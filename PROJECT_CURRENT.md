@@ -39,6 +39,7 @@
   - **验证**：新增 10 个单测；四次变异反证全部精确命中（身份退回 token / 删 off 解析 / 折叠改重建 / 同关两处冷却闸门 → 分别 2/1/2/4 个用例 FAIL）；真实 `.so` ctypes 探针 `test/qwenwork/multiaccount_probe.py` 9/9 PASS（含探针自身判别力变异验证）；WSL 真实 cgo 构建 + test + vet 全绿；gofmt 空；版本 0.1.0→**0.2.0**。
   - **未验证（诚实标注）**：真实双账号端到端切换。本机仅 1 个真实账号，且失败路径需先过真实 MaaS 签发（`sharedHTTPClient` 直连，不经宿主桥），桩驱动无法不联网注入 401；该链路由「同键一致性单测 + 调度侧冷却排除单测」组合覆盖。
   - **0.2.0 已发布（2026-10-18）**：CI run `39062771266` 全绿（Test + 6 平台 build/cross + Release）→ `cc7fe59`(assets，先于 registry 推送) → `bf36ab1`(registry 0.2.0，6 artifacts) → `33d5fb2`(prune 0.1.0)。远端 6/6 raw URL HTTP 200 且 Content-Length 与 registry size 全等，下载复算 sha256 6/6 一致；6 个二进制内均含 `0.2.0`；远端 registry 12 插件无空 artifacts；旧 0.1.0 URL 现 404（预期）。
+  - **生产部署（2026-10-18 04:04:54，首次安装）**：`plugin-store install?version=0.2.0` → HTTP 200 + `restart_required:false`，**零容器重启**（Up 2 days）；日志 `plugin loaded`/`plugin registered` 均为 `version=0.2.0`；落盘 `.so` sha256 `b75b5628…` 与本地 zip 逐字节一致；插件列表 `registered=true enabled=true 0.2.0`；`/accounts`（`scheduler_mode:session`、0 账号）/`/config`/`/models`/面板资源全 200；外网 `/v1/models` 200（36 模型）；`config_store` 真实换行 1502 行未塌缩、端口稳定 `:8317`；无 error/panic。生产账号为空，需用户面板 Device Flow 登录。
   - **有意保留**：`clientUA = "qoderwork/1.3.1"` 是实测通过的 UA（探针同值），非残留；`isDailyCountExceeded` 的 110 判定实测四形态不误伤，留作防御。
   - 文档：实施总览 § CYCLE-02 执行结果、`doc/5-tests/2026-10-18_021000_*`、`doc/6-review/2026-10-18_021000_*`（STYLE: PASS）。
 - 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：

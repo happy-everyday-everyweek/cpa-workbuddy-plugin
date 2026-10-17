@@ -380,6 +380,23 @@ QwenWork 无对应语义，但实测四种常见 110 形态均不误伤，保留
 | 旧版清理 | `33d5fb2` prune `qwenwork-provider-0.1.0`（本地与远端目录均移除，旧 URL 现 404 为预期） |
 | 产物版本核验 | 6 个二进制内均含 `0.2.0` 版本串 |
 
+**生产部署（2026-10-18 04:04:54）**：首次安装到生产 CPA 宿主，走 `plugin-store install` 热重载，**零容器重启**。
+
+| 项 | 结果 |
+|---|---|
+| 安装命令 | `POST /v0/management/plugin-store/qwenwork-provider/install?version=0.2.0` → HTTP 200，`restart_required:false` |
+| 落盘文件 | `plugins/linux/amd64/qwenwork-provider-v0.2.0.so`，7844832 字节 |
+| 哈希比对 | 落盘 sha256 `b75b56282df6e97bf0fc7839f044149a6f68b6b171e67a17b540de1bfd829da6` 与本地 zip 内 `.so` **完全一致** |
+| 热重载日志 | `plugin loaded` / `plugin registered`，`plugin_id=qwenwork-provider version=0.2.0`（首装无 retired 版本） |
+| 插件列表 | `registered=true enabled=true version=0.2.0` |
+| 路由验收 | `/accounts` 200（`scheduler_mode:session`、0 账号）、`/config` 200（2605B）、`/models` 200、面板 `/v0/resource/plugins/qwenwork-provider/panel` 200（62899B） |
+| 外网入口 | `https://cpa.luode.vip/v1/models` 200，共 36 个模型 |
+| 配置完整性 | `config_store` 真实换行 1502 行（远非 1，未塌缩）、端口稳定 `:8317`、spool mtime 04:04 与安装时刻一致 |
+| 容器状态 | `Up 2 days`，**未重启** |
+| 运行期错误 | 近 5 分钟无 qwenwork 相关 error/panic |
+
+**生产账号**：安装后 `accounts:[]`（0 账号），需用户在面板走 Device Flow 登录后才会出现账号；本轮不代登录。
+
 ### CYCLE-03：额度与生命周期
 
 - `account-context` + `wallets` 额度查询
