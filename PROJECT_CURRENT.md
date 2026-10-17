@@ -32,6 +32,16 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-18）：**coze-provider 0.2.0 模型动态发现 + 面板重做**：
+  - 需求：用户在生产管理台看到「支持的模型」弹窗显示「该凭证暂无可用模型」，且面板与 workbuddy 差距大、缺测试模型功能、时间非北京时间、面板内不该有授权区。
+  - **上游契约（真机实证）**：`POST /v1/model/list` 的 `model_type` 必须是**字符串**枚举（`llm` / `image_generation` / `video_generation` / `tts` / `asr` / `embedding`），传数字返回 `InvalidRequest`；`POST /api/coze_claw/resource/get_multimodal_model_catalog` 才有完整视频族（Seedance 2.5/2.0、MiniMax-H3），两者必须合并。生产账号实测 **16 个模型**。
+  - **实现**：声明 `model_provider`，实现 `model.static` / `model.for_auth`；发现链路并发 + 单请求 8s 超时 + 缓存按 `AuthID` 分桶；`model.static` **不在宿主启动期打网络**（宿主在认证加载路径同步调用）；新增 `/models` 与 `/test-active`（认证层探活：判据端点 + 模型目录 + `sec_user_id` 归属 + 选中模型是否在目录）。
+  - **面板重做**：移除授权引导区（改走宿主「添加账号」）；按 workbuddy 风格做账号卡 / 筛选标签+计数 / 汇总卡 / 搜索 / 批量启停 / 删除二次确认 / toast / 三态主题；时间统一 `Asia/Shanghai`。
+  - **验证**：cgo-shim build/vet/test 全绿（新增 15 个用例，含哨兵验证）；真实账号 `TestLiveModelDiscovery` 9 个模型（本地 Cookie 仅 38 字节，多模态目录被拒）；本地 mock 宿主浏览器验证 10 项全通过、控制台 0 错误。
+  - **发布（0.2.0）**：CI run `39065042718` 全绿 → `16cddd8`(源码) → `2c6d528`(assets) → `ee4f2c2`(registry + prune 0.1.3) → `1931cd7`(文档)；远端 6/6 raw URL 200 且 size 全等；`validate-registry.py` OK（12 插件）。
+  - **生产部署（2026-10-18 04:48:23）**：`plugin-store install?version=0.2.0` → HTTP 200 + `restart_required:false`，**零容器重启**；日志 `plugin hot reloaded active_version=0.2.0 retired_version=0.1.3`。验收：`auth-files/models` 返回真实模型（含 `coze/MiniMax-H3` 等视频族）；插件 `/models` → `source=upstream count=16`；`/test-active` → `ok=true 会话有效，可见 16 个模型`；`/panel` 中「授权扣子账号」出现 0 次。
+  - **未验证**：真实推理链路（`coze_claw/message/chat` 需桌面端 `claw_id` / `session_id`，属 CYCLE-01）；AC-001 真实浏览器授权仍需用户先在浏览器登录扣子。
+  - 文档：`doc/5-tests/2026-10-18_050000_CozeProvider模型发现与面板重做验证.md`、`doc/6-review/2026-10-18_050000_CozeProvider模型发现与面板重做_6-review.md`（STYLE: PASS）。
 - 当前会话（2026-10-18）：**qwenwork CYCLE-02 多账号调度：修复账号身份 key 失配（P0）**：
   - 需求：用户「启动 CYCLE-02 多账号调度」，范围为账号池 / 调度三模式+会话粘性 / 冷却阶梯+换号重试。
   - **核心缺陷（克隆遗留，P0）**：执行器把 `auth.accessToken` 当账号身份，而调度候选、冷却表、会话绑定、积分缓存全按宿主 `auth.ID`（`qwenwork-<uid>.json`，由 [authIDForPath](file:///C:/Users/luode/go/pkg/mod/github.com/router-for-me/!c!l!i!proxy!a!p!i/v7@v7.2.129/internal/pluginhost/auth_callbacks.go#L504) 从相对路径派生）索引。实测 token 是 552 字符 JWT ⇒ 冷却写到永远查不到的键 ⇒ 故障账号永不退出轮转，多账号调度退化为单账号。
