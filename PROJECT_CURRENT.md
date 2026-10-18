@@ -32,14 +32,13 @@
 
 ## 活动会话进展摘要
 
-- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收发现流式 500 并修复为 0.3.1**：
-  - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS（version 0.3.0、6 平台 sha256 全对、无旧版残留）→ 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200，账号 `auth_state=ok`、积分 2669/3000。
-  - **生产行为验收发现真实缺陷**：`POST /v1/chat/completions`（`coze/doubao-seed-2-0-mini-260215`，stream）立即返回 `{"error":{"message":"json: unsupported type: <-chan pluginapi.ExecutorStreamChunk"}}`，0 字节正文、0 chunk。
-  - **根因（宿主源码取证）**：`internal/pluginhost/rpc_schema.go:52` 的 `rpcExecutorStreamResponse.Chunks` 是 **slice**，`rpc_client_stream.go:29` 先判 `len(resp.Chunks) > 0` 再转 channel。0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化阶段即失败。宿主的正确异步路径是 `stream_id` + `host.stream.emit` / `host.stream.close`（workbuddy 同款）。
-  - **修复（0.3.1）**：`handleExecStream` 改为解析 `executorStreamRequest`（内嵌 `ExecutorRequest` + `stream_id`）；有 `stream_id` 时立即返回响应头，`pumpClawStream` 后台逐帧 `streamEmit`；无 `stream_id` 时 `collectStreamChunks` 同步收集返回 slice。补 `X-Accel-Buffering: no`（缺它会攒缓冲，真流式表现为卡住后一次性蹦出）。
-  - **回归与反证**：新增 `TestStreamResponseSerializable`（变异回 channel 形态 → 精确复现生产报错文案）、`TestStreamHeadersCarryNoBufferHint`；cgo-shim build/vet/test 全绿。
+- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收发现两处真实缺陷，修复到 0.3.2**：
+  - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS → 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200。
+  - **缺陷 1（0.3.0 → 0.3.1）：流式响应 500**。生产 `POST /v1/chat/completions` 立即返回 `json: unsupported type: <-chan pluginapi.ExecutorStreamChunk`。根因：宿主 `rpcExecutorStreamResponse.Chunks` 是 **slice**（`internal/pluginhost/rpc_schema.go:52`），`rpc_client_stream.go:29` 先判 `len()` 再转 channel；0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化即失败。修复：带 `stream_id` 时立即返回响应头，后台用 `host.stream.emit` 逐帧推送、`host.stream.close` 收尾；无 `stream_id` 时同步收集返回 slice；补 `X-Accel-Buffering: no`。回归 `TestStreamResponseSerializable`（变异回 channel 形态精确复现生产报错文案）。发布链 `06bb281` → CI `39121930862` success → registry `45e6851` → 远端 ALL PASS → 生产热重载 `active_version=0.3.1 retired_version=0.3.0`，落盘 sha256 `50dfcd41…` 与本地一致。
+  - **缺陷 2（0.3.1 → 0.3.2）：WS 握手缺 Cookie，只能收到心跳**。0.3.1 后流式虽完整但耗时 92 秒、正文在最后一帧一次性到达——首帧后 91 秒零增量，正好卡在首字超时 90s，实际走轮询兜底。**对照实验（同一生产账号，仅差 Cookie 头）**：不带 Cookie 6 帧全是 `hi`；带 Cookie 25 帧含 21 条二进制业务帧，0.34–4.25s 陆续到达。**根因**：frontier 网关对无 Cookie 握手照样返回 101，但只推心跳。修复：`frontierClient` 增加 `cookieHeader`，`runOnce` 握手写入 `Cookie`；`runStream` 传 `sa.CookieHeader`。回归 `TestFrontierHandshakeCarriesCookie`（变异删头精确 FAIL）。
+  - **生产日志佐证**：`frontier 已连接`（19:19:06）→ `连接中断`（19:20:37）相隔 91 秒，中间零业务帧。
   - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
-  - **待办**：0.3.1 走完整发布链并重新做生产流式验收。
+  - **待办**：0.3.2 走完整发布链并重新做生产流式验收（期望首帧后毫秒级陆续出字，而非 90 秒后一次性）。
 
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。

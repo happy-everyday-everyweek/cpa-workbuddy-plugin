@@ -29,8 +29,10 @@ type wsTestServer struct {
 	gotSubprotocol string
 	// gotQuery 记录客户端连接参数。
 	gotQuery url.Values
-	mu       sync.Mutex
-	conns    int
+	// gotCookie 记录握手时的 Cookie 头。
+	gotCookie string
+	mu        sync.Mutex
+	conns     int
 }
 
 // newWSTestServer 启动一个假 frontier 服务端。
@@ -49,6 +51,7 @@ func newWSTestServer(t *testing.T, onConnect func(conn *websocket.Conn)) *wsTest
 		ts.conns++
 		ts.gotSubprotocol = r.Header.Get("Sec-WebSocket-Protocol")
 		ts.gotQuery = r.URL.Query()
+		ts.gotCookie = r.Header.Get("Cookie")
 		ts.mu.Unlock()
 
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -77,6 +80,7 @@ func newWSTestServer(t *testing.T, onConnect func(conn *websocket.Conn)) *wsTest
 func newTestFrontierClient(ts *wsTestServer, onEvent func(frontierEvent)) *frontierClient {
 	client := newFrontierClient(
 		&frontierKeyResponse{AccessKey: "test-key", DeviceID: "test-device"},
+		"sessionid=test",
 		onEvent,
 	)
 	client.logf = func(level, message string, fields map[string]any) {}
@@ -97,7 +101,7 @@ func newTestFrontierClient(ts *wsTestServer, onEvent func(frontierEvent)) *front
 // [返回] 无。
 // 最近修改时间：2026-10-18；改动原因：新增，参数契约守卫。
 func TestFrontierURLContainsClawParams(t *testing.T) {
-	client := newFrontierClient(&frontierKeyResponse{AccessKey: "k", DeviceID: "d"}, nil)
+	client := newFrontierClient(&frontierKeyResponse{AccessKey: "k", DeviceID: "d"}, "", nil)
 	raw := client.url()
 
 	parsed, err := url.Parse(raw)
@@ -126,6 +130,40 @@ func TestFrontierURLContainsClawParams(t *testing.T) {
 	if parsed.Scheme != "wss" {
 		t.Errorf("scheme = %q，期望 wss", parsed.Scheme)
 	}
+}
+
+// TestFrontierHandshakeCarriesCookie 验证 WS 握手携带会话 Cookie。
+//
+// 不带 Cookie 时网关照样返回 101，但只推 hi 心跳、不给任何业务帧，
+// 表现为「连上了却收不到回复」，只能等首字超时走轮询兜底。
+// 2026-10-18 生产对照实验：不带 6 帧全 hi；带上 25 帧含 21 条业务帧。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，握手凭证契约守卫。
+func TestFrontierHandshakeCarriesCookie(t *testing.T) {
+	ts := newWSTestServer(t, func(conn *websocket.Conn) {
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	client := newTestFrontierClient(ts, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go client.Run(ctx)
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ts.mu.Lock()
+		got := ts.gotCookie
+		ts.mu.Unlock()
+		if got != "" {
+			if got != "sessionid=test" {
+				t.Errorf("Cookie = %q，期望 sessionid=test", got)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("握手未携带 Cookie：上游只会推心跳，收不到业务帧")
 }
 
 // TestFrontierConnectsWithSubprotocol 验证握手使用 pbbp2 子协议。

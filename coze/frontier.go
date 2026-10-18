@@ -174,6 +174,12 @@ type frontierClient struct {
 	dialer  *websocket.Dialer
 	onEvent func(frontierEvent)
 	logf    func(level, message string, fields map[string]any)
+	// cookieHeader 是账号的会话 Cookie。
+	//
+	// 握手必须带上它：不带时网关照样返回 101，但只推 hi 心跳，
+	// 一帧业务数据都不给（2026-10-18 生产对照实验：不带 6 帧全 hi，
+	// 带上 25 帧含 21 条业务帧）。这是「连上了却收不到回复」的根因。
+	cookieHeader string
 	// serverURL 覆盖默认的 frontier 主机，仅供测试指向 httptest 服务端。
 	serverURL string
 	// readTimeout 覆盖默认读超时，仅供测试缩短等待。
@@ -184,15 +190,17 @@ type frontierClient struct {
 }
 
 // newFrontierClient 构造 WS 客户端。
-// [参数] key: get_frontier_key 返回的凭证；onEvent: 事件回调。
+// [参数] key: get_frontier_key 返回的凭证；cookieHeader: 账号会话 Cookie；
+// onEvent: 事件回调。
 // [返回] 客户端。
-// 最近修改时间：2026-10-18；改动原因：新增，WS 客户端构造入口。
-func newFrontierClient(key *frontierKeyResponse, onEvent func(frontierEvent)) *frontierClient {
+// 最近修改时间：2026-10-18；改动原因：握手补 Cookie，修复只收心跳不收业务帧。
+func newFrontierClient(key *frontierKeyResponse, cookieHeader string, onEvent func(frontierEvent)) *frontierClient {
 	return &frontierClient{
-		key:     key,
-		dialer:  websocket.DefaultDialer,
-		onEvent: onEvent,
-		logf:    hostLogf,
+		key:          key,
+		dialer:       websocket.DefaultDialer,
+		onEvent:      onEvent,
+		logf:         hostLogf,
+		cookieHeader: cookieHeader,
 	}
 }
 
@@ -275,6 +283,9 @@ func (c *frontierClient) runOnce(ctx context.Context) error {
 	header := http.Header{}
 	header.Set("User-Agent", webUserAgent)
 	header.Set("Origin", cozeSiteHost)
+	if c.cookieHeader != "" {
+		header.Set("Cookie", c.cookieHeader)
+	}
 
 	dialer := *c.dialer
 	dialer.HandshakeTimeout = frontierHandshakeTimeout

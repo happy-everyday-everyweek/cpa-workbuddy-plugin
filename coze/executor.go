@@ -246,7 +246,7 @@ func (e *cozeExecutor) runStream(ctx context.Context, prompt string, emit func(s
 	wsCtx, stopWS := context.WithCancel(ctx)
 	defer stopWS()
 
-	client := newFrontierClient(key, func(ev frontierEvent) {
+	client := newFrontierClient(key, e.sa.CookieHeader, func(ev frontierEvent) {
 		msg, found := parseFrontierMessage(ev.Payload)
 		if !found {
 			return

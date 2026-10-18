@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.2 (2026-10-18)
+
+### 修复
+
+- **WS 握手缺会话 Cookie，只能收到心跳**。0.3.1 修好序列化后，生产流式
+  虽能返回完整正文，但耗时 92 秒且正文在最后一帧一次性到达——首帧之后
+  91 秒没有任何增量，正好卡在首字超时（90s）上，实际走的是轮询兜底。
+- **根因**：frontier 网关对「无 Cookie 的握手」照样返回 `101 Switching
+  Protocols`，但只推 `hi` 心跳，一帧业务数据都不给。生产日志里
+  `frontier 已连接` 到 `连接中断` 相隔 91 秒、中间零业务帧，与此吻合。
+- **对照实验（同一生产账号，仅差一个 Cookie 头）**：
+  - 不带 Cookie：6 帧，全部是 `hi`；
+  - 带 Cookie：25 帧，其中 21 条二进制业务帧，在 0.34s–4.25s 陆续到达。
+- **修复**：`frontierClient` 增加 `cookieHeader`，`runOnce` 握手时写入
+  `Cookie` 请求头；`runStream` 从账号取 `sa.CookieHeader` 传入。
+
+### 测试
+
+- 新增 `TestFrontierHandshakeCarriesCookie`：假服务端记录握手 Cookie 并断言。
+  变异删除该请求头后用例精确失败。
+
 ## 0.3.1 (2026-10-18)
 
 ### 修复
