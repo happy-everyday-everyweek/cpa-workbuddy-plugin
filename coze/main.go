@@ -65,7 +65,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.2.2-verify2"
+	version      = "0.2.2"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -120,6 +120,10 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+
+	// 续期定时器必须在宿主装配完成后启动：init() 早于 cliproxy_plugin_init，
+	// 此刻 hostAPI 仍为 nil，循环会先等宿主就绪再跑首轮（见 renew_loop.go）。
+	startRenewLoop()
 	return 0
 }
 
@@ -158,6 +162,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	stopRenewLoop()
 	hostAPIMu.Lock()
 	hostAPI = nil
 	hostAPIMu.Unlock()
@@ -343,6 +348,9 @@ func configurePlugin(raw []byte) error {
 		}
 	}
 	activeConfig.Store(cfg)
+	// 间隔可能在本次 reconfigure 里被改小：让循环立即重排，避免旧 timer
+	// 继续按旧间隔睡满一整轮。
+	requestRenewTick()
 	return nil
 }
 

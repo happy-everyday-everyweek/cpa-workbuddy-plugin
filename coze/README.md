@@ -41,15 +41,22 @@ CLIProxyAPI（CPA）插件：把扣子（Coze）账号接入 CPA，提供**授�
 | 带会话 Cookie | `x-tt-token` 响应头（Set-Cookie 0 条） |
 | 带 `x-tt-token` | `Set-Cookie`（13 条） |
 
-因此会话可无限滚动续期，不存在 Cookie 快照硬失效。面板的「续期」按钮与宿主
-`auth.refresh` 都会执行这一循环。
+因此会话可无限滚动续期，不存在 Cookie 快照硬失效。续期有两个触发源：
+
+- **插件内定时器**：默认每 4 小时（`renew_interval_seconds`）遍历所有启用
+  账号执行一轮续期并落盘，插件热重载后立即先跑一轮；
+- **面板「续期」按钮**：对单个账号立即执行一轮。
+
+宿主 `auth.refresh` 也会走同一套续期内核，但扣子不声明 executor 能力，
+宿主自动刷新循环对本插件只重排不执行（`handleDueAuth` 的 `exec == nil`
+分支），因此定时续期由插件自己负责。
 
 ## 配置
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `timeout_seconds` | 30 | 上游请求超时（秒） |
-| `renew_interval_seconds` | 21600 | 续期间隔（秒），供宿主 `auth.refresh` 排期 |
+| `renew_interval_seconds` | 14400 | 定时续期间隔（秒），默认 4 小时 |
 
 ## 管理接口
 

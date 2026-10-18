@@ -299,8 +299,106 @@ func TestRenewSession_Rejected(t *testing.T) {
 	}
 }
 
-// TestSaveFromToken_WritesAuthFile 验证完整授权链路落盘。
+// TestApplyRenewal_WritesNewCookie 验证续期结果真实写回物理账号文件。
+//
+// 定时续期循环依赖这条落盘链路：若 applyRenewal 只改内存不写盘，重启后
+// 账号会退回旧 Cookie，续期等于没做。这里用真实临时文件验证。
 // [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，定时续期落盘验证。
+func TestApplyRenewal_WritesNewCookie(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	sa := &StoredAuth{
+		AuthID:       "coze-apply",
+		CookieHeader: "sessionid=old",
+		LastRenewAt:  "2026-10-01T00:00:00+08:00",
+		CreatedAt:    "2026-10-01T00:00:00+08:00",
+	}
+	filePath := dir + "/coze-apply.json"
+	if errWrite := writeAuthFileDirect(filePath, sa); errWrite != nil {
+		t.Fatalf("准备账号文件失败：%v", errWrite)
+	}
+	// 按真实形态重新读取：续期循环里的账号都来自 listAllAuthFiles / readAuthFile，
+	// 带上读取时刻的内容摘要作为防覆盖基准。
+	sa, errRead := readAuthFile(filePath)
+	if errRead != nil {
+		t.Fatalf("读取账号失败：%v", errRead)
+	}
+
+	res := &renewResult{
+		Renewed:      true,
+		CookieHeader: "sessionid=new",
+		Cookies: []savedCookie{{
+			Source: "https://www.coze.cn/",
+			Cookie: http.Cookie{Name: "sessionid", Value: "new", Domain: "www.coze.cn", Path: "/"},
+		}},
+		Note: "测试换发",
+	}
+	if errApply := applyRenewal(sa, res); errApply != nil {
+		t.Fatalf("落盘应成功，实际失败：%v", errApply)
+	}
+
+	loaded, errRead := readAuthFile(filePath)
+	if errRead != nil {
+		t.Fatalf("应能读回文件：%v", errRead)
+	}
+	if loaded.CookieHeader != "sessionid=new" {
+		t.Fatalf("落盘 Cookie 头 = %q，期望 sessionid=new", loaded.CookieHeader)
+	}
+	if loaded.LastRenewAt == sa.CreatedAt {
+		t.Fatal("last_renew_at 应推进")
+	}
+}
+
+// TestApplyRenewal_SkipsWhenExternallyReplaced 验证账号文件被外部替换时放弃写入。
+//
+// 防覆盖语义：用户重新授权或另一实例写入新凭据后，旧快照不能把它冲掉。
+// 这里复刻真实调用形态——账号总是先从磁盘读出来（记录内容摘要），
+// 之后才可能被外部改写。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，防覆盖闸门验证。
+func TestApplyRenewal_SkipsWhenExternallyReplaced(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	seeded := &StoredAuth{AuthID: "coze-replace", CookieHeader: "sessionid=old"}
+	filePath := dir + "/coze-replace.json"
+	if errWrite := writeAuthFileDirect(filePath, seeded); errWrite != nil {
+		t.Fatalf("准备账号文件失败：%v", errWrite)
+	}
+
+	// 读取：此刻记录内容摘要，作为后续防覆盖基准。
+	sa, errRead := readAuthFile(filePath)
+	if errRead != nil {
+		t.Fatalf("读取账号失败：%v", errRead)
+	}
+
+	// 模拟外部写入新凭据（重新授权 / 另一实例）。
+	external := &StoredAuth{AuthID: "coze-replace", CookieHeader: "sessionid=external"}
+	if errWrite := writeAuthFileDirect(filePath, external); errWrite != nil {
+		t.Fatalf("外部写入失败：%v", errWrite)
+	}
+
+	res := &renewResult{Renewed: true, CookieHeader: "sessionid=renewed"}
+	if errApply := applyRenewal(sa, res); errApply != nil {
+		t.Fatalf("放弃写入不应返回错误，实际：%v", errApply)
+	}
+
+	loaded, errRead := readAuthFile(filePath)
+	if errRead != nil {
+		t.Fatalf("应能读回文件：%v", errRead)
+	}
+	if loaded.CookieHeader != "sessionid=external" {
+		t.Fatalf("外部凭据被覆盖，实际 %q", loaded.CookieHeader)
+	}
+}
+
+// TestSaveFromToken_WritesAuthFile 验证完整授权链路落盘。// [参数] t: 测试上下文。
 // [返回] 无。
 // 最近修改时间：2026-10-18；改动原因：新增，落盘端到端用例。
 func TestSaveFromToken_WritesAuthFile(t *testing.T) {

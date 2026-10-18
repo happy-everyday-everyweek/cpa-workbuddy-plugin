@@ -395,11 +395,12 @@ func renewSession(sa *StoredAuth) (*renewResult, error) {
 
 // applyRenewal 把续期结果写回账号并落盘。
 //
-// 防覆盖：写盘前比对文件内容摘要，若已被外部（用户重新授权 / 另一实例）
-// 替换则放弃本次写入，避免旧快照覆盖刚授权的新凭据。
+// 防覆盖：写盘前比对「读取该账号时」记录的内容摘要，若文件已被外部
+// （用户重新授权 / 另一实例）替换则放弃本次写入，避免旧快照覆盖刚授权的
+// 新凭据。摘要必须在读取时锚定——写前才取会永远比对到自己。
 // [参数] sa: 账号；res: 续期结果。
 // [返回] 写入错误；被外部替换而放弃时返回 nil。
-// 最近修改时间：2026-10-18；改动原因：新增，续期落盘与防覆盖闸门。
+// 最近修改时间：2026-10-18；改动原因：新增，续期落盘与防覆盖闸门；判据锚点改为读取时刻。
 func applyRenewal(sa *StoredAuth, res *renewResult) error {
 	if sa == nil || res == nil || !res.Renewed {
 		return nil
@@ -407,7 +408,7 @@ func applyRenewal(sa *StoredAuth, res *renewResult) error {
 	if sa.PhysicalPath == "" {
 		return fmt.Errorf("账号缺少物理路径，无法落盘")
 	}
-	if bindStore(sa.PhysicalPath).replaced() {
+	if accountReplaced(sa) {
 		return nil
 	}
 
@@ -415,7 +416,26 @@ func applyRenewal(sa *StoredAuth, res *renewResult) error {
 	sa.Cookies = res.Cookies
 	sa.LastRenewAt = time.Now().Format(time.RFC3339)
 	sa.UpdatedAt = sa.LastRenewAt
-	return writeAuthFileDirect(sa.PhysicalPath, sa)
+	if errWrite := writeAuthFileDirect(sa.PhysicalPath, sa); errWrite != nil {
+		return errWrite
+	}
+	// 写入成功后刷新基准，使同一进程内的后续轮次以新内容为起点。
+	sa.LoadedDigest = fileDigest(sa.PhysicalPath)
+	return nil
+}
+
+// accountReplaced 判断账号文件在读取之后是否被外部改写。
+//
+// 没有读取基准（例如内存里新建、尚未落盘的账号）时返回 false：
+// 那种情况下不存在「被外部覆盖」的对象。
+// [参数] sa: 账号。
+// [返回] 已被外部替换时返回 true。
+// 最近修改时间：2026-10-18；改动原因：新增，读取基准防覆盖判据。
+func accountReplaced(sa *StoredAuth) bool {
+	if sa == nil || sa.PhysicalPath == "" || sa.LoadedDigest == "" {
+		return false
+	}
+	return fileDigest(sa.PhysicalPath) != sa.LoadedDigest
 }
 
 // renewAccountByID 按账号标识执行一轮续期并落盘。

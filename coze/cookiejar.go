@@ -227,35 +227,6 @@ func isCozeSessionCookie(name string) bool {
 	return false
 }
 
-// storePath 是 cookieStore 的持久化目标绑定。
-//
-// 与 doubao 插件同构：用内容摘要而不是文件元信息做防覆盖判据——
-// Windows 上删除后重建会复用同一文件索引，SameFile + ModTime + Size
-// 三项都可能判为未变化，导致旧快照覆盖用户刚重新授权的新凭据。
-type storeBinding struct {
-	path  string
-	saved string
-}
-
-// bind 绑定持久化目标文件并记录当前内容摘要。
-// [参数] path: 账号文件路径。
-// [返回] 绑定结果。
-// 最近修改时间：2026-10-18；改动原因：新增，防覆盖判定基准。
-func bindStore(path string) storeBinding {
-	return storeBinding{path: path, saved: fileDigest(path)}
-}
-
-// replaced 判断账号文件是否已被本进程之外的一方替换。
-// [参数] 无。
-// [返回] 内容与绑定时摘要不一致时返回 true。
-// 最近修改时间：2026-10-18；改动原因：新增，防覆盖判定。
-func (b storeBinding) replaced() bool {
-	if b.path == "" {
-		return false
-	}
-	return fileDigest(b.path) != b.saved
-}
-
 // fileDigest 计算文件内容摘要；文件不存在或不可读时返回空串。
 // [参数] path: 文件路径。
 // [返回] 十六进制摘要。

@@ -50,6 +50,12 @@ type StoredAuth struct {
 	UpdatedAt   string `json:"updated_at"`
 	// PhysicalPath 是账号文件绝对路径，不落盘（json:"-"）。
 	PhysicalPath string `json:"-"`
+	// LoadedDigest 是读取该账号时物理文件的内容摘要，不落盘（json:"-"）。
+	//
+	// 防覆盖判据必须锚定「读取那一刻」的内容：若在写入前才取摘要，
+	// 比对的永远是文件自身，外部重新授权写入的新凭据会被静默覆盖
+	// （2026-10-18 单测 TestApplyRenewal_SkipsWhenExternallyReplaced 实证）。
+	LoadedDigest string `json:"-"`
 }
 
 type rpcHostAuthListResponse struct {
@@ -220,6 +226,7 @@ func readAuthFile(filePath string) (*StoredAuth, error) {
 		return nil, errUnmarshal
 	}
 	auth.PhysicalPath = filePath
+	auth.LoadedDigest = fileDigest(filePath)
 	return &auth, nil
 }
 
@@ -266,6 +273,7 @@ func listHostAuthFiles() []*StoredAuth {
 			}
 			sa.Disabled = sa.Disabled || f.Disabled
 			sa.PhysicalPath = getResp.Path
+			sa.LoadedDigest = fileDigest(getResp.Path)
 			out = append(out, &sa)
 		}
 	}
@@ -313,6 +321,7 @@ func listAllAuthFiles() ([]*StoredAuth, error) {
 			}
 			if _, exists := seen[sa.AuthID]; !exists {
 				sa.PhysicalPath = fullPath
+				sa.LoadedDigest = fileDigest(fullPath)
 				seen[sa.AuthID] = &sa
 				list = append(list, &sa)
 			}
