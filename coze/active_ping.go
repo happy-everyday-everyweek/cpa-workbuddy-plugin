@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,17 +12,18 @@ import (
 
 // 本文件实现面板「测试」按钮的账号探活。
 //
-// 当前只做认证层探活，原因：扣子对话链路（coze_claw 的 message/chat）需要
-// claw_id 与 session_id，二者来自桌面端运行时上下文，尚未接入（CYCLE-01）。
-// 认证层探活能真实回答面板最关心的问题——「这个账号现在还能不能用」：
+// 探活分三层，逐层加深：
 //   - account/info/v2 判据通过 → 会话 Cookie 仍有效；
-//   - 模型目录可拉取 → 该账号的模型权限仍在（顺带验证 /v1/model/list 可达）。
+//   - 模型目录可拉取 → 该账号的模型权限仍在；
+//   - chat 模型再发一次极小推理 → 对话链路（WS 收帧、增量拼接、收尾）
+//     真的能跑通。前两层测不出 executor 故障，2026-10-18 的流式 500
+//     与空正文都属于这类只有真打一次才会暴露的问题。
 //
-// 它不消耗推理配额，也没有生图/生视频那种数十秒等待，适合作为面板的即时反馈。
+// 图片/视频模型只做前两层：它们不适用对话链路，且单次生成要数十秒。
 
 // testActiveTimeout 是单次探活的等待上限。
 //
-// 探活只打两个轻量接口，正常 1~3 秒返回；20 秒覆盖上游排队与网络抖动。
+// 认证与模型两步只打轻量接口，正常 1~3 秒返回；20 秒覆盖上游排队与网络抖动。
 const testActiveTimeout = 20 * time.Second
 
 // testActiveResult 是探活结果。
@@ -92,13 +94,16 @@ func findAccountForTest(authID string) (*StoredAuth, error) {
 	return nil, fmt.Errorf("账号不存在：%s", authID)
 }
 
-// runActiveTest 对指定账号执行一次认证层探活。
+// runActiveTest 对指定账号执行一次探活。
 //
-// 两步都成功才判定可用：判据端点确认会话有效，模型目录确认权限仍在。
-// 只做第一步会把「会话活着但模型被收回」的账号误报为可用。
+// 三步都成功才判定可用：判据端点确认会话有效，模型目录确认权限仍在，
+// chat 模型还会发一次极小推理确认对话链路真的通。
+// 只做前两步会把「会话活着但 executor 坏了」的账号误报为可用——
+// 本仓库 2026-10-18 就出现过流式 500 与空正文，认证层探活完全测不出来。
+// 图片/视频模型只做前两步：它们不适用对话链路，且单次生成耗时数十秒。
 // [参数] sa: 账号；model: 面板选中的模型（仅回显）。
 // [返回] 探活结果。
-// 最近修改时间：2026-10-18；改动原因：新增，双条件探活内核。
+// 最近修改时间：2026-10-18；改动原因：升级为真实推理探活，覆盖对话链路。
 func runActiveTest(sa *StoredAuth, model string) map[string]any {
 	start := time.Now()
 	res := testActiveResult{
@@ -138,10 +143,89 @@ func runActiveTest(sa *StoredAuth, model string) map[string]any {
 		return testActiveResultMap(res)
 	}
 
+	// 选中的是 chat 模型就再跑一次真实推理：这是唯一能证明「对话链路可用」
+	// 的判据。图片/视频模型跳过，避免几十秒等待与无谓的生成配额消耗。
+	if model != "" && isChatModel(models, model) {
+		res.Scope = "auth+models+inference"
+		reply, errInfer := runInferenceProbe(sa, model)
+		if errInfer != nil {
+			res.ElapsedMS = time.Since(start).Milliseconds()
+			res.Error = "会话与模型均可用，但推理失败：" + errInfer.Error()
+			return testActiveResultMap(res)
+		}
+		res.OK = true
+		res.ElapsedMS = time.Since(start).Milliseconds()
+		res.Message = fmt.Sprintf("推理成功，可见 %d 个模型；回复：%s", len(models), reply)
+		return testActiveResultMap(res)
+	}
+
 	res.OK = true
 	res.ElapsedMS = time.Since(start).Milliseconds()
 	res.Message = fmt.Sprintf("会话有效，可见 %d 个模型", len(models))
 	return testActiveResultMap(res)
+}
+
+// inferenceProbePrompt 是推理探活的提示词。
+//
+// 要求回复极短（一个词），既能证明链路上游通、又不浪费生成配额；
+// 附带随机标记用于确认回复确实来自本轮而不是历史残留。
+const inferenceProbePrompt = "只回复两个字：可用"
+
+// inferenceProbeMaxDuration 是推理探活的等待上限。
+//
+// 真流式一轮通常 5~20 秒；60 秒覆盖上游排队，超过就说明链路卡死。
+const inferenceProbeMaxDuration = 60 * time.Second
+
+// inferenceProbe 是推理探活的执行函数。
+//
+// 抽成变量是为了测试可注入假实现：单测里没有真实账号，
+// 而真实推理必然被上游拒绝（登录认证失败），会让所有探活用例变红。
+var inferenceProbe = func(ctx context.Context, sa *StoredAuth, model string) (string, error) {
+	exec := newCozeExecutor(sa, model, nil)
+	return exec.execute(ctx, inferenceProbePrompt)
+}
+
+// runInferenceProbe 对指定 chat 模型发一次极小推理请求。
+//
+// 走插件自己的执行链路（非流式），与真实用户请求同一条代码路径，
+// 因此能捕获流式 500、空正文、WS 未就绪等只有对话链路才暴露的故障。
+// [参数] sa: 账号；model: 对外模型 ID（可带 coze/ 前缀）。
+// [返回] 回复摘要与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，对话链路真实验证。
+func runInferenceProbe(sa *StoredAuth, model string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), inferenceProbeMaxDuration)
+	defer cancel()
+
+	content, errRun := inferenceProbe(ctx, sa, model)
+	if errRun != nil {
+		return "", errRun
+	}
+	reply := strings.TrimSpace(content)
+	if reply == "" {
+		return "", fmt.Errorf("上游返回空正文")
+	}
+	// 面板只显示一行，长回复截断即可：探活关心的是「有没有正文」。
+	if runes := []rune(reply); len(runes) > 40 {
+		reply = string(runes[:40]) + "…"
+	}
+	return reply, nil
+}
+
+// isChatModel 判断模型是否为对话模型。
+//
+// 只认宿主 Type 为 chat 的条目；图片/视频/音频模型不适用对话探活。
+// [参数] models: 模型目录；model: 待查模型名。
+// [返回] 是对话模型时返回 true。
+// 最近修改时间：2026-10-18；改动原因：新增，按模型类型分流探活强度。
+func isChatModel(models []pluginapi.ModelInfo, model string) bool {
+	want := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(model, ":latest")))
+	for _, m := range models {
+		if strings.ToLower(m.ID) != want && !strings.EqualFold(m.Name, model) {
+			continue
+		}
+		return strings.EqualFold(strings.TrimSpace(m.Type), "chat")
+	}
+	return false
 }
 
 // modelInCatalog 判断模型是否在目录中（忽略大小写与 :latest 后缀）。

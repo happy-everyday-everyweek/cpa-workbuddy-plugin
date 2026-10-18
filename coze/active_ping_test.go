@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -159,6 +162,7 @@ func TestRunActiveTest_Success(t *testing.T) {
 	setupModelStubs(t, map[string][]upstreamModel{
 		modelTypeLLM: {sampleLLM("chat-a")},
 	}, nil)
+	stubInference(t, "可用", nil)
 
 	res := runActiveTest(sa, modelIDPrefix+"chat-a")
 	if res["ok"] != true {
@@ -307,5 +311,105 @@ func TestSeedAccountFileExists(t *testing.T) {
 	sa := seedAccount(t, "coze-fixture1", "sec-user-1")
 	if _, errStat := os.Stat(filepath.Join(getAccountsDir(), sa.AuthID+".json")); errStat != nil {
 		t.Fatalf("夹具应真实落盘：%v", errStat)
+	}
+}
+
+// stubInference 把推理探活替换成假实现，测试结束后恢复。
+//
+// 单测没有真实账号：走真实推理必然被上游拒绝（700012006），
+// 会让所有带 chat 模型的探活用例变红，掩盖真正要验证的分支。
+// [参数] t: 测试上下文；reply: 假回复；err: 假错误。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，推理探活测试注入。
+func stubInference(t *testing.T, reply string, err error) {
+	t.Helper()
+	original := inferenceProbe
+	inferenceProbe = func(context.Context, *StoredAuth, string) (string, error) {
+		return reply, err
+	}
+	t.Cleanup(func() { inferenceProbe = original })
+}
+
+// TestRunActiveTest_InferenceSucceeds 验证 chat 模型会走真实推理探活。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，三层探活成功用例。
+func TestRunActiveTest_InferenceSucceeds(t *testing.T) {
+	sa := seedAccount(t, "coze-probe11", "sec-user-1")
+	setupProbeStubs(t, "sec-user-1")
+	setupModelStubs(t, map[string][]upstreamModel{
+		modelTypeLLM: {sampleLLM("chat-a")},
+	}, nil)
+	stubInference(t, "可用", nil)
+
+	res := runActiveTest(sa, modelIDPrefix+"chat-a")
+	if res["ok"] != true {
+		t.Fatalf("探活应通过，实际 %v", res["error"])
+	}
+	if res["scope"] != "auth+models+inference" {
+		t.Errorf("scope = %v，期望 auth+models+inference", res["scope"])
+	}
+	msg, _ := res["message"].(string)
+	if !strings.Contains(msg, "推理成功") {
+		t.Errorf("message 应说明推理成功，实际 %q", msg)
+	}
+}
+
+// TestRunActiveTest_InferenceFails 验证推理失败时判失败。
+//
+// 这是三层探活的核心价值：认证与模型都正常，但 executor 坏了
+// （如 2026-10-18 的流式 500 / 空正文），必须能测出来。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，对话链路故障用例。
+func TestRunActiveTest_InferenceFails(t *testing.T) {
+	sa := seedAccount(t, "coze-probe12", "sec-user-1")
+	setupProbeStubs(t, "sec-user-1")
+	setupModelStubs(t, map[string][]upstreamModel{
+		modelTypeLLM: {sampleLLM("chat-a")},
+	}, nil)
+	stubInference(t, "", errors.New("json: unsupported type: <-chan pluginapi.ExecutorStreamChunk"))
+
+	res := runActiveTest(sa, modelIDPrefix+"chat-a")
+	if res["ok"] == true {
+		t.Fatal("推理失败时必须判失败")
+	}
+	errStr, _ := res["error"].(string)
+	if !strings.Contains(errStr, "推理失败") {
+		t.Errorf("错误应说明推理失败，实际 %q", errStr)
+	}
+}
+
+// TestRunActiveTest_SkipsInferenceForImageModel 验证图片模型不发推理请求。
+//
+// 图片模型不适用对话链路，且单次生成要数十秒；
+// 对它们发推理探活既无意义又慢。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，模型类型分流用例。
+func TestRunActiveTest_SkipsInferenceForImageModel(t *testing.T) {
+	sa := seedAccount(t, "coze-probe13", "sec-user-1")
+	setupProbeStubs(t, "sec-user-1")
+	setupModelStubs(t, map[string][]upstreamModel{
+		modelTypeImage: {{ModelID: "img-a", ModelName: "img-a", ShowName: "IMG-A", ModelType: modelTypeImage}},
+	}, nil)
+
+	called := false
+	original := inferenceProbe
+	inferenceProbe = func(context.Context, *StoredAuth, string) (string, error) {
+		called = true
+		return "不该被调用", nil
+	}
+	t.Cleanup(func() { inferenceProbe = original })
+
+	res := runActiveTest(sa, modelIDPrefix+"img-a")
+	if called {
+		t.Fatal("图片模型不应触发推理探活")
+	}
+	if res["ok"] != true {
+		t.Fatalf("图片模型应通过前两层，实际 %v", res["error"])
+	}
+	if res["scope"] != "auth+models" {
+		t.Errorf("scope = %v，期望 auth+models", res["scope"])
 	}
 }
