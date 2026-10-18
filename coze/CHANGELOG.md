@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.1 (2026-10-19)
+
+### 修复
+
+- **下游用量全部记零**。生产面板显示 coze 请求「输入 0 / TPS 0.00」，
+  new-api 通用日志里该模型 `Tokens` 恒为 `-`、费用 `$0`，无法计费。
+  根因是插件从未在响应里输出 `usage` 字段：宿主只从 chunk/响应体的
+  `usage` 取 token 数，扣子上游又没有 token 计数端点、WS 帧里也不带用量，
+  于是整条链路拿到的都是零值。
+  现在流式在**终止帧**、非流式在响应体输出 OpenAI 规范的 usage，
+  按字符特征估算（CJK ≈ 1 字 1 token，拉丁 ≈ 4 字符 1 token），
+  并带 `estimated: true` 便于区分估算值与上游实测值。
+
+### 测试
+
+- 新增 `TestBuildUsageEstimatesTokens`（估算值与 total 自洽）、
+  `TestUsageOnlyInTerminalChunk`（中间帧不带 usage、终止帧必须带）、
+  `TestBuildCompletionCarriesUsage`（非流式响应带非零 usage）。
+  分别变异移除分片与非流式两条挂载路径，两个用例精确失败。
+
 ## 0.4.0 (2026-10-19)
 
 ### 新增

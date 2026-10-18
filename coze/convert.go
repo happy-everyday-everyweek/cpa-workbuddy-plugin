@@ -149,11 +149,13 @@ func newCompletionID() string {
 // delta 为 nil 时产出空 delta（用于终止帧），finishReason 为 nil 时
 // 表示流未结束。两者独立，因为 OpenAI 允许「带内容的帧不结束」
 // 与「不带内容的帧结束」。
+// usage 只在终止帧携带：OpenAI 约定流式用量放在最后一帧，
+// 中间帧带 usage 会被客户端当作重复计费。
 // [参数] id: 响应 ID；model: 模型名；delta: 增量文本，空串表示无内容；
-// finishReason: 终止原因，nil 表示未结束。
+// finishReason: 终止原因，nil 表示未结束；usage: 用量对象，nil 表示不带。
 // [返回] JSON 分片与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，分片构造。
-func buildChunk(id, model, delta string, finishReason *string) ([]byte, error) {
+// 最近修改时间：2026-10-18；改动原因：新增 usage 输出，修复下游全部记零。
+func buildChunk(id, model, delta string, finishReason *string, usage map[string]any) ([]byte, error) {
 	deltaPayload := map[string]any{}
 	if delta != "" {
 		deltaPayload["content"] = delta
@@ -171,6 +173,9 @@ func buildChunk(id, model, delta string, finishReason *string) ([]byte, error) {
 				"finish_reason": finishReason,
 			},
 		},
+	}
+	if usage != nil {
+		chunk["usage"] = usage
 	}
 	return json.Marshal(chunk)
 }
@@ -200,10 +205,13 @@ func buildFirstChunk(id, model string) ([]byte, error) {
 }
 
 // buildCompletion 构造非流式响应。
-// [参数] id: 响应 ID；model: 模型名；content: 完整正文。
+//
+// usage 必须带上：宿主与 new-api 都从响应体的 usage 字段取 token 数，
+// 缺失时整条请求记 0 用量、new-api 显示 `Tokens: -` 且无法计费。
+// [参数] id: 响应 ID；model: 模型名；content: 完整正文；usage: 用量对象。
 // [返回] JSON 响应与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，非流式响应构造。
-func buildCompletion(id, model, content string) ([]byte, error) {
+// 最近修改时间：2026-10-18；改动原因：新增 usage 输出，修复下游全部记零。
+func buildCompletion(id, model, content string, usage map[string]any) ([]byte, error) {
 	response := map[string]any{
 		"id":      id,
 		"object":  openAIObjectChatCompletion,
@@ -220,7 +228,47 @@ func buildCompletion(id, model, content string) ([]byte, error) {
 			},
 		},
 	}
+	if usage != nil {
+		response["usage"] = usage
+	}
 	return json.Marshal(response)
+}
+
+// estimateTokens 估算一段文本的 token 数。
+//
+// 扣子没有 token 计数端点，帧里也不带用量，只能按字符特征估算：
+// CJK 约 1 字 1 token，拉丁文约 4 字符 1 token。
+// [参数] s: 文本。
+// [返回] 估算 token 数；空串返回 0。
+// 最近修改时间：2026-10-18；改动原因：新增，上游无真实用量。
+func estimateTokens(s string) int {
+	var cjk, other int
+	for _, r := range s {
+		if r >= 0x2E80 {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	return cjk + (other+3)/4
+}
+
+// buildUsage 构造 OpenAI 规范的 usage 对象。
+//
+// estimated 是扩展字段：宿主与客户端都会忽略，但让人工排查能一眼区分
+// 「上游返回的真实用量」与「本插件的估算值」，避免把估算值当实测数据。
+// [参数] prompt: 提示词；completion: 回复正文。
+// [返回] usage 对象。
+// 最近修改时间：2026-10-18；改动原因：新增，用量对象构造。
+func buildUsage(prompt, completion string) map[string]any {
+	p := estimateTokens(prompt)
+	c := estimateTokens(completion)
+	return map[string]any{
+		"prompt_tokens":     p,
+		"completion_tokens": c,
+		"total_tokens":      p + c,
+		"estimated":         true,
+	}
 }
 
 // buildImageMarkdown 把图片地址拼成 Markdown 图片段。

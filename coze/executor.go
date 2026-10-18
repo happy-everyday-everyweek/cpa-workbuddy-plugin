@@ -524,7 +524,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, errRun
 	}
 
-	payload, errBuild := buildCompletion(newCompletionID(), model, content)
+	payload, errBuild := buildCompletion(newCompletionID(), model, content, buildUsage(prompt, content))
 	if errBuild != nil {
 		return nil, errBuild
 	}
@@ -660,7 +660,7 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 
 	id := newCompletionID()
 	emit := func(delta string) error {
-		chunk, errBuild := buildChunk(id, model, delta, nil)
+		chunk, errBuild := buildChunk(id, model, delta, nil, nil)
 		if errBuild != nil {
 			return errBuild
 		}
@@ -675,7 +675,7 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 	}
 
 	exec := newCozeExecutor(sa, model, nil)
-	_, errRun := exec.runStream(ctx, prompt, emit)
+	reply, errRun := exec.runStream(ctx, prompt, emit)
 
 	finishReason := openAIFinishStop
 	if errRun != nil {
@@ -684,7 +684,10 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 		finishReason = openAIFinishLength
 	}
 
-	if terminal, errTerminal := buildChunk(id, model, "", &finishReason); errTerminal == nil {
+	// 用量挂在终止帧上：宿主与 new-api 都从这一帧取 token 数，
+	// 缺了会让整轮请求记零用量、下游无法计费。
+	terminal, errTerminal := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply))
+	if errTerminal == nil {
 		_ = streamEmit(streamID, terminal)
 	}
 }
@@ -708,7 +711,7 @@ func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.Exec
 	}
 
 	emit := func(delta string) error {
-		chunk, errBuild := buildChunk(id, model, delta, nil)
+		chunk, errBuild := buildChunk(id, model, delta, nil, nil)
 		if errBuild != nil {
 			return errBuild
 		}
@@ -717,13 +720,13 @@ func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.Exec
 	}
 
 	exec := newCozeExecutor(sa, model, nil)
-	_, errRun := exec.runStream(ctx, prompt, emit)
+	reply, errRun := exec.runStream(ctx, prompt, emit)
 
 	finishReason := openAIFinishStop
 	if errRun != nil {
 		finishReason = openAIFinishLength
 	}
-	if terminal, errTerminal := buildChunk(id, model, "", &finishReason); errTerminal == nil {
+	if terminal, errTerminal := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply)); errTerminal == nil {
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: terminal})
 	}
 	return chunks, nil

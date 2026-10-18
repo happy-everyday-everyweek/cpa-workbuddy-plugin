@@ -100,7 +100,7 @@ func TestBuildChunkShapes(t *testing.T) {
 	stop := openAIFinishStop
 
 	t.Run("内容帧未结束", func(t *testing.T) {
-		raw, err := buildChunk("id1", "coze/m", "hi", nil)
+		raw, err := buildChunk("id1", "coze/m", "hi", nil, nil)
 		if err != nil {
 			t.Fatalf("构造失败: %v", err)
 		}
@@ -126,7 +126,7 @@ func TestBuildChunkShapes(t *testing.T) {
 	})
 
 	t.Run("空内容终止帧", func(t *testing.T) {
-		raw, err := buildChunk("id1", "coze/m", "", &stop)
+		raw, err := buildChunk("id1", "coze/m", "", &stop, nil)
 		if err != nil {
 			t.Fatalf("构造失败: %v", err)
 		}
@@ -159,7 +159,7 @@ func TestBuildFirstChunkHasRole(t *testing.T) {
 // [返回] 无。
 // 最近修改时间：2026-10-18；改动原因：新增，非流式契约。
 func TestBuildCompletionShape(t *testing.T) {
-	raw, err := buildCompletion("id1", "coze/m", "完整回答")
+	raw, err := buildCompletion("id1", "coze/m", "完整回答", nil)
 	if err != nil {
 		t.Fatalf("构造失败: %v", err)
 	}
@@ -184,6 +184,86 @@ func TestBuildCompletionShape(t *testing.T) {
 	}
 	if resp.Choices[0].FinishReason != openAIFinishStop {
 		t.Errorf("finish_reason = %q", resp.Choices[0].FinishReason)
+	}
+}
+
+// TestBuildUsageEstimatesTokens 验证 usage 估算。
+//
+// 扣子没有 token 计数端点，帧里也不带用量；缺 usage 会让宿主记 0 输入、
+// new-api 显示 `Tokens: -` 且无法计费（2026-10-18 生产实测）。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，下游零计费回归。
+func TestBuildUsageEstimatesTokens(t *testing.T) {
+	usage := buildUsage("你好", "世界很大")
+	p, _ := usage["prompt_tokens"].(int)
+	c, _ := usage["completion_tokens"].(int)
+	total, _ := usage["total_tokens"].(int)
+	if p != 2 {
+		t.Errorf("prompt_tokens = %d，期望 2（两个 CJK 字符）", p)
+	}
+	if c != 4 {
+		t.Errorf("completion_tokens = %d，期望 4", c)
+	}
+	if total != p+c {
+		t.Errorf("total_tokens = %d，期望 %d", total, p+c)
+	}
+	if usage["estimated"] != true {
+		t.Errorf("必须标记 estimated，避免把估算值当实测数据")
+	}
+}
+
+// TestUsageOnlyInTerminalChunk 验证 usage 只出现在终止帧。
+//
+// OpenAI 约定流式用量挂在最后一帧；中间帧带 usage 会被客户端当重复计费。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，用量位置契约。
+func TestUsageOnlyInTerminalChunk(t *testing.T) {
+	stop := openAIFinishStop
+
+	content, errContent := buildChunk("id1", "coze/m", "hi", nil, nil)
+	if errContent != nil {
+		t.Fatalf("构造失败: %v", errContent)
+	}
+	if strings.Contains(string(content), `"usage"`) {
+		t.Errorf("内容帧不应带 usage: %s", content)
+	}
+
+	terminal, errTerminal := buildChunk("id1", "coze/m", "", &stop, buildUsage("hi", "hello"))
+	if errTerminal != nil {
+		t.Fatalf("构造失败: %v", errTerminal)
+	}
+	if !strings.Contains(string(terminal), `"usage"`) {
+		t.Errorf("终止帧必须带 usage: %s", terminal)
+	}
+}
+
+// TestBuildCompletionCarriesUsage 验证非流式响应带 usage。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，非流式用量契约。
+func TestBuildCompletionCarriesUsage(t *testing.T) {
+	raw, err := buildCompletion("id1", "coze/m", "完整回答", buildUsage("问题", "完整回答"))
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	var resp struct {
+		Usage struct {
+			PromptTokens     int  `json:"prompt_tokens"`
+			CompletionTokens int  `json:"completion_tokens"`
+			TotalTokens      int  `json:"total_tokens"`
+			Estimated        bool `json:"estimated"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if resp.Usage.PromptTokens <= 0 || resp.Usage.CompletionTokens <= 0 {
+		t.Errorf("usage 不应为零值: %+v", resp.Usage)
+	}
+	if resp.Usage.TotalTokens != resp.Usage.PromptTokens+resp.Usage.CompletionTokens {
+		t.Errorf("total_tokens 不等于两项之和: %+v", resp.Usage)
 	}
 }
 
