@@ -45,6 +45,9 @@
   - **模型清单澄清**：16 个模型是 `/v1/model/list`（在线 9）+ 多模态目录（8，去重 1）动态合并结果，与 CPA `/v1/models` 逐条一致；`staticFallbackModels()` 的 5 条仅用于启动期无账号兜底。
   - **0.3.6（22:00:10 热重载）**：修复 `/v1/responses` 入口必然 503。根因 `executorRequestBody` 优先读 `OriginalRequest`（客户端原始体，Responses 入口只有 `input`），而宿主只翻译 `Payload`；解析失败还会让宿主把账号标记不可用，连带 chat 请求 503。改为 Payload 优先。生产验收：responses 非流式 / 流式 / chat 三场景均 200，账号 `auth_state=ok`，`请求缺少 messages` 归零。
   - **待办**：new-api 渠道 4「混合」的 `models` 仍需手工追加 coze 模型名，否则 new-api 侧不会转发到 CPA。
+  - **0.4.0（并行会话）**：打通对话内生图，图片按 Markdown 在正文后下发；已发布并生产验收。
+  - **0.4.1（2026-10-19 00:27:28 热重载）**：修复下游用量全部记零。根因：插件从未输出 `usage`，而扣子上游无 token 计数端点、WS 帧也不带用量，宿主只能拿到零值。改为流式终止帧 + 非流式响应体输出 OpenAI 规范 usage，按字符特征估算并标记 `estimated:true`。生产验收：两条路径均输出 `9/2/11`，中间帧不带 usage；零容器重启。
+  - **待办（新）**：`token-usage-tracker` 的 `/stats/groups` 查不到 coze-provider 行（其 `usage.handle` 日志确认已收到记录），属该插件聚合口径问题，不影响 CPA/new-api 计费取值。
 
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
