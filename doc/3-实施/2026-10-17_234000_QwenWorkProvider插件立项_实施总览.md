@@ -424,6 +424,23 @@ QwenWork 无对应语义，但实测四种常见 110 形态均不误伤，保留
 
 完整根因链见 `doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`。
 
+**缺陷修复（2026-10-18，0.2.7）：额度耗尽未被识别，面板永久「加载中」**
+
+用户提供生产面板截图：账号 `u9c993791` 的「可用积分」永久转圈，且无任何 0 积分表现。
+
+根因两层：
+
+1. **信号未映射**：上游 `account-context` 明确返回 `quota.exceeded=true`、`remaining=0`，但钱包三项全为 0。`fetchUserResource` 只用 `exceeded` 把 `TotalRemain` 归零，**没有写进快照** ⇒ 快照三项数值全 0、无 packages ⇒ `isCreditsExhausted` 判为「数据未知」而非「耗尽」⇒ 面板走「加载中…」分支。
+2. **产品前提被推翻**：插件四处（lifecycle / active_auth / policy / 面板文案）按「0 积分仍可用免费模型」设计。生产用该账号签发 MaaS 会话实测 `qwen3.8-max-preview` / `qwen3.8-flash` / `qwen3.8-plus` / `glm-5.2` **全部 429 `balance_insufficient`** —— QwenWork 没有免费模型。
+
+修复四处：① `creditsSummary` 新增 `Exceeded`，解析抽成纯函数 `buildCreditsSummary`；② 新增 `isCreditsLowOrExhausted`，调度/换号/可路由统一排除；③ 新增 `disableAuth`（`disabled:true` + `exhausted_disable:true`，积分恢复自动启用；`manual_disable` 永不被自动改动）；④ 面板新增 `isAccountExhausted` 单一判定入口，耗尽显示「已耗尽 · 余0」。
+
+`lifecycle_auto` 开关语义保留：写 disabled 需开启；**路由排除与面板展示无条件生效**。
+
+变异反证三组全部命中（其中 `buildCreditsSummary` 接线变异首次未捕获，抽函数补测后才命中——与 0.2.6 的 `mintPayload` 同类陷阱）。
+
+完整根因见 `doc/4-bugs/2026-10-18_173000_qwenwork额度耗尽未识别致面板永久加载中根因诊断.md`。
+
 ### CYCLE-03：额度与生命周期
 
 - `account-context` + `wallets` 额度查询
