@@ -473,6 +473,11 @@ func parseFrontierMessage(payload []byte) (*frontierMessage, bool) {
 	msg := &frontierMessage{ID: raw.ID}
 
 	// content 承载增量片段；它本身是 JSON 字符串，需要二次解析。
+	//
+	// 但 event_final 帧是例外：它的 content 装的是**累积全文**而不是增量。
+	// 照单全收会把整篇正文再追加一遍，客户端看到答案重复两遍
+	// （2026-10-18 生产实测：末帧 578 字 == 前文拼接，全文 1156 字）。
+	// 所以先解析 content_v2 拿到 phase，再决定 content 的语义。
 	if inner := strings.TrimSpace(raw.Content); inner != "" {
 		var parsed frontierContentInner
 		if err := json.Unmarshal([]byte(inner), &parsed); err == nil {
@@ -501,6 +506,11 @@ func parseFrontierMessage(payload []byte) (*frontierMessage, bool) {
 				}
 			}
 		}
+	}
+
+	// final 帧的 content 是累积全文，不能当增量累加。
+	if msg.Phase == "event_final" {
+		msg.Delta = ""
 	}
 
 	return msg, true

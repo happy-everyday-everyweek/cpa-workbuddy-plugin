@@ -32,13 +32,14 @@
 
 ## 活动会话进展摘要
 
-- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收发现两处真实缺陷，修复到 0.3.2**：
+- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收连修三处真实缺陷（0.3.1/0.3.2/0.3.3）**：
   - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS → 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200。
   - **缺陷 1（0.3.0 → 0.3.1）：流式响应 500**。生产 `POST /v1/chat/completions` 立即返回 `json: unsupported type: <-chan pluginapi.ExecutorStreamChunk`。根因：宿主 `rpcExecutorStreamResponse.Chunks` 是 **slice**（`internal/pluginhost/rpc_schema.go:52`），`rpc_client_stream.go:29` 先判 `len()` 再转 channel；0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化即失败。修复：带 `stream_id` 时立即返回响应头，后台用 `host.stream.emit` 逐帧推送、`host.stream.close` 收尾；无 `stream_id` 时同步收集返回 slice；补 `X-Accel-Buffering: no`。回归 `TestStreamResponseSerializable`（变异回 channel 形态精确复现生产报错文案）。发布链 `06bb281` → CI `39121930862` success → registry `45e6851` → 远端 ALL PASS → 生产热重载 `active_version=0.3.1 retired_version=0.3.0`，落盘 sha256 `50dfcd41…` 与本地一致。
   - **缺陷 2（0.3.1 → 0.3.2）：WS 握手缺 Cookie，只能收到心跳**。0.3.1 后流式虽完整但耗时 92 秒、正文在最后一帧一次性到达——首帧后 91 秒零增量，正好卡在首字超时 90s，实际走轮询兜底。**对照实验（同一生产账号，仅差 Cookie 头）**：不带 Cookie 6 帧全是 `hi`；带 Cookie 25 帧含 21 条二进制业务帧，0.34–4.25s 陆续到达。**根因**：frontier 网关对无 Cookie 握手照样返回 101，但只推心跳。修复：`frontierClient` 增加 `cookieHeader`，`runOnce` 握手写入 `Cookie`；`runStream` 传 `sa.CookieHeader`。回归 `TestFrontierHandshakeCarriesCookie`（变异删头精确 FAIL）。
   - **生产日志佐证**：`frontier 已连接`（19:19:06）→ `连接中断`（19:20:37）相隔 91 秒，中间零业务帧。
+  - **缺陷 3（0.3.2 → 0.3.3）：正文重复一遍**。0.3.2 部署后生产时序验收：总耗时从 92s 降到 17.71s、29 个正文帧在 5.02–17.70s 陆续到达（间隔约 0.3s），真流式恢复。但发现末帧 578 字**恰好等于前文拼接**，全文 1156 字重复输出两遍。**根因**：`content.message_data.reply.content` 在 `event_delta` 是增量、在 `event_final` 是**累积全文**，`parseFrontierMessage` 一视同仁当 delta 追加。修复：解析完 `content_v2` 拿到 phase 后，`event_final` 清空 `Delta` 只留 `Snapshot`。回归 `TestParseFinalFrameDoesNotDuplicate` + `TestParseDeltaFrameKeepsDelta`（变异移除清空逻辑精确 FAIL）。
   - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
-  - **待办**：0.3.2 走完整发布链并重新做生产流式验收（期望首帧后毫秒级陆续出字，而非 90 秒后一次性）。
+  - **待办**：0.3.3 走完整发布链并做最终生产流式验收（期望增量陆续到达 + 正文不重复）。
 
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
@@ -94,11 +95,11 @@
   - **CI 阻断修复（既有缺陷，非本轮引入）**：`go-cross/cgo-actions@v1` 内硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从 `download.freebsd.org/releases` 下线（404），既有 patch 指向的 `archive.freebsd.org/old-releases` 同样 404，导致全部 10 插件 freebsd-amd64 构建失败并连带 `Release` job 被 skipped。已改为在 wget 包装层把 `14.3-RELEASE` 改写为仍可用的 `14.4-RELEASE`。
   - **生产验收边界**：热重载后 15 分钟窗口内无断流事件，端到端「断流 → 换号 → 第二次成功」未能实证；已改为确认新符号 `shouldRotateOnStreamReadError` / `after partial output` / `daily cooling persist failed` 已进入三插件生产二进制（qoderwork 另含 `mergeActiveDailyCooling`），服务 `/v1/models` 200、无 error/panic 日志。后续需在真实断流发生时观察日志。
   - 文档：`doc/4-bugs/2026-10-17_202500_qoderwork流式中途断流不换号且24h冷却未落盘根因诊断.md`、`doc/3-实施/2026-10-17_203500_qoder三插件流式断流换号与冷却落盘修复实施总览.md`（§14 记录执行结果与偏差）。
-- 上一会话（2026-10-15）：**跨插件同步第二轮复检（只读审计）**：以 md5 对比 + 机制分布 grep + 版本矩阵复核对 9 插件做跨维度审计，原批次 A~D 全部闭环；新登记 G1（zcode `handleSchedulerPick` 越界，因调度器在任者是 copilot 而潜伏）、G2（http_status 推广）、G3（copilot 用量上报）、G4（token-usage 补 traework 映射）。文档同步两份实施总览。
+- 会话（2026-10-15，已压缩）：**跨插件同步第二轮复检（只读审计）**：以 md5 对比 + 机制分布 grep + 版本矩阵复核 9 插件，原批次 A~D 全部闭环。
 
 - 会话（2026-10-15，已压缩）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20）**：根因是模板 baseprompt 的 agent 上下文 + 插件重建 messages 丢掉 `tool_calls`/`tool_call_id`；方案 A 补三字段并同步自定义 `UnmarshalJSON`（陷阱：加字段必须同步解析否则恒空）。**判别力边界**：单工具任务 6/6 无判别力，探索型任务不收敛 ⇒ 只修结构丢失，不承诺消除持续工具调用。发布链 `f74a5e8`→`6d32f84`→`d9e8592`→`5124003`，热重载零重启，远端 14/14 ALL PASS。
 
-- 上一会话（2026-10-15）：**五插件签到节奏统一为每 4 小时，四插件全链路发布生产**：workbuddy/workbuddy-ai/traework 后端本就六槽；qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效的 `shouldRunCheckinNow` 门控（两表取值一致后恒真）；同步修正 workbuddy/traework 面板与文档长期错标的 `09:00/21:00`。发布链 `91ca440`→CI→`cf40437`(32 assets)→`97db81e`(registry)→`8c2ea35`(prune)。生产四插件热重载零重启，`.so` 与 zip 逐字节一致，远端 28/28 ALL PASS。
+- 会话（2026-10-15，已压缩）：**五插件签到节奏统一为每 4 小时**：qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效门控；修正面板与文档错标的 `09:00/21:00`；四插件发布生产、零重启，远端 28/28 ALL PASS。
 
 - 会话（2026-10-15，已压缩）：**zcode-provider 0.1.31 面板额度改为逐模型独立进度条**：`quotaHTML` 由单条汇总条改为按 `entitlements[]` 逐模型渲染，移除「过期」行；回归脚本补逐模型断言；发布链 `0702b84`→CI success→`b7b754a`(assets)→`0d6c46a`(registry)；生产面板 `pb-item`/`pb-name` 各 4 处、旧结构残留 0。
 

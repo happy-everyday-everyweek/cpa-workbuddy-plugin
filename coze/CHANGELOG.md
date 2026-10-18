@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.3 (2026-10-18)
+
+### 修复
+
+- **正文重复一遍：`event_final` 的累积全文被当成增量追加**。0.3.2 恢复真流式
+  后，生产实测 39 个正文帧、正文 1156 字，其中末帧 578 字**恰好等于前文
+  拼接**——同一段答案完整输出了两遍。
+- **根因**：`content.message_data.reply.content` 在 `event_delta` 帧里是增量，
+  但在 `event_final` 帧里装的是**累积全文**。`parseFrontierMessage` 对所有
+  reply 帧一视同仁地取 content 当 delta，收尾帧就把全文又追加了一次。
+- **修复**：解析完 `content_v2` 拿到 `phase` 后，`event_final` 帧清空 `Delta`，
+  只保留 `Snapshot` 供校对。
+
+### 测试
+
+- 新增 `TestParseFinalFrameDoesNotDuplicate`（final 帧 delta 必须为空）与
+  `TestParseDeltaFrameKeepsDelta`（普通增量帧仍保留 delta）。
+  变异移除清空逻辑后前者精确失败。
+
 ## 0.3.2 (2026-10-18)
 
 ### 修复

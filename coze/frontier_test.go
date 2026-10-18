@@ -417,3 +417,64 @@ func mustJSONString(t *testing.T, s string) string {
 	}
 	return string(raw)
 }
+
+// TestParseFinalFrameDoesNotDuplicate 验证 event_final 不把全文当增量。
+//
+// event_final 帧的 content 装的是累积全文；若当 delta 追加，
+// 客户端会看到答案完整重复一遍（2026-10-18 生产实测：末帧 578 字
+// == 前文拼接，全文 1156 字）。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，正文重复缺陷回归。
+func TestParseFinalFrameDoesNotDuplicate(t *testing.T) {
+	inner := `{"id":"m1","message_type":"reply","message_data":{"reply":{"content":"完整答案","reply_to_message_id":"u1","stream":true}},"turn_id":"t1"}`
+	innerV2 := `{"source":0,"session":{"phase":"event_final","seq_num":"9","turn_id":"t1","final":{"type":"agent.message","agent_message_event":{"content":[{"type":"text","text":{"content":"完整答案"}}]}}}}`
+	payload, errMarshal := json.Marshal(map[string]any{
+		"id":           "m1",
+		"message_type": "reply",
+		"content":      inner,
+		"content_v2":   innerV2,
+	})
+	if errMarshal != nil {
+		t.Fatalf("构造载荷失败：%v", errMarshal)
+	}
+
+	msg, found := parseFrontierMessage(payload)
+	if !found {
+		t.Fatal("应当命中 reply 帧")
+	}
+	if msg.Delta != "" {
+		t.Errorf("final 帧的 delta 必须为空，实际 %q", msg.Delta)
+	}
+	if msg.Snapshot != "完整答案" {
+		t.Errorf("快照 = %q", msg.Snapshot)
+	}
+	if !msg.isFinal() {
+		t.Error("应当判定为收尾帧")
+	}
+}
+
+// TestParseDeltaFrameKeepsDelta 验证普通增量帧仍然保留 delta。
+//
+// 修复不能伤及正常路径：event_delta 的 content 就是增量。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，增量路径守卫。
+func TestParseDeltaFrameKeepsDelta(t *testing.T) {
+	inner := `{"id":"m1","message_type":"reply","message_data":{"reply":{"content":"片段","reply_to_message_id":"u1","stream":true}},"turn_id":"t1"}`
+	innerV2 := `{"session":{"phase":"event_delta","seq_num":"8","turn_id":"t1"}}`
+	payload, _ := json.Marshal(map[string]any{
+		"id":           "m1",
+		"message_type": "reply",
+		"content":      inner,
+		"content_v2":   innerV2,
+	})
+
+	msg, found := parseFrontierMessage(payload)
+	if !found {
+		t.Fatal("应当命中 reply 帧")
+	}
+	if msg.Delta != "片段" {
+		t.Errorf("增量 = %q，期望 片段", msg.Delta)
+	}
+}
