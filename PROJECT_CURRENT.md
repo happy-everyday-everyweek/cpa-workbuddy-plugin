@@ -57,15 +57,9 @@
   - **安装坑**：`plugin-store install` 不带 `source` 参数报 `direct plugin version "x" not found`（多源合并路径版本解析失败），必须带 `&source=source-636fa01121af`。
   - **有意保留**：`clientUA = "qoderwork/1.3.1"` 是实测通过的 UA（探针同值），非残留；`isDailyCountExceeded` 的 110 判定实测四形态不误伤，留作防御。
   - 文档：实施总览 § CYCLE-02 执行结果、`doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`、`doc/5-tests/2026-10-18_021000_*`、`doc/6-review/2026-10-18_021000_*`（STYLE: PASS）。
-- 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：
-  - 需求背景：用户发现千问办公（qwenwork.cn，与 Qoder 不同产品）并希望做成 CPA 插件；先分析开源与插件库（无现成项目）→ 选方案 A 做真实登录验证 → 参照 workbuddy 插件功能实现。
-  - **协议链路（真机实证）**：Device Flow + PKCE（`gateway.qwenwork.cn`，`clientId=e883ade2-…`，`redirect=qwenwork-cn://`）换宿主 token（JWT 7d）→ `POST /api/desktop-sessions`（**返回 201 非 200**）签发 `sk-mm-v1.*` 短票据（TTL 2h）→ 裸 Bearer 打 `{base_url}/v1/chat/completions`；轮换走 `POST {base}/v1/access-tokens/exchange`。MaaS 无 `/v1/models`（404），真实目录在 `GET /api/desktop/chat-modes`（`schema_version=2`，仅 flash / pro / qwen3.8-max-preview 三档）。
-  - **实现要点**：QwenWork 说标准 OpenAI 协议，故推理改**请求体透传**（`payload.go` 仅强制 `stream=true` + `max_tokens` 自适应放宽），删除 Qoder 模板链（`baseprompt.json` 59KB / `encoding.go` / `buildQoderBody` / `alignToolsWithClient`）与 COSY 签名。管理路由收敛为 13 条（移除 checkin / growth / trial / claim-pro / PAT import）。版本三处统一 `0.1.0`（VERSION / main.go / registry）。
-  - **验证**：cgo-shim build/vet/test 全绿（145 个 Test 函数）；WSL 真实 cgo 构建 7.85MB ELF，`cliproxyPluginCall`/`Free`/`Shutdown` 符号齐全、版本串 `0.1.0`、`gateway.qwenwork.cn` ×6、`qoder.com.cn` ×0；真实账号 MaaS 签发 201 + OpenAI(`glm-5.2`) 与 Anthropic(`qwen3.8-max`) 双协议推理均 200。
-  - **发布闭环**：`a9585c7`(源码 69 文件 + CI 8 处接入点) → dispatch CI run `39050879075` success（Test 12/12 + 7 平台构建全绿）→ `91e050e`(assets) → `14bc392`(对齐并行会话的 6 平台口径，删 freebsd) → `3568d37`(registry + 官方图标)。远端 6/6 artifacts HTTP 200 且 Content-Length 与 registry size 逐一相符；registry 11 插件无空 artifacts 条目；按宿主 `internal/pluginstore` 源码复刻的校验谓词全部通过。
-  - **并行会话冲突处置**：① 我先前补的 CI 接入点被 `99034bb` 以「qwenwork/go.mod 未入库致 setup-go 失败、连带跳过所有 Release job」为由移除，本轮源码与 CI 在**同一提交**落地；② `398a206` 提前写入的 coze-provider `artifacts: []` 占位条目（其 GitHub release 实测 404）会让 CPA 整体拒绝 registry 源，已由 `13cb542` 撤回，待 coze 产物就绪后再由 `publish-assets.py` 回填。
-  - **图标修正**：`pluginLogoURL` 原指向 `DGZSbot/ai-icon/QwenWork.png`（实测 404，面板与账号行会破图），改为仓库内 `assets/icons/QwenWork.png`（取自千问办公客户端自带的官方 1024×1024 资源）。
-  - 未验证：生产 `plugin-store install` 与热重载（本轮止于 registry 发布）；多账号调度、配额生命周期、Anthropic 输出（CYCLE-02/03/06 未启动）。
+  - **额度耗尽修复（0.2.7，2026-10-18）**：用户指出面板账号「可用积分」永久卡「加载中…」且无 0 积分耗尽表现。根因两层：① 上游 `quota.exceeded=true` 未写入快照，免费版账号 `total_used/total_size` 恒 0 ⇒ 确定耗尽被判成「未知」；② 四处代码按「0 积分仍可用免费模型」设计，但生产实测该账号对 `qwen3.8-max-preview`/`flash`/`plus`/`glm-5.2` **全部 429 `balance_insufficient`**——QwenWork 无免费模型。修复：`creditsSummary` 加 `Exceeded`、解析抽 `buildCreditsSummary`；新增 `isCreditsLowOrExhausted` 统一调度/换号/可路由排除；新增 `disableAuth`（`disabled`+`exhausted_disable`，恢复自动启用，`manual_disable` 永不自动改）；面板 `isAccountExhausted` 单一入口 + 「已耗尽 · 余0」。`lifecycle_auto` 默认关闭（写 disabled 需开启），路由排除与面板展示无条件生效。
+  - **0.2.7 发布与生产验收**：CI `39114864713` 全绿 → `f1fa228`(registry) → 生产 install `restart_required:false`、`hot reloaded active_version=0.2.7 retired_version=0.2.6`、容器 Up 2 days 零重启；落盘 `.so` sha256 `235a3720…96258` 与 zip 逐字节一致；`/accounts` 返回该账号 `exhausted=true exceeded=true`；面板资源含 `isAccountExhausted`×7 与「已耗尽 · 余0」；推理 `qwen3.8-max-preview`/`qwen-3.8-max` 均 200（调度正确跳过耗尽账号）。
+- 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：Device Flow + PKCE（`gateway.qwenwork.cn`）换宿主 JWT → `POST /api/desktop-sessions`（**201 非 200**）签发 `sk-mm-v1.*` 短票据（TTL 2h）→ 裸 Bearer 打 `{base_url}/v1/chat/completions`；MaaS 无 `/v1/models`，目录在 `GET /api/desktop/chat-modes`。推理走**请求体透传**（仅强制 `stream=true` + `max_tokens` 自适应），管理路由收敛 13 条。发布链 `a9585c7` → CI `39050879075` → `91e050e` → `14bc392`(6 平台) → `3568d37`(registry)；图标改用仓库内 `assets/icons/QwenWork.png`（原外链 404）。
 - 当前会话（2026-10-18）：**发布矩阵下线 freebsd-amd64，平台数 7 → 6**：
   - 需求背景：用户反馈「7 平台产物里有一个平台之前构建时出过问题，能否缩减」，并裁定「只砍 freebsd-amd64」。
   - 根因确认：`go-cross/cgo-actions@v1` 硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从官方源下架（404），2026-10-17 曾导致全部 10 插件 freebsd 构建集体失败并连带 Release job skipped；当时的 wget 包装层改写 `14.3→14.4` 属绕过，本次直接下线该平台根治。
@@ -160,7 +154,7 @@
 {
   "version": 5,
   "registry_schema": "task_plan_projection_registry",
-  "registry_updated_at": "2026-10-17T18:06:46Z",
+  "registry_updated_at": "2026-10-18T09:12:12Z",
   "projections": [
     {
       "projection_id": "SESSION/30608b3616fa2311bfb720a2776c09ac96b2738601ec3752b03a252c810cdb70",
@@ -396,6 +390,34 @@
         {
           "id": "TASK-005",
           "step": "[TASK-005] 双账号故障切换验证 + 文档与风格收口",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "projection_id": "SESSION/b104d3bd7fe586700ffcf91a64d1b13f225f91728325744aad9b76fccf1540cb",
+      "session_id": "b98da698-d42c-4920-afdf-34f3bc242d7c",
+      "projection_origin": "persisted",
+      "synthesis_mode": "none",
+      "state": "active",
+      "plan_key": "DIAG-PROJECT-DISK-USAGE-20261018",
+      "source_document": "doc/4-bugs/2026-10-18_172500_项目磁盘占用过大根因诊断.md",
+      "plan_fingerprint": "41eebc847b50e161b00543a1659f14721dff70011ae0728f14474bf54e37d36c",
+      "updated_at": "2026-10-18T09:12:12Z",
+      "steps": [
+        {
+          "id": "TASK-001",
+          "step": "[TASK-001] 统计工作树各目录与 .git 的真实磁盘占用",
+          "status": "completed"
+        },
+        {
+          "id": "TASK-002",
+          "step": "[TASK-002] 定位大体积来源：release-assets、Git 对象、缓存、构建产物",
+          "status": "completed"
+        },
+        {
+          "id": "TASK-003",
+          "step": "[TASK-003] 归纳根因与安全清理建议，落盘诊断文档",
           "status": "completed"
         }
       ]
