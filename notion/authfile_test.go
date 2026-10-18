@@ -499,3 +499,50 @@ func TestRetireStaleAccountsArchivesSameUser(t *testing.T) {
 		t.Fatal("其他用户的账号不能被归档")
 	}
 }
+
+// TestMapLegacyAccountByUserAndSpace 校验拆分前的旧账号记录能映射到新账号。
+//
+// 宿主持久化存储里可能仍保留拆分前的账号记录并继续派发；这些记录与新账号
+// 指向同一空间，按 user_id + space_id 映射回去即可，升级后不会报错。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，升级兼容回归。
+func TestMapLegacyAccountByUserAndSpace(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	paid := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-paid",
+		CookieHeader: "token_v2=new; notion_user_id=u", TokenV2: "new",
+		UserID: "u", SpaceID: "space-paid",
+	}
+	free := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-free",
+		CookieHeader: "token_v2=new; notion_user_id=u", TokenV2: "new",
+		UserID: "u", SpaceID: "space-free",
+	}
+	for _, a := range []*StoredAuth{paid, free} {
+		if errWrite := writeAuthFileDirect(filepath.Join(dir, a.AuthID+notionAuthFileSuffix), a); errWrite != nil {
+			t.Fatalf("落盘失败：%v", errWrite)
+		}
+	}
+
+	// 旧记录：旧 authID、旧 token、同样的 user 与 space。
+	legacy := &StoredAuth{
+		AuthID: "notion-legacy", UserID: "u", SpaceID: "space-free",
+	}
+	got := mapLegacyAccount(legacy)
+	if got == nil || got.AuthID != "notion-free" {
+		t.Fatalf("旧记录应映射到免费空间账号，实际：%+v", got)
+	}
+
+	// 空间对不上时不能随便挑一个账号，否则会把请求打到错误空间。
+	if got := mapLegacyAccount(&StoredAuth{UserID: "u", SpaceID: "space-missing"}); got != nil {
+		t.Fatalf("空间不匹配时不应映射：%s", got.AuthID)
+	}
+	// 缺 user 或 space 时也不映射。
+	if got := mapLegacyAccount(&StoredAuth{SpaceID: "space-free"}); got != nil {
+		t.Fatal("缺少 user_id 时不应映射")
+	}
+}

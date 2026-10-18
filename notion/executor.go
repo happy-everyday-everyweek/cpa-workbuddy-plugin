@@ -131,22 +131,28 @@ func handleExecStream(raw []byte) ([]byte, error) {
 // 本地账号标识不带扩展名，因此比较前必须剥离，否则永远匹配不上。
 // [参数] storageJSON: 账号 JSON；authID: 账号标识。
 // [返回] 账号与错误。
-// 最近修改时间：2026-10-19；改动原因：剥离 .json 后缀并跳过停用账号，修复别名路由后取不到号。
+// 最近修改时间：2026-10-19；改动原因：补旧账号映射，避免升级后残留记录取不到号。
 func resolveAuth(storageJSON []byte, authID string) (*StoredAuth, error) {
+	var payload StoredAuth
+	hasPayload := false
 	if len(storageJSON) > 0 {
-		var auth StoredAuth
-		if errUnmarshal := json.Unmarshal(storageJSON, &auth); errUnmarshal == nil && auth.CookieHeader != "" {
-			if auth.AuthID == "" {
-				auth.AuthID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
-			}
-			if auth.SpaceID == "" && len(auth.Spaces) > 0 {
-				auth.SpaceID = auth.Spaces[0].ID
-			}
-			if auth.SpaceID == "" {
-				return nil, fmt.Errorf("账号缺少 space_id，请重新导入 Cookie")
-			}
-			return &auth, nil
+		if errUnmarshal := json.Unmarshal(storageJSON, &payload); errUnmarshal == nil {
+			hasPayload = true
 		}
+	}
+
+	if hasPayload && payload.CookieHeader != "" {
+		auth := payload
+		if auth.AuthID == "" {
+			auth.AuthID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
+		}
+		if auth.SpaceID == "" && len(auth.Spaces) > 0 {
+			auth.SpaceID = auth.Spaces[0].ID
+		}
+		if auth.SpaceID == "" {
+			return nil, fmt.Errorf("账号缺少 space_id，请重新导入 Cookie")
+		}
+		return &auth, nil
 	}
 
 	authID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
@@ -162,7 +168,44 @@ func resolveAuth(storageJSON []byte, authID string) (*StoredAuth, error) {
 			}
 		}
 	}
+
+	// 拆分前的旧账号按「用户 + token」命名，宿主存储里可能仍保留着这些
+	// 记录并继续派发。它们与新账号指向同一空间，按载荷里的 user_id /
+	// space_id 映射回去即可，既不会报错也不会多消耗一份额度。
+	if hasPayload {
+		if mapped := mapLegacyAccount(&payload); mapped != nil {
+			return mapped, nil
+		}
+	}
 	return nil, fmt.Errorf("未找到可用账号")
+}
+
+// mapLegacyAccount 把旧版账号记录映射到拆分后的空间账号。
+//
+// 只认「同 user_id + 同 space_id」：旧记录的 space_id 就是它当初使用的
+// 空间，映射后与原行为完全一致。凭据为空或账号已停用时不做映射，
+// 让调用方明确报「未找到可用账号」而不是悄悄打到别的空间。
+// [参数] payload: 宿主下发的账号载荷。
+// [返回] 匹配到的账号；无法映射时返回 nil。
+// 最近修改时间：2026-10-19；改动原因：新增，升级兼容映射。
+func mapLegacyAccount(payload *StoredAuth) *StoredAuth {
+	if payload == nil {
+		return nil
+	}
+	userID := strings.TrimSpace(payload.UserID)
+	spaceID := strings.TrimSpace(payload.SpaceID)
+	if userID == "" || spaceID == "" {
+		return nil
+	}
+	for _, auth := range listHostAuthFiles() {
+		if auth.Disabled || auth.CookieHeader == "" {
+			continue
+		}
+		if auth.UserID == userID && auth.SpaceID == spaceID {
+			return auth
+		}
+	}
+	return nil
 }
 
 // inferenceResult 是一次推理的汇总结果。
