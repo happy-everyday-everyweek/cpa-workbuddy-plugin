@@ -293,6 +293,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		collector := &sseUsageCollector{}
 		var sseErr string
 		emitted := false
+		contentEmitted := false
 		scanner := bufio.NewScanner(newHostStreamReader(stream))
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 		for scanner.Scan() {
@@ -313,6 +314,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			if cleaned == "" {
 				continue
 			}
+			if streamChunkHasContent(chunkJSON) {
+				contentEmitted = true
+			}
 			if sseFramed {
 				cleaned = "data: " + cleaned
 			}
@@ -324,22 +328,26 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			}
 			emitted = true
 		}
-		// 断流失败：零泄漏时换号续试，已泄漏时透传错误。
+		// 断流失败：正文零泄漏时换号续试，已出正文时透传错误。
 		stream.Close()
 		if err := scanner.Err(); err != nil {
 			readErrMsg := fmt.Sprintf("upstream stream read error: %v", err)
-			// 已泄漏分片时在错误文本中打标记，抑制信封状态码
-			if emitted {
+			// 已泄漏正文分片时打标记，抑制换号与信封状态码；仅思考分片单独标记，仍可换号
+			if contentEmitted {
 				readErrMsg = fmt.Sprintf("upstream stream read error: %v (%s)", err, streamReadErrorLeakedMarker)
+			} else if emitted {
+				readErrMsg = fmt.Sprintf("upstream stream read error: %v (%s)", err, streamReadErrorReasoningOnlyMarker)
 			}
-			// 1. 记录本次尝试失败并计入账号冷却
+			// 1. 记录本次尝试失败（用量统计），但不对账号记账：
+			// 断流是上游网络/服务抖动（connection reset by peer），与账号凭据健康度无关；
+			// 记账会让健康账号被阶梯冷却，故障时段过后仍无法承载流量（2026-10-18 实证：
+			// 48h 内 2 次断流均来自同一上游 IP，账号本身全程正常）。
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, 0, err.Error(), reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
-			noteAccountFailure(curAuthID, 0, err.Error())
-			// 2. 零泄漏且预算允许时换号重建请求
-			if !emitted && attempt < budget && encodedBody != "" {
+			// 2. 正文零泄漏且预算允许时换号重建请求
+			if !contentEmitted && attempt < budget && encodedBody != "" {
 				evictSessionBindingsForAuth(curAuthID)
 				nextID, nextSA, hasNext := pickNextAuth(curAuthID)
-				if shouldRotateOnStreamReadError(emitted, attempt, budget, true, hasNext && nextSA != nil) {
+				if shouldRotateOnStreamReadError(emitted, contentEmitted, attempt, budget, true, hasNext && nextSA != nil) {
 					nextReq, rebErr := rebuildRequestWithQoderAuth(nextSA, encodedBody, upstreamModel, curReq.Context())
 					if rebErr != nil {
 						streamEmitError(streamID, fmt.Sprintf("%s (retry rebuild failed: %v)", readErrMsg, rebErr))
@@ -355,7 +363,19 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 					continue
 				}
 			}
-			// 3. 不满足换号条件时透传错误收尾
+			// 3. 不满足换号条件时收尾：正文已泄漏时合成 length 终止分片，
+			// 让下游转译出 response.incomplete（客户端保留已生成内容，new-api
+			// 可凭终态事件与已收正文计费）；零泄漏/无候选仍透传错误。
+			if contentEmitted {
+				if termRaw, termErr := buildStreamTerminalChunk(requestedModel, streamTruncatedFinishReason); termErr == nil {
+					if sseFramed {
+						termRaw = append([]byte("data: "), termRaw...)
+					}
+					if emitErr := streamEmit(streamID, termRaw); emitErr == nil {
+						return
+					}
+				}
+			}
 			streamEmitError(streamID, readErrMsg)
 			return
 		}
@@ -486,6 +506,7 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 		}
 		chunks := make([]pluginapi.ExecutorStreamChunk, 0, 64)
 		var sseErrMsg string
+		contentEmitted := false
 		scanner := bufio.NewScanner(newHostStreamReader(stream))
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 		for scanner.Scan() {
@@ -509,6 +530,9 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 			cleaned := cleanChunkJSON(chunkJSON)
 			if cleaned == "" {
 				continue
+			}
+			if streamChunkHasContent(chunkJSON) {
+				contentEmitted = true
 			}
 			if sseFramed {
 				cleaned = "data: " + cleaned
@@ -539,17 +563,17 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 			continue
 		}
 		if err := scanner.Err(); err != nil {
-			// 1. 已收集分片即视为已泄漏，禁止换号
+			// 1. 已收集分片即视为已下发；其中是否含正文由 contentEmitted 判定
 			emitted := len(chunks) > 0
-			// 2. 零泄漏且预算允许时换号重试
-			if !emitted && attempt < budget && curSA != nil {
+			// 2. 正文零泄漏且预算允许时换号重试（仅思考分片允许重放）
+			if !contentEmitted && attempt < budget && curSA != nil {
 				currentID := strings.TrimSpace(curSA.Auth.AccessToken)
 				if currentID == "" {
 					currentID = strings.TrimSpace(curSA.Account.UID)
 				}
 				evictSessionBindingsForAuth(currentID)
 				_, nextSA, hasNext := pickNextAuth(currentID)
-				if shouldRotateOnStreamReadError(emitted, attempt, budget, encodedBody != "", hasNext && nextSA != nil) {
+				if shouldRotateOnStreamReadError(emitted, contentEmitted, attempt, budget, encodedBody != "", hasNext && nextSA != nil) {
 					curSA = nextSA
 					continue
 				}

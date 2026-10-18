@@ -1,5 +1,33 @@
 # WorkBuddy AI Plugin Changelog
 
+## 0.1.19
+
+### Fix - 正文已泄漏的断流改为 length 收尾（new-api 可恢复计费）
+
+- 变更要点:
+  1. 根因：0.1.18 只解决了「仅思考分片时换号」，但**正文已发出后断流**仍走 `streamEmitError` 发 `event: error`。宿主 `forwardResponsesStream` 对非 Codex 客户端只输出 `event: error`（`writeTerminalError`），而 new-api 的 `OaiResponsesStreamHandler` 只从 `response.completed / incomplete / done / failed / cancelled` 提取 usage；`event: error` 不在其列 → 走正文估算兜底，但正文为空时 `CompletionTokens=0` → 打出「上游没有返回计费信息，无法扣费」并 `$0`。
+  2. 收尾策略改为合成终止分片：正文已泄漏且无法换号时，不再发 error，改为 emit 一个 `finish_reason=length` 的空 delta 分片并正常关流。宿主补 `[DONE]` 后，转译层 `incompleteByFinishReason` 把 `length` 映射为 `response.incomplete`（含 `incomplete_details.reason=max_output_tokens`），该事件属终态（`responsesSSETerminalEvent`）不会触发 502 兜底。
+  3. 计费恢复链路：new-api 收到 `response.incomplete` 后从终态事件提 usage；若无 usage 则回退到 `response.output_text.delta` 累计正文估算（`relay_responses.go:146`），正文已泄漏场景可正常出 token。
+  4. 语义边界：**只有正文已泄漏才合成 length**；零泄漏或仅思考分片仍走换号，换号失败仍透传 error（保持可观测性，不把真实失败伪装成成功截断）。
+  5. 同步路径（`StreamID == ""`）不改：宿主 `rpcPluginAdapter.ExecuteStream` 恒填 `StreamID`（`rpc_client_stream.go:16`），该分支仅为防御性 fallback；其调用方在 `err == nil` 时把请求记为成功，若在此合成终止分片会让截断在 dashboard 上伪装成成功。
+- 验证: 新增 `TestBuildStreamTerminalChunk`（校验 object/model/finish_reason=length/空 delta/不被判为内容泄漏）与 `TestBuildStreamTerminalChunkFraming`（SSE 前缀差异）；两次变异反证精确命中（`finish_reason` 改 `stop` → 1 例 FAIL；`delta` 改非空 → 1 例 FAIL）；cgo-shim build/vet/test 全绿。
+- 已知代价: 客户端会看到「成功但内容被截断」的 incomplete 状态，而非显式错误；这是保留已生成内容的必然取舍，日志侧仍有 `publishUsage(failed=true)` 记录可追溯。
+- 依据: 用户裁定「traework 式收尾作为正文已泄漏分支的补充」；宿主与 new-api 链路已逐行核验（`responsesSSETerminalEvent`、`buildResponsesCompletedEvent`、`relay_responses.go:91-153`）。
+- 涉及文件: workbuddy-ai/policy.go、workbuddy-ai/stream.go、workbuddy-ai/stream_read_error_failover_test.go、workbuddy-ai/main.go、workbuddy-ai/VERSION
+
+## 0.1.18
+
+### Fix - 断流分级换号（补齐 0.16.5 同源修复）+ 断流不再误伤账号冷却
+
+- 变更要点:
+  1. 根因：本插件此前**完全没有断流换号路径**——`pumpUpstreamStream` 的 `scanner.Err()` 分支只记录失败并透传错误，同步路径同样直接返回；连零泄漏场景也不会换号。同时错误信封无 `http_status`，宿主无法据此跨 provider 轮转。
+  2. 补齐断流识别与分级换号：新增 `isStreamReadError` / `shouldRotateOnStreamReadError` / `streamChunkHasContent` / `streamChunksHaveContent`，异步与同步两条路径均在「正文零泄漏」时换号续试。
+  3. 细化泄漏语义：仅思考分片已下发时打 `reasoning only, no content` 标记并允许换号；正文已发出时打 `after partial output`，抑制换号与状态码。避免 qwen-3.8-flash 在 `reasoning_effort=max` 下思考阶段断流被误判为不可重试。
+  4. 信封补 502：新增 `envelopeHTTPStatusForError`，断流时携带 `http_status=502`，让宿主识别为网关失败并可跨 provider 轮转。
+  5. 断流不再对账号记账：断流是上游网络/服务抖动，与账号凭据健康度无关，移除 `noteAccountFailure(curAuthID, 0, ...)`，避免健康账号被阶梯冷却。
+- 验证: 新增 `TestIsStreamReadError`（8 例）、`TestShouldRotateOnStreamReadError`（10 例，含「仅思考分片仍可换号」「正文已泄漏不换号」）、`TestStreamChunkHasContent`（11 例）；变异反证（守卫退回 `emitted`）精确命中 1 例；cgo-shim build/vet/test 全绿。
+- 已知代价: 思考阶段换号会让客户端看到两段思考摘要（宿主 ABI 无清空已发内容通道）。
+
 ## 0.1.17
 
 ### Fix - 账号故障冷却改为 30s 递增阶梯、上限 10 分钟
