@@ -45,13 +45,14 @@ on:
       - "doubao-provider-v*"
       - "coze-provider-v*"
       - "qwenwork-provider-v*"
+      - "notion-provider-v*"
   workflow_dispatch:
     inputs:
       plugin:
         description: "Plugin to release"
         required: true
         type: choice
-        options: [workbuddy-provider, qoderwork-provider, workbuddy-token-usage, traework-provider, workbuddy-ai-provider, cursor-provider, qoder-ai-provider, zcode-provider, copilot-provider, doubao-provider, coze-provider, qwenwork-provider]
+        options: [workbuddy-provider, qoderwork-provider, workbuddy-token-usage, traework-provider, workbuddy-ai-provider, cursor-provider, qoder-ai-provider, zcode-provider, copilot-provider, doubao-provider, coze-provider, qwenwork-provider, notion-provider]
       version:
         description: "Version without v (empty = plugin's VERSION file)"
         required: false
@@ -88,6 +89,7 @@ jobs:
           - dir: doubao
           - dir: coze
           - dir: qwenwork
+          - dir: notion
     defaults:
       run:
         working-directory: ${{ matrix.dir }}
@@ -141,6 +143,7 @@ jobs:
               "doubao-provider": "doubao",
               "coze-provider": "coze",
               "qwenwork-provider": "qwenwork",
+              "notion-provider": "notion",
           }
           NATIVE = [
               ("linux", "amd64", "ubuntu-24.04", "so"),
@@ -405,7 +408,8 @@ jobs:
         startsWith(github.ref, 'refs/tags/copilot-provider-v') ||
         startsWith(github.ref, 'refs/tags/doubao-provider-v') ||
         startsWith(github.ref, 'refs/tags/coze-provider-v') ||
-        startsWith(github.ref, 'refs/tags/qwenwork-provider-v')
+        startsWith(github.ref, 'refs/tags/qwenwork-provider-v') ||
+        startsWith(github.ref, 'refs/tags/notion-provider-v')
       )
     needs:
       - test
@@ -447,6 +451,8 @@ jobs:
             P="coze-provider"; V="${GITHUB_REF_NAME#coze-provider-v}"
           elif [[ "${GITHUB_REF_NAME}" == qwenwork-provider-v* ]]; then
             P="qwenwork-provider"; V="${GITHUB_REF_NAME#qwenwork-provider-v}"
+          elif [[ "${GITHUB_REF_NAME}" == notion-provider-v* ]]; then
+            P="notion-provider"; V="${GITHUB_REF_NAME#notion-provider-v}"
           else
             P="workbuddy-token-usage"; V="${GITHUB_REF_NAME#workbuddy-token-usage-v}"
           fi
@@ -534,6 +540,7 @@ jobs:
             doubao-provider)       DISPLAY="Doubao Provider" ;;
             coze-provider)         DISPLAY="Coze Provider" ;;
             qwenwork-provider)     DISPLAY="QwenWork Provider" ;;
+            notion-provider)       DISPLAY="Notion AI" ;;
           esac
           TITLE="${DISPLAY:-$PLUGIN} v${VERSION}"
           # tag 由 gh release create 自动创建（指向当前提交）。

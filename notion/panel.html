@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notion Provider</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #6ea8fe;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+  input, textarea, select {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 9px 10px; font: inherit; outline: none;
+  }
+  textarea { min-height: 82px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > .grow { flex: 1 1 240px; }
+  button {
+    background: var(--accent); color: #06121f; border: 0;
+    border-radius: 6px; padding: 9px 16px; font: inherit; font-weight: 600;
+    cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); font-weight: 500; }
+  button.danger { background: transparent; color: var(--err); border: 1px solid var(--border); font-weight: 500; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .tag.ok { color: var(--ok); border-color: rgba(63,185,80,.4); }
+  .tag.err { color: var(--err); border-color: rgba(248,81,73,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(210,153,34,.4); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .log {
+    margin-top: 12px; padding: 10px 12px; border-radius: 6px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto;
+  }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .spaces { margin-top: 6px; }
+  .space-item { font-size: 12px; color: var(--muted); }
+  .space-item b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>Notion Provider</h1>
+<div class="sub">把 Notion AI 的模型能力接入 CPA。非官方逆向实现，仅建议自用。</div>
+
+<div class="panel">
+  <h2>导入账号</h2>
+  <label for="cookie">Cookie header（浏览器开发者工具 → Network → 任意请求 → Request Headers → Cookie）</label>
+  <textarea id="cookie" placeholder="token_v2=...; notion_user_id=...; notion_browser_id=..."></textarea>
+  <div class="row" style="margin-top:10px">
+    <div class="grow">
+      <label for="label">备注名（可空）</label>
+      <input id="label" placeholder="例如：主账号">
+    </div>
+    <div class="grow">
+      <label for="spaceId">指定工作空间 id（可空，默认选额度最高的）</label>
+      <input id="spaceId" placeholder="留空自动选择">
+    </div>
+    <button id="importBtn">导入并探活</button>
+  </div>
+  <div class="hint">导入会先校验登录态与工作空间，成功才落盘。Notion 把 AI 权限绑定到登录 IP，请在本机导出 Cookie。</div>
+  <div id="importLog" class="log" style="display:none"></div>
+</div>
+
+<div class="panel">
+  <h2>账号列表</h2>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:22%">账号</th>
+        <th style="width:20%">工作空间</th>
+        <th style="width:22%">额度</th>
+        <th style="width:12%">状态</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="accounts">
+      <tr><td colspan="5" class="mono">加载中…</td></tr>
+    </tbody>
+  </table>
+  <div id="actionLog" class="log" style="display:none"></div>
+</div>
+
+<script>
+// API 前缀必须与 plugin id 完全一致，否则管理路由 404。
+const API = '/v0/management/plugins/notion-provider';
+
+// 管理接口带宿主密钥，从当前页面地址或本地存储取。
+function authHeaders() {
+  const key = localStorage.getItem('cpa-management-key')
+    || new URLSearchParams(location.search).get('key')
+    || '';
+  const h = { 'Content-Type': 'application/json' };
+  if (key) h['Authorization'] = 'Bearer ' + key;
+  return h;
+}
+
+// request 统一封装管理接口调用。
+async function request(path, options = {}) {
+  const resp = await fetch(API + path, {
+    ...options,
+    headers: { ...authHeaders(), ...(options.headers || {}) },
+  });
+  const text = await resp.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  return data;
+}
+
+// log 在指定容器里追加一行。
+function log(el, message) {
+  el.style.display = 'block';
+  const time = new Date().toLocaleTimeString();
+  el.textContent = '[' + time + '] ' + message + '\n' + el.textContent;
+}
+
+// escapeHTML 防止账号名等用户输入被当成 HTML 注入。
+function escapeHTML(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// renderSpaces 渲染账号下的工作空间与额度。
+function renderSpaces(spaces, current) {
+  if (!spaces || !spaces.length) return '<span class="mono">—</span>';
+  return '<div class="spaces">' + spaces.map(s => {
+    const active = s.id === current;
+    const premium = s.premium_credits || 0;
+    const plan = s.plan_type ? escapeHTML(s.plan_type) : '';
+    return '<div class="space-item">'
+      + (active ? '● ' : '○ ')
+      + '<b>' + escapeHTML(s.name) + '</b>'
+      + (plan ? ' ' + plan : '')
+      + ' · 订阅额度 ' + premium
+      + (s.basic_limit ? ' · 基础 ' + (s.basic_usage || 0) + '/' + s.basic_limit : '')
+      + '</div>';
+  }).join('') + '</div>';
+}
+
+// loadAccounts 拉取并渲染账号列表。
+async function loadAccounts() {
+  const tbody = document.getElementById('accounts');
+  try {
+    const data = await request('/accounts');
+    const list = data.accounts || [];
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="mono">还没有账号，请先导入 Cookie。</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(a => {
+      const status = a.disabled
+        ? '<span class="tag">已禁用</span>'
+        : '<span class="tag ok">启用中</span>';
+      const model = a.spaces && a.spaces.length ? '' : '';
+      return '<tr>'
+        + '<td><div>' + escapeHTML(a.label) + '</div><div class="mono">' + escapeHTML(a.auth_id) + '</div><div class="mono">' + escapeHTML(a.user_id) + '</div>' + model + '</td>'
+        + '<td><div>' + escapeHTML(a.space_name) + '</div><div class="mono">' + escapeHTML(a.space_id) + '</div></td>'
+        + '<td>' + renderSpaces(a.spaces, a.space_id) + '</td>'
+        + '<td>' + status + '</td>'
+        + '<td>'
+        +   '<button class="ghost" data-action="test" data-id="' + escapeHTML(a.auth_id) + '">测试</button> '
+        +   '<button class="ghost" data-action="toggle" data-id="' + escapeHTML(a.auth_id) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' + (a.disabled ? '启用' : '禁用') + '</button> '
+        +   '<button class="danger" data-action="delete" data-id="' + escapeHTML(a.auth_id) + '">删除</button>'
+        + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="5" class="mono">加载失败：' + escapeHTML(e.message) + '</td></tr>';
+  }
+}
+
+// importAccount 提交 Cookie 并探活。
+async function importAccount() {
+  const btn = document.getElementById('importBtn');
+  const logEl = document.getElementById('importLog');
+  const cookie = document.getElementById('cookie').value.trim();
+  if (!cookie) { log(logEl, '请先粘贴 Cookie'); return; }
+
+  btn.disabled = true;
+  log(logEl, '正在解析并探活…');
+  try {
+    const data = await request('/import', {
+      method: 'POST',
+      body: JSON.stringify({
+        cookie,
+        label: document.getElementById('label').value.trim(),
+        space_id: document.getElementById('spaceId').value.trim(),
+      }),
+    });
+    log(logEl, '导入成功：' + data.space_name + ' (' + data.space_id + ')');
+    document.getElementById('cookie').value = '';
+    await loadAccounts();
+  } catch (e) {
+    log(logEl, '导入失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// runAction 处理表格里的操作按钮。
+async function runAction(action, authId, disabled) {
+  const logEl = document.getElementById('actionLog');
+  try {
+    if (action === 'delete') {
+      if (!confirm('确定删除账号 ' + authId + '？')) return;
+      await request('/delete', { method: 'POST', body: JSON.stringify({ auth_id: authId }) });
+      log(logEl, '已删除：' + authId);
+    } else if (action === 'toggle') {
+      const path = disabled ? '/enable' : '/disable';
+      await request(path, { method: 'POST', body: JSON.stringify({ auth_id: authId }) });
+      log(logEl, (disabled ? '已启用：' : '已禁用：') + authId);
+    } else if (action === 'test') {
+      log(logEl, '探活中：' + authId + ' …');
+      const data = await request('/test-active', {
+        method: 'POST',
+        body: JSON.stringify({ auth_id: authId }),
+      });
+      if (data.ok) {
+        log(logEl, '探活成功 ' + authId + '：' + data.elapsed + ' · 回复「' + (data.reply || '') + '」· tokens ' + (data.in_tokens || 0) + '/' + (data.out_tokens || 0));
+      } else {
+        log(logEl, '探活失败 ' + authId + '：' + (data.error || '未知错误'));
+      }
+    }
+    await loadAccounts();
+  } catch (e) {
+    log(logEl, '操作失败：' + e.message);
+  }
+}
+
+document.getElementById('importBtn').addEventListener('click', importAccount);
+
+document.getElementById('accounts').addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-action]');
+  if (!btn) return;
+  runAction(btn.dataset.action, btn.dataset.id, btn.dataset.disabled === '1');
+});
+
+loadAccounts();
+</script>
+</body>
+</html>

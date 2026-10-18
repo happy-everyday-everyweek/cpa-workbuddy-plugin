@@ -1,0 +1,512 @@
+package main
+
+// 本文件实现插件的管理路由。
+//
+// 路由前缀随 plugin id 变化：/v0/management/plugins/notion-provider/*。
+// 面板网页拿不到管理密钥，因此面板自身走 resource 路由（宿主免密钥放行），
+// 数据接口走 management 路由。
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+var (
+	managementBasePath   string
+	managementBasePathMu sync.RWMutex
+)
+
+// setManagementBasePath 设置管理路由前缀。
+// [参数] base: 宿主下发的前缀。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，前缀注入。
+func setManagementBasePath(base string) {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return
+	}
+	managementBasePathMu.Lock()
+	defer managementBasePathMu.Unlock()
+	managementBasePath = base
+}
+
+// getManagementBasePath 读取当前管理路由前缀。
+// [参数] 无。
+// [返回] 管理基础路径。
+// 最近修改时间：2026-10-18；改动原因：新增，前缀读取。
+func getManagementBasePath() string {
+	managementBasePathMu.RLock()
+	defer managementBasePathMu.RUnlock()
+	return managementBasePath
+}
+
+type managementRoute struct {
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	Description string `json:"description,omitempty"`
+}
+
+type resourceRoute struct {
+	Path        string `json:"path"`
+	Menu        string `json:"menu,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type managementRegistrationResponse struct {
+	Routes    []managementRoute `json:"routes,omitempty"`
+	Resources []resourceRoute   `json:"resources,omitempty"`
+}
+
+// managementRegistration 声明插件对宿主暴露的管理路由与资源页。
+// [参数] 无。
+// [返回] 路由与资源注册结构。
+// 最近修改时间：2026-10-18；改动原因：新增，账号导入与管理路由。
+func managementRegistration() managementRegistrationResponse {
+	base := "/plugins/" + providerName
+	return managementRegistrationResponse{
+		Routes: []managementRoute{
+			{Method: http.MethodGet, Path: base + "/accounts", Description: "列出 Notion 账号。"},
+			{Method: http.MethodPost, Path: base + "/import", Description: "导入 Cookie header（body: {cookie, label?, space_id?}）。"},
+			{Method: http.MethodPost, Path: base + "/delete", Description: "删除一个 Notion 账号。"},
+			{Method: http.MethodPost, Path: base + "/enable", Description: "启用一个 Notion 账号。"},
+			{Method: http.MethodPost, Path: base + "/disable", Description: "禁用一个 Notion 账号。"},
+			{Method: http.MethodPost, Path: base + "/set-space", Description: "切换账号使用的工作空间（body: {auth_id, space_id}）。"},
+			{Method: http.MethodPost, Path: base + "/test-active", Description: "对单个账号发起一次推理探活（body: {auth_id, model?}）。"},
+			{Method: http.MethodGet, Path: base + "/models", Description: "列出账号可见模型（query: auth_id）。"},
+			{Method: http.MethodGet, Path: base + "/usage", Description: "查询账号各工作空间的额度（query: auth_id）。"},
+		},
+		Resources: []resourceRoute{
+			{Path: "/panel", Menu: "Notion", Description: "Notion Provider 管理面板：Cookie 导入、工作空间切换与探活。"},
+		},
+	}
+}
+
+// normalizeMgmtSubPath 归一化管理子路径，兼容宿主的多种前缀形态。
+// [参数] rawPath: 宿主传入的原始路径。
+// [返回] 归一化子路径与从路径解析出的查询参数。
+// 最近修改时间：2026-10-18；改动原因：新增，兼容 resource 与 management 两种前缀。
+func normalizeMgmtSubPath(rawPath string) (string, url.Values) {
+	u, errParse := url.Parse(rawPath)
+	path := rawPath
+	var query url.Values
+	if errParse == nil {
+		path = u.Path
+		query = u.Query()
+	}
+	path = strings.TrimRight(path, "/")
+
+	// resource 路由：面板页本身走这里，宿主免密钥放行。
+	resPrefix := "/v0/resource/plugins/" + providerName
+	if strings.HasPrefix(path, resPrefix) {
+		sub := strings.TrimPrefix(path, resPrefix)
+		if sub == "" {
+			return "/panel", query
+		}
+		return sub, query
+	}
+
+	fullPrefix := getManagementBasePath() + "/plugins/" + providerName
+	shortPrefix := "/plugins/" + providerName
+	switch {
+	case strings.HasPrefix(path, fullPrefix):
+		path = strings.TrimPrefix(path, fullPrefix)
+	case strings.HasPrefix(path, shortPrefix):
+		path = strings.TrimPrefix(path, shortPrefix)
+	}
+	if path == "" {
+		path = "/"
+	}
+	return path, query
+}
+
+// handleManagement 分发插件管理路由。
+// [参数] raw: 宿主 management.handle 载荷。
+// [返回] 管理响应信封与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，路由分发。
+func handleManagement(raw []byte) ([]byte, error) {
+	var req pluginapi.ManagementRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+
+	subPath, urlQuery := normalizeMgmtSubPath(req.Path)
+	method := strings.ToUpper(req.Method)
+
+	if method == http.MethodGet && (subPath == "/" || subPath == "/panel") {
+		return handlePanelPage()
+	}
+
+	switch {
+	case method == http.MethodGet && subPath == "/accounts":
+		return handleListAccounts()
+
+	case method == http.MethodPost && subPath == "/import":
+		return handleImportAccount(req.Body)
+
+	case method == http.MethodPost && subPath == "/delete":
+		return handleDeleteAccount(req.Body)
+
+	case method == http.MethodPost && subPath == "/enable":
+		return handleSetAccountStatus(req.Body, false)
+
+	case method == http.MethodPost && subPath == "/disable":
+		return handleSetAccountStatus(req.Body, true)
+
+	case method == http.MethodPost && subPath == "/set-space":
+		return handleSetSpace(req.Body)
+
+	case method == http.MethodPost && subPath == "/test-active":
+		return handleTestActive(req.Body)
+
+	case method == http.MethodGet && subPath == "/models":
+		return makeHTTPResponse(http.StatusOK, mustMarshal(handleModelsQuery(req, urlQuery)))
+
+	case method == http.MethodGet && subPath == "/usage":
+		return makeHTTPResponse(http.StatusOK, mustMarshal(handleUsageQuery(req, urlQuery)))
+
+	default:
+		return makeHTTPResponse(http.StatusNotFound, []byte(`{"error":"not_found"}`))
+	}
+}
+
+// makeHTTPResponse 把载荷包成宿主可识别的 HTTP 响应。
+// [参数] status: 状态码；body: 响应体。
+// [返回] 信封 JSON。
+// 最近修改时间：2026-10-18；改动原因：新增，管理响应构造。
+func makeHTTPResponse(status int, body []byte) ([]byte, error) {
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers: http.Header{
+			"Content-Type": {"application/json"},
+		},
+		Body: body,
+	})
+}
+
+// handlePanelPage 返回面板 HTML。
+// [参数] 无。
+// [返回] 管理响应。
+// 最近修改时间：2026-10-18；改动原因：新增，面板渲染入口。
+func handlePanelPage() ([]byte, error) {
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers: http.Header{
+			"Content-Type":  {"text/html; charset=utf-8"},
+			"Cache-Control": {"no-cache, no-store, must-revalidate"},
+		},
+		Body: panelHTML,
+	})
+}
+
+// accountView 是面板展示用的账号视图。
+type accountView struct {
+	AuthID    string        `json:"auth_id"`
+	Label     string        `json:"label"`
+	UserID    string        `json:"user_id"`
+	SpaceID   string        `json:"space_id"`
+	SpaceName string        `json:"space_name"`
+	Spaces    []NotionSpace `json:"spaces"`
+	Disabled  bool          `json:"disabled"`
+	UpdatedAt string        `json:"updated_at"`
+	// Available 表示上次探活是否通过；未知时为 null。
+	Available *bool `json:"available"`
+}
+
+// handleListAccounts 列出全部账号。
+// [参数] 无。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，账号列表。
+func handleListAccounts() ([]byte, error) {
+	accounts, _ := listAllAuthFiles()
+	views := make([]accountView, 0, len(accounts))
+	for _, auth := range accounts {
+		views = append(views, accountView{
+			AuthID:    auth.AuthID,
+			Label:     auth.Label,
+			UserID:    maskIdentifier(auth.UserID),
+			SpaceID:   auth.SpaceID,
+			SpaceName: auth.SpaceName,
+			Spaces:    auth.Spaces,
+			Disabled:  auth.Disabled,
+			UpdatedAt: auth.UpdatedAt,
+		})
+	}
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{"accounts": views}))
+}
+
+// importAccountRequest 是导入请求体。
+type importAccountRequest struct {
+	Cookie  string `json:"cookie"`
+	Label   string `json:"label"`
+	SpaceID string `json:"space_id"`
+}
+
+// handleImportAccount 导入一份 Cookie。
+// [参数] body: 请求体。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，面板导入入口。
+func handleImportAccount(body json.RawMessage) ([]byte, error) {
+	var req importAccountRequest
+	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "请求体格式错误"}))
+	}
+	if strings.TrimSpace(req.Cookie) == "" {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "cookie 不能为空"}))
+	}
+
+	auth, errSave := saveCredentials(req.Cookie, req.Label, req.SpaceID)
+	if errSave != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": errSave.Error()}))
+	}
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
+		"auth_id":    auth.AuthID,
+		"space_id":   auth.SpaceID,
+		"space_name": auth.SpaceName,
+		"spaces":     auth.Spaces,
+	}))
+}
+
+// authIDRequest 是只带账号标识的请求体。
+type authIDRequest struct {
+	AuthID string `json:"auth_id"`
+}
+
+// handleDeleteAccount 删除账号。
+// [参数] body: 请求体。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，账号删除。
+func handleDeleteAccount(body json.RawMessage) ([]byte, error) {
+	var req authIDRequest
+	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "请求体格式错误"}))
+	}
+	if errDelete := deleteAuthFileDirect(req.AuthID); errDelete != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": errDelete.Error()}))
+	}
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]bool{"ok": true}))
+}
+
+// handleSetAccountStatus 启用或禁用账号。
+// [参数] body: 请求体；disabled: 目标状态。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，账号启停。
+func handleSetAccountStatus(body json.RawMessage, disabled bool) ([]byte, error) {
+	var req authIDRequest
+	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "请求体格式错误"}))
+	}
+
+	auth, errFind := findAccount(req.AuthID)
+	if errFind != nil {
+		return makeHTTPResponse(http.StatusNotFound, mustMarshal(map[string]string{"error": errFind.Error()}))
+	}
+	auth.Disabled = disabled
+	auth.UpdatedAt = time.Now().Format(time.RFC3339)
+	if errWrite := writeAuthFileDirect(auth.PhysicalPath, auth); errWrite != nil {
+		return makeHTTPResponse(http.StatusInternalServerError, mustMarshal(map[string]string{"error": errWrite.Error()}))
+	}
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]bool{"ok": true}))
+}
+
+// setSpaceRequest 是切换工作空间的请求体。
+type setSpaceRequest struct {
+	AuthID  string `json:"auth_id"`
+	SpaceID string `json:"space_id"`
+}
+
+// handleSetSpace 切换账号使用的工作空间。
+// [参数] body: 请求体。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，多 workspace 切换。
+func handleSetSpace(body json.RawMessage) ([]byte, error) {
+	var req setSpaceRequest
+	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "请求体格式错误"}))
+	}
+
+	auth, errFind := findAccount(req.AuthID)
+	if errFind != nil {
+		return makeHTTPResponse(http.StatusNotFound, mustMarshal(map[string]string{"error": errFind.Error()}))
+	}
+
+	var target *NotionSpace
+	for i := range auth.Spaces {
+		if strings.EqualFold(auth.Spaces[i].ID, strings.TrimSpace(req.SpaceID)) {
+			target = &auth.Spaces[i]
+			break
+		}
+	}
+	if target == nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "该工作空间不在账号下"}))
+	}
+
+	auth.SpaceID = target.ID
+	auth.SpaceName = target.Name
+	auth.UpdatedAt = time.Now().Format(time.RFC3339)
+	if errWrite := writeAuthFileDirect(auth.PhysicalPath, auth); errWrite != nil {
+		return makeHTTPResponse(http.StatusInternalServerError, mustMarshal(map[string]string{"error": errWrite.Error()}))
+	}
+	// 切空间后旧 thread 属于旧空间，必须整批清掉，否则续写会落到错误空间。
+	forgetSessionsForAuth(auth)
+
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
+		"space_id":   auth.SpaceID,
+		"space_name": auth.SpaceName,
+	}))
+}
+
+// testActiveRequest 是探活请求体。
+type testActiveRequest struct {
+	AuthID string `json:"auth_id"`
+	Model  string `json:"model"`
+}
+
+// handleTestActive 对账号发起一次最小推理探活。
+//
+// 必须走真实的推理链路而不是只查模型列表：模型可见不代表能出正文，
+// 静默空流只有真正跑一轮才会暴露。
+// [参数] body: 请求体。
+// [返回] 管理响应与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，面板测试按钮。
+func handleTestActive(body json.RawMessage) ([]byte, error) {
+	var req testActiveRequest
+	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "请求体格式错误"}))
+	}
+
+	auth, errFind := findAccount(req.AuthID)
+	if errFind != nil {
+		return makeHTTPResponse(http.StatusNotFound, mustMarshal(map[string]string{"error": errFind.Error()}))
+	}
+
+	model := req.Model
+	if strings.TrimSpace(model) == "" {
+		model = defaultNotionModel
+	}
+
+	start := time.Now()
+	chatReq := &openAIChatRequest{
+		Model:        model,
+		MessagesText: []chatMessage{{Role: "user", Content: "只回复两个字符：OK"}},
+	}
+	result, errRun := runInference(context.Background(), auth, chatReq, nil)
+	elapsed := time.Since(start).Round(time.Millisecond).String()
+
+	if errRun != nil {
+		// 探活失败与真实请求失败口径一致：计入账号级冷却，
+		// 否则面板测出账号坏了但路由仍把流量打过去。
+		cfg := currentConfig()
+		noteAccountFailure(auth.AuthID, classifyInferenceError(errRun), cfg.CooldownSeconds)
+		return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
+			"ok":      false,
+			"error":   errRun.Error(),
+			"elapsed": elapsed,
+		}))
+	}
+	resetAccountFailover(auth.AuthID)
+	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
+		"ok":         true,
+		"elapsed":    elapsed,
+		"reply":      truncateForError([]byte(result.text)),
+		"thread":     result.threadID,
+		"model":      result.model,
+		"in_tokens":  result.inputTokens,
+		"out_tokens": result.outputTokens,
+	}))
+}
+
+// handleModelsQuery 返回账号可见的模型列表。
+// [参数] req: 管理请求；query: 查询参数。
+// [返回] 响应体。
+// 最近修改时间：2026-10-18；改动原因：新增，面板模型下拉。
+func handleModelsQuery(req pluginapi.ManagementRequest, query url.Values) map[string]any {
+	authID := query.Get("auth_id")
+	if authID == "" {
+		authID = req.Query.Get("auth_id")
+	}
+	auth, errFind := findAccount(authID)
+	if errFind != nil {
+		return map[string]any{"error": errFind.Error()}
+	}
+
+	codes, errDiscover := discoverModels(auth)
+	if errDiscover != nil || len(codes) == 0 {
+		codes = enabledNotionModels()
+	}
+
+	type modelView struct {
+		Code    string `json:"code"`
+		Display string `json:"display"`
+	}
+	out := make([]modelView, 0, len(codes))
+	for _, code := range codes {
+		display := notionModelDisplayNames[code]
+		if display == "" {
+			display = code
+		}
+		out = append(out, modelView{Code: code, Display: display})
+	}
+	return map[string]any{"models": out}
+}
+
+// handleUsageQuery 返回账号各工作空间的额度。
+// [参数] req: 管理请求；query: 查询参数。
+// [返回] 响应体。
+// 最近修改时间：2026-10-18；改动原因：新增，套餐与余额展示。
+func handleUsageQuery(req pluginapi.ManagementRequest, query url.Values) map[string]any {
+	authID := query.Get("auth_id")
+	if authID == "" {
+		authID = req.Query.Get("auth_id")
+	}
+	auth, errFind := findAccount(authID)
+	if errFind != nil {
+		return map[string]any{"error": errFind.Error()}
+	}
+
+	// 用实时值覆盖落盘快照：余额会随使用变化，快照只用于离线展示。
+	cfg := currentConfig()
+	cl := ensureHTTPClient(notionRequestTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), notionRequestTimeout())
+	defer cancel()
+	enrichSpaceUsage(ctx, cl, scopeForAuth(auth, cfg.ClientVersion), auth.Spaces)
+
+	return map[string]any{
+		"auth_id":    auth.AuthID,
+		"space_id":   auth.SpaceID,
+		"space_name": auth.SpaceName,
+		"spaces":     auth.Spaces,
+	}
+}
+
+// findAccount 按标识查找账号。
+// [参数] authID: 账号标识。
+// [返回] 账号与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，账号查找。
+func findAccount(authID string) (*StoredAuth, error) {
+	authID = strings.TrimSpace(authID)
+	accounts, _ := listAllAuthFiles()
+	for _, auth := range accounts {
+		if auth.AuthID == authID {
+			return auth, nil
+		}
+	}
+	return nil, errAccountNotFound
+}
+
+// errAccountNotFound 表示账号不存在。
+var errAccountNotFound = &accountNotFoundError{}
+
+type accountNotFoundError struct{}
+
+// Error 实现 error 接口。
+// [参数] 无。
+// [返回] 错误描述。
+// 最近修改时间：2026-10-18；改动原因：新增，标准错误形态。
+func (e *accountNotFoundError) Error() string { return "账号不存在" }
