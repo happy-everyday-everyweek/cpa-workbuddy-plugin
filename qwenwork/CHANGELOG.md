@@ -1,5 +1,16 @@
 # QwenWork Plugin Changelog
 
+## 0.2.4
+
+### Fix - 模型作用域改为 both，让宿主注册期填充 oauth-model-alias 缓存
+
+- 变更要点:
+  1. 0.2.3 补了执行器别名反解，但**生产实测仍 400**。根因在更上层：插件声明 `ExecutorModelScope: OAuth`，而宿主 `executorScopeAllowsStaticModels`（`internal/pluginhost/adapters.go:60`）只对 `static`/`both` 返回 true ⇒ 宿主**从不调用** `StaticModels` ⇒ `cacheModelAliases` 从未执行 ⇒ 别名缓存恒空 ⇒ `resolveUpstreamModel` 查不到任何映射。
+  2. 改为 `ExecutorModelScopeBoth`：既让注册期 `StaticModels` 被调用以填充别名缓存，又保留 OAuth 账号级模型发现能力。
+  3. 补 `TestRegistration_ExecutorModelScopeAllowsStaticModels` 锁定该声明；变异回 `OAuth` 时该用例精确 FAIL。
+- 验证: cgo-shim build/vet/test 全绿；变异反证精确命中；生产别名请求由 400 → 200（见下）。
+- 涉及文件: qwenwork/main.go、qwenwork/alias_resolution_test.go、qwenwork/VERSION、qwenwork/CHANGELOG.md
+
 ## 0.2.3
 
 ### Fix - 执行器补齐 oauth-model-alias 反解（别名请求不再 400）
@@ -10,6 +21,7 @@
   3. 修复：新增 `upstreamModelFor(model, attrs)`，固定「剥 provider 前缀 → 反解别名 → 模型键归一」三步；同步路径 `handleExecExecute` 与流式路径 `handleExecStream` 统一调用，消除两处各自拼装。
   4. 别名来源双通道：auth 属性 `model_alias` / `model-alias` / `oauth-model-alias` 优先，其次宿主级 `oauth-model-alias` 缓存（`cacheModelAliases` 在 `model.static` / `model.for_auth` 时由宿主传入的 `HostConfigSummary` 填充）。
 - 验证: 新增 `alias_resolution_test.go`（4 个用例、9 个子用例）覆盖宿主缓存通道、auth 属性优先级、`cacheModelAliases` 过滤规则（空别名/同名/空 name 跳过）、channel 名大小写不敏感，以及执行器入口 `upstreamModelFor` 的完整链路（含 `qwenwork/` 前缀与大小写形态）；**变异反证**：把 `upstreamModelFor` 退回「只剥前缀」→ 6 个子用例精确 FAIL；还原后 cgo-shim build/vet/test 全绿。
+- 已知边界: 本版修复了执行器接线，但宿主级别名缓存因作用域声明问题仍为空，生产验证未通过——由 0.2.4 补上作用域修复后才真正生效。
 - 涉及文件: qwenwork/main.go、qwenwork/alias_resolution_test.go、qwenwork/VERSION、qwenwork/CHANGELOG.md
 
 ## 0.2.2

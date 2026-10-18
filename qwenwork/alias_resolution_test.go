@@ -115,6 +115,24 @@ func TestCacheModelAliases_CaseInsensitiveChannel(t *testing.T) {
 	}
 }
 
+// TestRegistration_ExecutorModelScopeAllowsStaticModels 锁定模型作用域声明。
+//
+// 这是 2026-10-18 别名缺陷的真实根因：宿主只对 static/both 作用域在注册期
+// 调用 StaticModels，而 oauth-model-alias 的宿主级缓存正是从该回调的
+// HostConfigSummary 填充的。声明成 oauth 会让缓存恒空，执行器反解拿不到别名表。
+// 判定依据：宿主 internal/pluginhost/adapters.go 的 executorScopeAllowsStaticModels。
+func TestRegistration_ExecutorModelScopeAllowsStaticModels(t *testing.T) {
+	reg := wbRegistration()
+	scope := reg.Capabilities.ExecutorModelScope
+	if scope != pluginapi.ExecutorModelScopeStatic && scope != pluginapi.ExecutorModelScopeBoth {
+		t.Fatalf("ExecutorModelScope = %q, host will never call StaticModels and the alias cache stays empty; want static or both", scope)
+	}
+	// 同时必须保留 OAuth 模型能力，否则账号级模型发现失效。
+	if scope != pluginapi.ExecutorModelScopeBoth {
+		t.Fatalf("ExecutorModelScope = %q, want both (needs static + oauth)", scope)
+	}
+}
+
 // TestUpstreamModelFor_ExecutorPath 直接覆盖执行器使用的解析入口。
 //
 // 这是针对 2026-10-18 生产缺陷的回归测试：执行器曾只做 stripProviderPrefix，

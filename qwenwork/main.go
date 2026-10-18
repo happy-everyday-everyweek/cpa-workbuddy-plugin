@@ -329,7 +329,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.2.3"
+var version = "0.2.4"
 
 func wbRegistration() registration {
 	return registration{
@@ -352,11 +352,16 @@ func wbRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelProvider:         true,
-			AuthProvider:          true,
-			FrontendAuthProvider:  false,
-			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
+			ModelProvider: true,
+			AuthProvider:  true,
+			FrontendAuthProvider: false,
+			Executor:      true,
+			// 必须是 both 而不是 oauth：宿主只对 static/both 作用域在注册期调用
+			// StaticModels（internal/pluginhost/adapters.go:60 executorScopeAllowsStaticModels），
+			// 而 oauth-model-alias 的宿主级缓存正是从该回调的 HostConfigSummary 里
+			// 填充的（见 models.go cacheModelAliases）。声明成 oauth 会让缓存恒空，
+			// 执行器拿不到别名表，别名请求被原样透传后遭上游 400。
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,
