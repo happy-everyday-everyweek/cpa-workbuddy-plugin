@@ -77,6 +77,18 @@
 <h1>Notion Provider</h1>
 <div class="sub">把 Notion AI 的模型能力接入 CPA。非官方逆向实现，仅建议自用。</div>
 
+<div class="panel" id="authBox" style="display:none;border-color:rgba(210,153,34,.5)">
+  <h2>管理密钥</h2>
+  <div class="hint" style="margin:0 0 10px">数据接口需要 management key。从 CPA 主面板嵌入时会自动获取；独立打开时请在此填写（只存 sessionStorage，不落盘）。</div>
+  <div class="row">
+    <div class="grow">
+      <label for="keyInput">management key</label>
+      <input id="keyInput" type="password" autocomplete="off" placeholder="粘贴 CPA 的管理密钥">
+    </div>
+    <button id="keyBtn">保存并加载</button>
+  </div>
+</div>
+
 <div class="panel">
   <h2>导入账号</h2>
   <label for="cookie">Cookie header（浏览器开发者工具 → Network → 任意请求 → Request Headers → Cookie）</label>
@@ -119,26 +131,124 @@
 // API 前缀必须与 plugin id 完全一致，否则管理路由 404。
 const API = '/v0/management/plugins/notion-provider';
 
-// 管理接口带宿主密钥，从当前页面地址或本地存储取。
+/* ---------- 管理密钥获取（三级回退，零配置） ----------
+   1) CPA 主面板 localStorage "cli-proxy-auth"（XOR + base64，同源 iframe 嵌入）；
+   2) ?key= URL 参数（读取后立即从地址栏抹掉，存入 sessionStorage）；
+   3) 手工输入（仅存 sessionStorage，不持久化到磁盘）。
+   资源页 /v0/resource/... 免密钥放行，但数据接口仍校验 management key，
+   因此面板必须自己拿到密钥，不能指望浏览器自动带上。 */
+const ENC_PREFIX = 'enc::v1::';
+const SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
+const PANEL_STORE = 'cli-proxy-auth';
+const SS_KEY = 'notion-mgmt-key';
+
+// enc/dec 在编码后的 localStorage 值与明文之间转换。
+function enc(t) { return new TextEncoder().encode(t); }
+function dec(b) { return new TextDecoder().decode(b); }
+
+// keyBytes 派生 XOR 密钥：与 CPA 主面板同源同 UA 才解得开。
+function keyBytes() {
+  try { return enc(SECRET_SALT + '|' + window.location.host + '|' + navigator.userAgent); }
+  catch (e) { return enc(SECRET_SALT); }
+}
+function xorBytes(d, k) {
+  const r = new Uint8Array(d.length);
+  for (let i = 0; i < d.length; i++) r[i] = d[i] ^ k[i % k.length];
+  return r;
+}
+function b64decode(s) {
+  const bin = atob(s);
+  const b = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
+  return b;
+}
+
+// deobfuscate 解开主面板的 enc::v1:: 前缀；非该形态按明文返回。
+function deobfuscate(p) {
+  if (!p || !p.startsWith(ENC_PREFIX)) return p;
+  try { return dec(xorBytes(b64decode(p.slice(ENC_PREFIX.length)), keyBytes())); }
+  catch (e) { return p; }
+}
+function isEmbedded() {
+  try { return window.self !== window.top; } catch (e) { return false; }
+}
+
+// readPanelKey 从主面板 localStorage 取密钥，仅在同源 iframe 嵌入时有意义。
+function readPanelKey() {
+  if (!isEmbedded()) return null;
+  let raw;
+  try { raw = localStorage.getItem(PANEL_STORE); } catch (e) { return null; }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(deobfuscate(raw));
+    const st = (parsed && parsed.state) || parsed || {};
+    return typeof st.managementKey === 'string' && st.managementKey ? st.managementKey : null;
+  } catch (e) { return null; }
+}
+
+// readUrlKey 读取 ?key= 并立即从地址栏抹掉，避免密钥留在历史记录里。
+function readUrlKey() {
+  const m = new URLSearchParams(window.location.search).get('key');
+  if (m) {
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.delete('key');
+      history.replaceState(null, '', u.pathname + u.search + u.hash);
+    } catch (e) { /* 历史接口不可用时忽略 */ }
+  }
+  return m;
+}
+function persistKey(k) {
+  if (!k) return k;
+  try { sessionStorage.setItem(SS_KEY, k); } catch (e) { /* 隐私模式忽略 */ }
+  return k;
+}
+function getKey() {
+  let stored = null;
+  try { stored = sessionStorage.getItem(SS_KEY); } catch (e) { /* ignore */ }
+  return stored || persistKey(readPanelKey()) || persistKey(readUrlKey());
+}
 function authHeaders() {
-  const key = localStorage.getItem('cpa-management-key')
-    || new URLSearchParams(location.search).get('key')
-    || '';
+  const key = getKey();
   const h = { 'Content-Type': 'application/json' };
   if (key) h['Authorization'] = 'Bearer ' + key;
   return h;
 }
 
-// request 统一封装管理接口调用。
+// showAuth 展示密钥输入框。
+function showAuth() {
+  const box = document.getElementById('authBox');
+  if (!box) return;
+  box.style.display = 'block';
+  const i = document.getElementById('keyInput');
+  if (i) i.focus();
+}
+
+// saveKey 保存手填密钥并重新加载。
+function saveKey() {
+  const i = document.getElementById('keyInput');
+  const v = i ? i.value.trim() : '';
+  if (!v) return;
+  try { sessionStorage.setItem(SS_KEY, v); } catch (e) { /* ignore */ }
+  document.getElementById('authBox').style.display = 'none';
+  loadAccounts();
+}
+
+// request 统一封装管理接口调用；鉴权失败时弹出密钥输入框。
 async function request(path, options = {}) {
   const resp = await fetch(API + path, {
     ...options,
+    credentials: 'omit',
+    cache: 'no-store',
     headers: { ...authHeaders(), ...(options.headers || {}) },
   });
   const text = await resp.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  if (!resp.ok) {
+    if (resp.status === 401 || /management key/i.test(data.error || '')) showAuth();
+    throw new Error(data.error || ('HTTP ' + resp.status));
+  }
   return data;
 }
 
@@ -264,6 +374,10 @@ async function runAction(action, authId, disabled) {
 }
 
 document.getElementById('importBtn').addEventListener('click', importAccount);
+document.getElementById('keyBtn').addEventListener('click', saveKey);
+document.getElementById('keyInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') saveKey();
+});
 
 document.getElementById('accounts').addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-action]');

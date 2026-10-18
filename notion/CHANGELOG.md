@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1 (2026-10-19)
+
+### 修复
+
+- **面板在生产环境读不到账号列表**。资源页 `/v0/resource/plugins/<id>/panel`
+  由宿主免密钥放行，但数据接口 `/v0/management/plugins/<id>/*` 仍校验
+  `Authorization: Bearer <management key>`。0.1.0 的面板只读
+  `localStorage['cpa-management-key']`，这个键在 CPA 主面板里并不存在，
+  结果浏览器实测显示「加载失败：missing management key」。
+  修复为与 coze 面板一致的三级回退：主面板 `cli-proxy-auth`（XOR + base64）
+  → `?key=` URL 参数（读后立即从地址栏抹除）→ 手工输入（仅存 sessionStorage）。
+  鉴权失败时自动弹出密钥输入框，不再只报一行错误。
+
+### 测试
+
+- 生产环境用真实浏览器打开面板，确认真实渲染与数据加载链路。
+- 真实账号端到端：非流式 `PONG`、流式无重复帧、多轮 `PONG-2026` 复述、
+  面板探活 1.86s 返回 OK。
+
 ## 0.1.0 (2026-10-18)
 
 ### 新增
