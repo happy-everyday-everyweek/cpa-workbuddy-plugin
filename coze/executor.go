@@ -649,18 +649,20 @@ func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.Exec
 	return chunks, nil
 }
 
-// executorRequestBody 取执行请求的原始 OpenAI 请求体。
+// executorRequestBody 取执行请求的 OpenAI 聊天请求体。
 //
-// 宿主可能把原始体放在 OriginalRequest，也可能已翻译进 Payload；
-// 优先用 OriginalRequest（未翻译，字段最全）。
+// 必须优先用 Payload：宿主只对 Payload 做协议翻译，插件声明
+// executor_input_formats=["openai"] 后，Payload 一定是 OpenAI chat 形态。
+// OriginalRequest 保存客户端原始请求，走 /v1/responses 时里面只有 input、
+// 没有 messages，优先读它会让所有非 chat 入口的请求直接失败。
 // [参数] req: 执行请求。
 // [返回] 请求体字节。
-// 最近修改时间：2026-10-18；改动原因：新增，请求体取值。
+// 最近修改时间：2026-10-18；改动原因：修复 Responses 入口必然报「请求缺少 messages」。
 func executorRequestBody(req pluginapi.ExecutorRequest) []byte {
-	if len(req.OriginalRequest) > 0 {
-		return req.OriginalRequest
+	if len(req.Payload) > 0 {
+		return req.Payload
 	}
-	return req.Payload
+	return req.OriginalRequest
 }
 
 // parseStoredAuth 从宿主下发的 StorageJSON 还原账号。

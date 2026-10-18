@@ -394,16 +394,46 @@ func TestParseStoredAuthRejectsMissingCookie(t *testing.T) {
 	}
 }
 
-// TestExecutorRequestBodyPreference 验证优先用 OriginalRequest。
+// TestExecutorRequestBodyPreference 验证优先用 Payload。
+//
+// 宿主只对 Payload 做协议翻译；OriginalRequest 保留客户端原始请求。
+// 走 /v1/responses 时原始体里只有 input，优先读它会报「请求缺少 messages」。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-18；改动原因：新增，请求体取值优先级。
+// 最近修改时间：2026-10-18；改动原因：修复 Responses 入口失败，优先级反转。
 func TestExecutorRequestBodyPreference(t *testing.T) {
-	if got := executorRequestBody(pluginapiRequest("orig", "payload")); string(got) != "orig" {
-		t.Errorf("应当优先 OriginalRequest，实际 %q", got)
+	if got := executorRequestBody(pluginapiRequest("orig", "payload")); string(got) != "payload" {
+		t.Errorf("应当优先 Payload，实际 %q", got)
 	}
-	if got := executorRequestBody(pluginapiRequest("", "payload")); string(got) != "payload" {
-		t.Errorf("应当回退 Payload，实际 %q", got)
+	if got := executorRequestBody(pluginapiRequest("orig", "")); string(got) != "orig" {
+		t.Errorf("应当回退 OriginalRequest，实际 %q", got)
+	}
+}
+
+// TestExecutorResponsesEntryParsesTranslatedPayload 验证 Responses 入口可用。
+//
+// 生产实测（2026-10-18）：经 /v1/responses 或 new-api 转发时，客户端原始体
+// 只有 input，翻译后的 messages 只在 Payload 里。旧实现优先读 OriginalRequest，
+// 导致所有这类请求报「请求缺少 messages」，错误还会让宿主把账号标记不可用。
+// 这里锁定契约：必须从 Payload 解析出 messages 并折叠成 prompt。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，Responses 入口缺陷回归。
+func TestExecutorResponsesEntryParsesTranslatedPayload(t *testing.T) {
+	req := pluginapiRequest(
+		`{"model":"doubao-seed-2-0-lite","input":"你好"}`,
+		`{"model":"doubao-seed-2-0-lite","messages":[{"role":"user","content":"你好"}]}`,
+	)
+	chatReq, errChat := parseChatRequest(executorRequestBody(req))
+	if errChat != nil {
+		t.Fatalf("应当从 Payload 解析成功，实际 %v", errChat)
+	}
+	prompt, errPrompt := buildClawPrompt(chatReq.Messages)
+	if errPrompt != nil {
+		t.Fatalf("折叠失败：%v", errPrompt)
+	}
+	if prompt != "你好" {
+		t.Errorf("prompt = %q", prompt)
 	}
 }
 

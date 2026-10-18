@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.6 (2026-10-18)
+
+### 修复
+
+- **`/v1/responses` 与 new-api 转发请求必然失败**。生产日志大量出现
+  `503 auth_unavailable ... last upstream error: 请求缺少 messages`。
+  根因：`executorRequestBody` 优先读 `OriginalRequest`（客户端原始请求体），
+  而宿主**只对 `Payload` 做协议翻译**。走 Responses 入口时原始体只有 `input`
+  字段，没有 `messages`，插件在入口直接报错；该错误还会让宿主把账号标记为
+  不可用，连带后续正常的 chat / completions 请求一起 503。
+  修复为优先读 `Payload`，仅在为空时回退 `OriginalRequest`，与兄弟插件
+  doubao 的取值策略一致。
+
+### 测试
+
+- `TestExecutorRequestBodyPreference` 改为锁定新优先级（Payload 优先）。
+- 新增 `TestExecutorResponsesEntryParsesTranslatedPayload`：模拟 Responses
+  入口（原始体只有 `input`、Payload 含 `messages`），验证能正确折叠成 prompt。
+  变异回旧实现后两个用例精确复现生产报错文案「请求缺少 messages」。
+
 ## 0.3.5 (2026-10-18)
 
 ### 变更
