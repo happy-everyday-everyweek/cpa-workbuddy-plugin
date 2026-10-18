@@ -95,3 +95,15 @@
   - 踩坑清单追加 56：Windows `subprocess.Popen(["ssh", "cpa-server", "bash"])` 必须传 `bytes`（禁 `text=True` 防 `\r\n` 注入）并首行声明完整 `PATH`。
 - **验证**：SKILL.md 全文回读无乱码；UTF-8 无漂移。
 
+
+## 2026-10-18 更新：资产迁到 GitHub Release，发布链路合并为两次推送
+
+- **更新原因**：用户要求「优化发布速度」；实测单次 dispatch 85 个 job、端到端 17–27 分钟，且每次发布额外推送 18MB 资产。
+- **主要变更（SKILL.md）**：
+  - Step 9 合并「下载 + checksums 校验」，明确产物只是本地缓存（已被 `.gitignore` 忽略，不入仓）。
+  - Step 10 合并「publish + 单次 commit + push」，`publish-assets.py` 生成的 URL 指向 `releases/download/<id>-v<version>/<zip>`。
+  - 删除原 Step 10（提交 assets）与原 Step 11 的独立编号，后续步骤顺延：远端验证改为 Step 11。
+  - Step 13.5 由「发布后清理（必做）」改为「本地缓存清理（可选）」。
+  - 踩坑 2（0.9.7 assets 必须先 push）标注为失效；踩坑 44 去掉 `git add` 说明；踩坑 52 的落点由「提交 assets」改为「publish 进 registry」。
+- **同步落点**：`scripts/publish-assets.py`（新增 `--all-current`）、`scripts/prune-release-assets.py`（删除）、`.gitignore`、`registry.json`。
+- **验证**：72 个 artifact URL 全部 200 且 sha256/size 一致；`git ls-files release-assets` 为 0。

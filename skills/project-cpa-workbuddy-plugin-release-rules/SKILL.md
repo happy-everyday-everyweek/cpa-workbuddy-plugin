@@ -1,6 +1,6 @@
 ---
 name: project-cpa-workbuddy-plugin-release-rules
-description: 当需要发布 cpa-workbuddy-plugin 仓库任意插件新版本（workbuddy-provider / qoderwork-provider / traework-provider / workbuddy-token-usage 四插件），或走完「修复→发布→生产验证」闭环（发布后对生产真实入口 https://cpa.luode.vip/v1 做行为验收，如流式 qwen3.8-max 长推理、用生产日志 stream_id 判定成败）时触发：版本 bump、commit、push、dispatch CI（必须带 version 输入）、下载 assets、更新 registry、远端验证、生产 plugin-store 部署、生产行为验收、发布后清理（Step 13.5，见 project-cpa-workbuddy-plugin-release-asset-prune-rules）的一整套链路，含 GitHub 上行大流量稳定阻断时经生产服务器 SOCKS 隧道绕过。负责发布执行与门禁；本地逻辑验证用 cgo-plugin-isolated-test（cgo-shim-build.py），本 skill 只引用它，不重复实现。
+description: 当需要发布 cpa-workbuddy-plugin 仓库任意插件新版本（workbuddy-provider / qoderwork-provider / traework-provider / workbuddy-token-usage 四插件），或走完「修复→发布→生产验证」闭环（发布后对生产真实入口 https://cpa.luode.vip/v1 做行为验收，如流式 qwen3.8-max 长推理、用生产日志 stream_id 判定成败）时触发：版本 bump、commit、push、dispatch CI（必须带 version 输入）、下载 assets 并校验、单次提交更新 registry（资产托管在 GitHub Release，一次发布只有两次推送）、远端验证、生产 plugin-store 部署、生产行为验收、本地缓存清理（Step 13.5，缓存可随时删除）的一整套链路，含 GitHub 上行大流量稳定阻断时经生产服务器 SOCKS 隧道绕过。负责发布执行与门禁；本地逻辑验证用 cgo-plugin-isolated-test（cgo-shim-build.py），本 skill 只引用它，不重复实现。
 ---
 
 # cpa-workbuddy-plugin 插件发布链路
@@ -29,11 +29,11 @@ description: 当需要发布 cpa-workbuddy-plugin 仓库任意插件新版本（
 
 ## 默认执行流程（13 步，不可跳步）
 
-### Step 1 · bump 插件版本两处（registry 延迟到 Step 11 原子更新）
+### Step 1 · bump 插件版本两处（registry 延迟到 Step 10 原子更新）
 
 - `workbuddy/VERSION`（或其他插件目录 VERSION）：`0.12.2` → 新版本
 - `workbuddy/main.go`：`var version = "0.12.2"` → 新版本（**注意：main.go 常是混合文件，见 Step 3**）
-- **本步禁止提前修改 `registry.json.version`**。registry 的 `version` 与 `install.artifacts` 必须在 Step 11 由 `publish-assets.py` 同一次改动原子更新。提前 bump 并 push 会产生“新 version + 旧 artifacts”远端中间态，生产 store install 可能把旧二进制按新版本文件名落盘（0.1.13 实锤）。
+- **本步禁止提前修改 `registry.json.version`**。registry 的 `version` 与 `install.artifacts` 必须在 Step 10 由 `publish-assets.py` 同一次改动原子更新。提前 bump 并 push 会产生“新 version + 旧 artifacts”远端中间态，生产 store install 可能把旧二进制按新版本文件名落盘（0.1.13 实锤）。
 
 ### Step 2 · CHANGELOG 条目
 
@@ -156,29 +156,24 @@ assert concl == 'success', 'CI FAILED'
 python scripts/download-release-assets.py 0.14.17 workbuddy-provider
 # ⚠️ 参数顺序与 publish-assets.py 相反：download 是 <version> [plugin]，publish 是 <plugin> <version>
 # 传反 → tag 拼成 "0.14.17-vworkbuddy-provider" → Release API 404（易误判为资产未建/CDN 延迟）
+cd release-assets/workbuddy-provider-0.14.17 && sha256sum -c checksums.txt && cd ../..
 ```
 
-产物在 `release-assets/workbuddy-provider-0.14.17/`：6 个 zip（darwin amd64/arm64、linux amd64/arm64、windows amd64/arm64）+ checksums.txt。
+产物落在 `release-assets/<id>-<version>/`，**只是本地缓存**：该目录已被 `.gitignore` 忽略，不进 git、不需要提交。校验必须看到 6/6 OK；残缺时补下载，不能靠命令退出码串联代替产物校验（踩坑 52）。
 
-### Step 10 · 提交 assets + push（0.9.7 教训：必须先 push assets 再 publish）
-
-```bash
-git add release-assets/workbuddy-provider-0.14.16/
-git commit -m "chore(release): add workbuddy-provider 0.14.16 release assets (<描述>)"
-git push origin main   # 同 Step 7，SSH 直推
-```
-
-### Step 11 · publish registry + 提交 + push
+### Step 10 · publish registry + 单次提交 + push
 
 ```bash
 python scripts/publish-assets.py workbuddy-provider 0.14.16
-git diff registry.json | grep -v "^warning:"   # 确认只改 workbuddy-provider 的 artifacts
+git diff registry.json | grep -v "^warning:"   # 确认只改本插件的 version + artifacts
 git add registry.json
-git commit -m "chore(registry): publish workbuddy-provider 0.14.16 (<描述>)"
+git commit -m "chore(registry): publish workbuddy-provider 0.14.16 (<描述>)" -- registry.json
 git push origin main   # 同 Step 7
 ```
 
-### Step 12 · 远端验证 + 清理
+`publish-assets.py` 生成的 URL 直接指向 `https://github.com/<repo>/releases/download/<id>-v<version>/<zip>`，sha256/size 由本地 zip 计算。**一次发布只有两次推送**：Step 8 的代码提交 + 本步的 registry 提交；不再有单独的 assets 提交。
+
+### Step 11 · 远端验证
 
 ```python
 import json, urllib.request, hashlib
@@ -199,7 +194,7 @@ for old in ['0.14.15','0.14.14','0.13.1','0.13.0']:   # 该插件除当前版本
 print('FINAL:', 'ALL PASS' if ok else 'FAIL')
 ```
 
-⚠️ raw URL 验证对刚 push 的文件有 CDN 缓存延迟（短暂 404 后自愈），404 需等待 1-2 分钟重试。
+⚠️ registry 的 raw URL 对刚 push 的文件有 CDN 缓存延迟（短暂 404 后自愈），404 需等待 1-2 分钟重试。artifact URL 指向 Release，无此延迟。
 
 ### Step 13 · 生产服务器部署（plugin-store install API）
 
@@ -240,17 +235,12 @@ rm -rf /tmp/cpa-0xxx cpa-shim-* 2>/dev/null
 git log --oneline -5 && git status --short | grep -cE "^ M|^\?\?"   # 并行改动条数应不变
 ```
 
-### Step 13.5 · 发布后清理（每次发布闭环后必做）
+### Step 13.5 · 本地缓存清理（可选）
 
-> 授权：本仓库默认发布授权（AGENTS.md「提交 / 发布授权」段），清理随发布链路一并提交推送，无需另行确认。
-
-- **仓库 `release-assets/` 受 git 跟踪**，且被 registry raw URL（`.../main/release-assets/<id>-<version>/...`）与生产 `plugin-store install` 直接引用——**只保留 registry.json 中每个插件的当前版本目录**，历史版本目录全部删除。
-- 一键清理：`python scripts/prune-release-assets.py --dry-run`（先看保留集 / 待删集 / 体积）→ `python scripts/prune-release-assets.py --apply`（对受跟踪目录 `git rm -r`，对空/未跟踪目录 rmdir）。
-- 判定铁律：保留集**逐插件读 registry.json 的 `id` + `version`**，禁用"最新 N 个 / 最近日期"等启发式；删除前二次断言保留集不在删除列表。
-- 只暂存 `release-assets/` 删除：`git diff --cached --name-only` 必须全部以 `release-assets/` 开头，防混入并行改动；随后 commit + push。
-- 远端抽查：当前版本资产 raw URL HEAD 200、任一被删旧版本 404；记录释放体积（如 3.75 GB → 0.13 GB）。
-- 本地未跟踪缓存 `.workbuddy/release-assets/`（被 .gitignore 忽略）可一并删除。
-- 完整规则见项目 skill `project-cpa-workbuddy-plugin-release-asset-prune-rules`。
+- `release-assets/` 已退出 git 跟踪（`.gitignore` 忽略），**只是本地缓存，可随时删除**；registry 与生产 `plugin-store install` 直接引用 GitHub Release URL，不再依赖仓库内文件。
+- 删除历史缓存：`rm -rf release-assets/<id>-<old-version>`；需要重发旧版本时用 `download-release-assets.py` 重新拉取。
+- 不再需要提交、推送或校验远端 URL——资产托管在 Release，与 git 无关。
+- 旧规则（`prune-release-assets.py`、`project-cpa-workbuddy-plugin-release-asset-prune-rules`）已随资产出库退役。
 
 
 ### Step 14 · 生产行为验收（真实入口，非冒烟）
@@ -298,7 +288,7 @@ git -c http.proxy=socks5h://127.0.0.1:1080 push origin main
 
 | 操作 | 命令 |
 |---|---|
-| 版本 bump | Step 1 只改 VERSION + main.go `var version`；Step 11 由 publish-assets.py 原子更新 registry version + artifacts |
+| 版本 bump | Step 1 只改 VERSION + main.go `var version`；Step 10 由 publish-assets.py 原子更新 registry version + artifacts |
 | 本地验证 | `python scripts/cgo-shim-build.py <plugin>`（需先移走并行文件模拟 CI） |
 | push | `git push origin main`（SSH remote，直接推；HTTPS+askpass 仅作 SSH 失效时的回退） |
 | 下载资产 | `python scripts/download-release-assets.py <VER> <provider-id>`（⚠️ 与 publish 参数顺序相反） |
@@ -307,14 +297,14 @@ git -c http.proxy=socks5h://127.0.0.1:1080 push origin main
 | 生产行为验收 | `POST https://cpa.luode.vip/v1/responses`（或 `/v1/chat/completions`），流式 `qwen3.8-max` 长推理 + 关联生产日志 stream_id（Step 14） |
 | 网络阻断绕过 | `ssh -i ~/.ssh/id_ed25519_cpa-server -p 18998 -N -D 127.0.0.1:1080 root@45.207.222.65` + git `-c http.proxy=socks5h://127.0.0.1:1080`；HTTP 走 `curl --socks5-hostname`（Step 16） |
 | registry 校验 | `python scripts/validate-registry.py` |
-| 发布后清理 | `python scripts/prune-release-assets.py --dry-run` → `--apply`（只保留 registry 当前版本目录，`git rm` 后提交推送） |
+| 发布后清理 | 无需提交：`release-assets/` 已被 `.gitignore` 忽略，本地缓存可随时 `rm -rf` |
 
 ## 踩坑清单（全部实测）
 
 1. **（遗留回退）GIT_ASKPASS 路径**：SSH 已是默认 push 方式（见 Step 7）；仅 SSH 失效回退 HTTPS 时使用，且必须 Windows 风格 `C:\...`；`/c/...` 报 cannot spawn（git.exe 不认 POSIX 路径）。askpass 用完即删。
-2. **0.9.7 教训**：assets commit **必须 push** 后才能 publish-assets.py——publish 后 registry 指向 raw.githubusercontent 的 URL，不 push 则远端 404。
+2. ~~**0.9.7 教训**~~（已随资产出库失效）：assets 不再入仓，无需 assets commit；registry 的 artifact URL 指向 GitHub Release，Release 由 CI 直接创建。
 3. **分离发布**：并行改动横跨多文件是整体；tracked 用 checkout 恢复、untracked 必须 mv 走；验证要在「纯 HEAD+自己文件」环境跑，否则混入并行测试符号导致 FAIL。
-4. **版本三处最终一致，但禁止一次提前 bump**：Step 1 只改 VERSION/main.go；Step 11 由 publish-assets.py 同时更新 registry.version + artifacts。最终三处必须一致，过程中不得把“新 registry version + 旧 artifacts”推到远端。
+4. **版本三处最终一致，但禁止一次提前 bump**：Step 1 只改 VERSION/main.go；Step 10 由 publish-assets.py 同时更新 registry.version + artifacts。最终三处必须一致，过程中不得把“新 registry version + 旧 artifacts”推到远端。
 5. **dispatch 偶发 SSL EOF / exit 35**：api.github.com 瞬时窗口，curl/urllib 都可能失败 → 指数退避重试（tries=5）。
 6. **registry.json 结构**：`plugins` 是 **list**（不是 dict），条目用 `id` 匹配；artifacts 在 `install.artifacts`。
 7. **零残留**：旧版本号字符串不得出现在 registry.json（历史 artifacts 会被 publish 替换）。
@@ -361,15 +351,15 @@ git -c http.proxy=socks5h://127.0.0.1:1080 push origin main
 41. **本机 SSH push 瞬时断流先复测、后隧道（2026-09-04 实测，traework 0.1.36）**：`git push origin main` 偶发报 `Please make sure you have the correct access rights`（SSH 出站瞬时断，`ls-remote` 同时 `Connection closed by 198.18.0.98`），几分钟内自愈——**判定顺序：ls-remote 复测 2 次 → 仍败才开 SOCKS 隧道**（踩坑 37），不要一败就切隧道。另：Windows git 的 `GIT_ASKPASS` 指向 `.sh` 脚本不生效（git.exe 无法 spawn shell 脚本），push 挂起无输出直至强杀——HTTPS 回退的 askpass 必须用 `.cmd`/`.exe` 形态，或干脆等 SSH 复测恢复直连。
 42. **截图圈选删除任务先确认区块归属（2026-09-04 实测，traework 0.1.35 误删）**：用户截图红框 + 「这个删掉」时，红框指向与文字描述可能不一致（0.1.35 实指下方「子系统状态」，被误读为上方「用量汇总」并发布上线）。铁律：动手前用文字向用户复述「删除 X、保留 Y」边界，或与上一版本基线 diff 核对目标区块函数归属；已发布错误时用前向修复新版本（revert 会回到含目标区块的旧版，非用户要的中间态）。
 43. **宿主对 management 响应强制 HTML 转义 + 全路由（含 GET）强制 management key（2026-09-04 实测，traework 0.1.38→0.1.39 三缺陷）**：宿主 v7.2.129 两条硬行为——①`ServeManagementHTTP` 写出前对 JSON body 递归 `html.EscapeString`（`&`→`&amp;`），插件侧无法关闭，URL 类字段交给浏览器前必须前端 `replaceAll("&amp;","&")` 还原；②`/v0/management/` 全部路由（含 GET）经 management key 中间件，浏览器直接导航的回调（OAuth bounce）必 401。**浏览器可见的回调/页面必须注册进 `Resources`**（挂 `/v0/resource/plugins/<id>/`，免 key 且响应不转义），`handleManagement` 的 resPrefix GET 分支按子路径分发。验证脚本解析被转义的 URL 前先 `replace("&amp;","&")`，否则 parse_qs 只出 1 个参数、后续参数全部被吞进前值（易误判为缺参数）。
-44. **release-assets 产物命名混合：目录连字符、zip 下划线（2026-09-05 实测）**：`download-release-assets.py` 产物目录是 `release-assets/<provider-id>-<ver>/`（连字符，如 `workbuddy-provider-0.14.20/`），目录内 zip 是 `<provider-id>_<ver>_<goos>_<goarch>.zip`（下划线，如 `workbuddy-provider_0.14.20_linux_amd64.zip`）。解压/脚本 glob 时目录段与文件段分隔符不同，写错任一都报找不到文件；`git add` 用连字符目录名。
+44. **release-assets 产物命名混合：目录连字符、zip 下划线（2026-09-05 实测）**：`download-release-assets.py` 产物目录是 `release-assets/<provider-id>-<ver>/`（连字符，如 `workbuddy-provider-0.14.20/`），目录内 zip 是 `<provider-id>_<ver>_<goos>_<goarch>.zip`（下划线，如 `workbuddy-provider_0.14.20_linux_amd64.zip`）。解压/脚本 glob 时目录段与文件段分隔符不同，写错任一都报找不到文件；目录已不再入仓，无需 `git add`。
 45. **三插件并行发布时 CI 轮询窗口需留足（2026-09-05 实测）**：三个 dispatch run 并行排队，15 分钟窗口只完成 1 个（runner 并发紧张），另 2 个在第二个 15 分钟窗口的第 1/8 分钟才完成——单轮询脚本超时不代表 CI 失败，先查 run 实际 status 再决定是否重试，直接对超时 run 起第二轮轮询即可。
 46. **`actions/runs?head_sha=` 过滤器必须传完整 40 位 SHA（2026-09-06 实测）**：传短 SHA（如 `c748f79`）恒返回空列表——dispatch 204 后轮询脚本 120s 查不到 run 会误判为「索引延迟」。先 `git rev-parse HEAD` 取完整 SHA 再查询；或改查 `actions/runs?event=workflow_dispatch&per_page=6` 按 `head_sha[:7]` 前缀匹配。
-47. **版本竞争 takeover：Release 已建但 registry 未 publish 时，版本号顺延不复用（2026-09-07 实测，0.1.53 发布）**：并行会话已 commit + dispatch + CI 建好 Release（tag 存在）但停在 publish 前，registry 仍是旧版。此时该版本号视为已占用——工作树里的新改动（superset）**必须顺延新版本号**（0.1.52→0.1.53），并做四处重定向：CHANGELOG 拆分条目（对方条目归位已发布版本，自己的条目起新版本章节）、VERSION/main.go 重新 bump、**工作树里提前 bump 的 registry.json 必须 `git checkout --` 撤销**（Step 11 由 publish-assets.py 原子更新）、测试注释/文档版本引用同步修正。registry 从旧版直跳新版（被占用版本从未进 registry，无零残留问题）。判定 Release 是否已发布用 `GET /releases/tags/<tag>`（HTTP 200=已存在），annotated tag 要用 `git rev-parse <tag>^{commit}` 解析真实 commit。
+47. **版本竞争 takeover：Release 已建但 registry 未 publish 时，版本号顺延不复用（2026-09-07 实测，0.1.53 发布）**：并行会话已 commit + dispatch + CI 建好 Release（tag 存在）但停在 publish 前，registry 仍是旧版。此时该版本号视为已占用——工作树里的新改动（superset）**必须顺延新版本号**（0.1.52→0.1.53），并做四处重定向：CHANGELOG 拆分条目（对方条目归位已发布版本，自己的条目起新版本章节）、VERSION/main.go 重新 bump、**工作树里提前 bump 的 registry.json 必须 `git checkout --` 撤销**（Step 10 由 publish-assets.py 原子更新）、测试注释/文档版本引用同步修正。registry 从旧版直跳新版（被占用版本从未进 registry，无零残留问题）。判定 Release 是否已发布用 `GET /releases/tags/<tag>`（HTTP 200=已存在），annotated tag 要用 `git rev-parse <tag>^{commit}` 解析真实 commit。
 48. **plugin-store install 对个别插件可能落盘但不热重载（2026-09-07 实测，qoderwork 0.9.12）**：traework/workbuddy install 后同秒 loaded+registered+hot reloaded，qoderwork install 返回 `status=installed, restart_required=false` 但**无任何 loaded/reloaded 日志**，重装一次（overwritten=true）也不触发——宿主 active 版本停在旧版（`.so` sha256 与本地一致，落盘本身正确）。处置：sha256 校验通过 + accounts/panel 200 即可接受「待宿主重启生效」；旧版继续服务且该插件生产无账号时无风险敞口，不必为此重启宿主（重启中断在线流量），把重启时机交用户决定。后续每次 install 后都要 `docker logs | grep "hot reloaded"` 确认 active_version，不能只信响应 JSON。（2026-09-08 复测 0.9.13：同版本族 install 后正常热重载，踩坑 48 形态非 qoderwork 必然，属偶发。）
 49. **CI 轮询 urllib 脚本必须 JSON 解析容错（2026-09-08 实测）**：api.github.com TLS 瞬时窗口（`SSL UNEXPECTED_EOF_WHILE_READING` 连续 5 次重试全败）时 call() 返回空串，裸 `json.loads(raw)` 直接崩溃退出——轮询脚本必须包 jcall（空响应跳过本轮继续轮询，多轮重试），否则一次网络抖动杀掉整个后台轮询还得重启脚本。
 50. **多插件批量改码后发布，Step 1 的 VERSION 文件极易漏 bump（2026-09-08 实测）**：会话内先改码收口、隔轮才授权发布时，main.go 的 `var version` 记得 bump 但三个 `VERSION` 纯文本文件仍是旧版——commit 前 push 前必须自查：`cat */VERSION && grep -h 'var version = ' */main.go` 两两核对一致；push 后才发现会造成 registry 版本与仓库 VERSION 不一致的中间态。
 51. **panel.html 改动仅凭 node --check 全绿就发布 = 生产事故（2026-09-08 实测，0.1.55→0.1.56 hotfix）**：`node --check` 只查语法，抓不到未定义标识符——0.1.55 清理把 `const scopeLabel=` 前缀删成孤立表达式，语法合法全绿发布，生产运行时 `ReferenceError` 使面板整体失败。HTML 内嵌 JS 改动后的发布前最低验证线：① vm + DOM stub 真实执行全部 `<script>` 顶层（抓 ReferenceError）；② 删除"带名字的定义"时 grep 复查定义处与使用处成对存在；③ 关键表达式（如三元链）逐分支运行时断言。三者缺一不可，Go build/test 全绿对内嵌 JS 零覆盖。
-52. **管道吞退出码 → 残缺 assets 被提交（2026-09-12 实测，0.14.29）**：`python scripts/download-release-assets.py ... | tail` 会吞掉脚本的异常退出码——下载 7 个 zip 只成功 1 个（脚本中途 URLError 10060），`&&` 链继续执行，**残缺 assets 直接 commit + push**。铁律：assets 下载后、`git add` 前**必须** `cd release-assets/<dir> && sha256sum -c checksums.txt` 且 6/6 全 OK；校验不过补下载，绝不能靠命令退出码串联代替产物校验。
+52. **管道吞退出码 → 残缺 assets 被提交（2026-09-12 实测，0.14.29）**：`python scripts/download-release-assets.py ... | tail` 会吞掉脚本的异常退出码——下载 7 个 zip 只成功 1 个（脚本中途 URLError 10060），`&&` 链继续执行，**残缺 assets 直接进入 registry**（当前资产不入仓，风险等价：残缺 sha256 被 publish 进 registry）。铁律：assets 下载后、`publish-assets.py` 前**必须** `cd release-assets/<dir> && sha256sum -c checksums.txt` 且 6/6 全 OK；校验不过补下载，绝不能靠命令退出码串联代替产物校验。
 53. **assets 下行也走 SOCKS 隧道 + 隧道启动方式（2026-09-12 实测，0.14.29/0.14.30 两次复现）**：踩坑 37 只写了上行，实测 `download-release-assets.py` 直连下行同样稳定超时（urllib WinError 10060）——release assets 下载直接走 `curl -sL --socks5-hostname 127.0.0.1:1080`（先下 checksums.txt，再逐个 zip，最后 sha256sum -c）。隧道启动：Git Bash 里 `(ssh -f -N -D ... &)` 子壳后台化不可靠（静默失败），**用 run_in_background 跑 `ssh -N -D 127.0.0.1:1080`，然后 `netstat -an | grep ":1080.*LISTEN"` 确认监听再开下载**；隧道进程保留可跨版本复用（0.14.29 与 0.14.30 共用）。
 54. **更新插件不需要手工改数据库表——直读直写 `config_store` 是生产事故（2026-10-11 两次事故，铁律）**：`plugin-store install` 一条命令即可，CPA 自动把 version + 6 平台 artifacts 写入 `config_store.content` 的 `plugins.configs.<id>` 并热重载，**零人工介入**（18:04:53 实证：install 0.1.3 前后两次配置快照 diff，唯一实质差异就是该插件的 version 与 artifacts）。反例：外部会话 `select content from cli_proxy_api.config_store` 后经二次序列化写回 → 真实换行退化为字面 `\n`、整篇塌缩单行 → YAML 判空 → `remote-management.secret-key`/`port` 全丢 → `/v0` `/v8` 管理路由全 404、端口漂移、外网 502。**铁律**：① 改插件配置只走 `plugin-store install`；② 非插件配置走 `PUT /v8/management/config`；③ 数据库表**只读不写**（`select` 可以，读完绝不写回）；④ 损坏铁证 = 反斜杠被再转义一层（`\"`→`\\"`）+ `char(10)` 真实换行数为 1；⑤ 恢复流程见 `project-cpa-workbuddy-plugin-host-config-safety-rules`。
 
