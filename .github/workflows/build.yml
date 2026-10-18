@@ -27,6 +27,11 @@ on:
   pull_request:
   push:
     branches: [main]
+    paths-ignore:
+      - "doc/**"
+      - "skills/**"
+      - "release-assets/**"
+      - "**/*.md"
     tags:
       - "workbuddy-provider-v*"
       - "qoderwork-provider-v*"
@@ -51,6 +56,10 @@ on:
         description: "Version without v (empty = plugin's VERSION file)"
         required: false
         default: ""
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
 permissions:
   contents: write
@@ -94,6 +103,9 @@ jobs:
 
   build:
     name: ${{ matrix.id }} ${{ matrix.goos }}/${{ matrix.goarch }}
+    # Branch pushes and PRs only run the test matrix; builds are reserved for
+    # dispatch and tag releases.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -565,6 +577,7 @@ jobs:
 
   build-cross:
     name: ${{ matrix.id }} ${{ matrix.target }} (go-cross)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     needs: test
     runs-on: ubuntu-24.04
     strategy:
