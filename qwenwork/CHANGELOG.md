@@ -1,5 +1,18 @@
 # QwenWork Plugin Changelog
 
+## 0.2.6
+
+### Fix - MaaS session_id 必须是合法 UUID（执行器路径 422 的真正原因）
+
+- 变更要点:
+  1. 0.2.5 修好 body.model 后，执行器路径改报 `maas mint: http 422 value is not a valid UUID`。生产日志定位：插件把调度侧会话键（形如 `x-client-request-id:abc`、`derived:conv-123`）原样当作上游 `session_id` 发送，而上游强校验 UUID。
+  2. 面板「测试」传空 sessionID 故正常，执行器路径必带会话键故必失败——又是一次「面板成功、网关失败」的路径差异。
+  3. 修复：新增 `maasSessionID`，按会话键做 SHA-256 确定性派生并格式化为 v4 UUID（版本位 4、变体位 8/9/a/b）；同一会话恒得同一 UUID（保持会话粘性），空键返回空串交由上游分配。
+  4. `mintPayload` 独立成函数，便于测试直接断言「实际发往上游的 payload 里 session_id 是 UUID」。
+- 验证: 新增 `maas_session_id_test.go`（4 个用例）覆盖 UUID 格式、确定性、空键；**变异反证**：把 `mintPayload` 退回直接透传会话键 → `TestMintPayload_SessionIDIsUUID` 精确 FAIL；还原后全绿。
+- 已知边界: 首版测试只断言 `maasSessionID` 本身，变异（跳过派生）未被捕获；据此把 payload 组装抽成 `mintPayload` 并补断言，才让变异命中。
+- 涉及文件: qwenwork/maas.go、qwenwork/maas_session_id_test.go、qwenwork/VERSION、qwenwork/CHANGELOG.md
+
 ## 0.2.5
 
 ### Fix - 透传请求体的 model 改写为上游真实 ID（别名 400 的真正根因）

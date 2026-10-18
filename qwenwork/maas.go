@@ -109,21 +109,56 @@ func maasCacheKey(sa *storedAuth) string {
 	return "token:" + fingerprintToken(sa.Auth.AccessToken)
 }
 
+// maasSessionID 把调度用的会话键转换为上游要求的 UUID 形态。
+//
+// 上游 POST /api/desktop-sessions 的 session_id 字段强校验 UUID：传入
+// "x-client-request-id:abc" 这类调度键会得到
+// `422 value is not a valid UUID`（2026-10-18 生产实证）。调度键与上游
+// 会话 ID 是两套语义，不能直接复用，因此这里按会话键确定性派生 UUID：
+// 同一会话恒得同一 UUID（保持会话粘性），不同会话得到不同 UUID。
+//
+// [参数] sessionKey 调度侧会话键，可为空。
+// [返回] 合法 UUID 字符串；sessionKey 为空时返回空串（交由上游分配）。
+// 最近修改时间：2026-10-18 14:45:00；改动原因：session_id 强校验 UUID。
+func maasSessionID(sessionKey string) string {
+	key := strings.TrimSpace(sessionKey)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("qwenwork-maas-session:" + key))
+	// 按 RFC 4122 v4 形态拼装：版本位固定为 4，变体位固定为 8/9/a/b。
+	sum[6] = (sum[6] & 0x0f) | 0x40
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
+}
+
+// mintPayload 组装 POST /api/desktop-sessions 的请求体。
+//
+// 独立成函数以便测试直接断言「发给上游的 session_id 是 UUID 形态」——
+// 只测 maasSessionID 本身无法发现调用方漏用派生结果。
+//
+// [参数] sessionID 调度侧会话键，可为空。
+// [返回] 上游请求体；会话键为空时不含 session_id 字段，由上游分配。
+// 最近修改时间：2026-10-18 14:45:00；改动原因：session_id 强校验 UUID。
+func mintPayload(sessionID string) map[string]any {
+	payload := map[string]any{}
+	if sid := maasSessionID(sessionID); sid != "" {
+		payload["session_id"] = sid
+	}
+	return payload
+}
+
 // mintMaasSession 调 POST /api/desktop-sessions 换新票据。
 //
 // [参数] hostToken 宿主 access token（dt- 或 device_token）；sessionID 可空，
 // 用于让上游把票据绑定到具体会话，空时上游自行分配。
 // [返回] 成功返回票据；HTTP 非 2xx 或响应缺 access_token 时返回错误。
-// 最近修改时间：2026-10-17 23:45:00；改动原因：新建 QwenWork MaaS 签发层。
+// 最近修改时间：2026-10-18 14:45:00；改动原因：session_id 必须是合法 UUID。
 func mintMaasSession(hostToken, sessionID string) (*maasSession, error) {
 	if strings.TrimSpace(hostToken) == "" {
 		return nil, fmt.Errorf("maas mint: empty host token")
 	}
-	payload := map[string]any{}
-	if sid := strings.TrimSpace(sessionID); sid != "" {
-		payload["session_id"] = sid
-	}
-	body, _ := json.Marshal(payload)
+	body, _ := json.Marshal(mintPayload(sessionID))
 	// 签发在请求关键路径上：sharedHTTPClient 的 120s 兜底太长，单独收紧。
 	ctx, cancel := context.WithTimeout(context.Background(), maasRequestTimeout)
 	defer cancel()
