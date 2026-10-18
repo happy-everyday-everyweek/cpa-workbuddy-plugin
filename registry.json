@@ -519,7 +519,7 @@
       "name": "GitHub Copilot",
       "description": "GitHub Copilot provider for CLIProxyAPI: GitHub OAuth Device Flow login, Copilot internal token exchange and keep-alive, VS Code Copilot Chat client fingerprint mimicry, dynamic model discovery, multi-account pool with failover, streaming and non-streaming forwarding, quota view, and a dedicated management panel.",
       "author": "Sliverkiss (cpa-workbuddy-plugin)",
-      "version": "0.1.8",
+      "version": "0.1.9",
       "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
       "logo": "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/assets/icons/Copilot.png",
       "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/copilot",
@@ -538,44 +538,44 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_darwin_amd64.zip",
-            "sha256": "da1b4754a1acf49f417b2f639b17509bd3cc3b7b4b495862b54d349a7de7fb26",
-            "size": 3035678
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_darwin_amd64.zip",
+            "sha256": "1e58f38b02f8df2ecb6213c0ec2dca77c1530343705f29e612d1a89979a9daa7",
+            "size": 3035683
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_darwin_arm64.zip",
-            "sha256": "0b460b25b28d48269fef1b0f52c40faeb2287300d78ba14100e3446c9d96ddf7",
-            "size": 2800637
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_darwin_arm64.zip",
+            "sha256": "048b472e1f4a5ab534388155fdeb24f63bc86e09b0e41e2033b9ca87846f8a68",
+            "size": 2800641
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_linux_amd64.zip",
-            "sha256": "828be988b73cb04ae7b77d01ed38964d01134fb484c18901d1f898046c428e92",
-            "size": 3182174
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_linux_amd64.zip",
+            "sha256": "019d43cf03ef0ff64937042a6be26e2e7c3406775e57ad1f3e9f88c6ad0db9d8",
+            "size": 3182175
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_linux_arm64.zip",
-            "sha256": "67ae7798a4d2b21dc580037cd4eb8120548e8f3b73c05419f030cadbb59af0da",
-            "size": 2889987
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_linux_arm64.zip",
+            "sha256": "28156e9704ddb133b619c11793ba760490ab3a4d6c575f0a829716570a843fd3",
+            "size": 2889990
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_windows_amd64.zip",
-            "sha256": "2b8cfe3c5da97e51ea674052b7448b1a1259ae888202c8720ad4a2501dc79828",
-            "size": 3104640
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_windows_amd64.zip",
+            "sha256": "e3787083874d90eeb658e0d3053230ad43117d3736e0426ab83b9d5f1ad863be",
+            "size": 3104634
           },
           {
             "goos": "windows",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.8/copilot-provider_0.1.8_windows_arm64.zip",
-            "sha256": "68084b877eae033e415081d069ba133c07b6bbd52d9499631640af0ad1e26b2d",
-            "size": 2876796
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/copilot-provider-v0.1.9/copilot-provider_0.1.9_windows_arm64.zip",
+            "sha256": "338094c57e64191f184e43b4a59329abe8ffcc0112776a3ae6ffdbf08eb1e58c",
+            "size": 2876793
           }
         ]
       }
