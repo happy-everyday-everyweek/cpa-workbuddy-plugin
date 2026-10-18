@@ -32,16 +32,18 @@
 
 ## 活动会话进展摘要
 
-- 当前会话（2026-10-18）：**coze-provider 0.2.0 模型动态发现 + 面板重做**：
-  - 需求：用户在生产管理台看到「支持的模型」弹窗显示「该凭证暂无可用模型」，且面板与 workbuddy 差距大、缺测试模型功能、时间非北京时间、面板内不该有授权区。
-  - **上游契约（真机实证）**：`POST /v1/model/list` 的 `model_type` 必须是**字符串**枚举（`llm` / `image_generation` / `video_generation` / `tts` / `asr` / `embedding`），传数字返回 `InvalidRequest`；`POST /api/coze_claw/resource/get_multimodal_model_catalog` 才有完整视频族（Seedance 2.5/2.0、MiniMax-H3），两者必须合并。生产账号实测 **16 个模型**。
-  - **实现**：声明 `model_provider`，实现 `model.static` / `model.for_auth`；发现链路并发 + 单请求 8s 超时 + 缓存按 `AuthID` 分桶；`model.static` **不在宿主启动期打网络**（宿主在认证加载路径同步调用）；新增 `/models` 与 `/test-active`（认证层探活：判据端点 + 模型目录 + `sec_user_id` 归属 + 选中模型是否在目录）。
-  - **面板重做**：移除授权引导区（改走宿主「添加账号」）；按 workbuddy 风格做账号卡 / 筛选标签+计数 / 汇总卡 / 搜索 / 批量启停 / 删除二次确认 / toast / 三态主题；时间统一 `Asia/Shanghai`。
-  - **验证**：cgo-shim build/vet/test 全绿（新增 15 个用例，含哨兵验证）；真实账号 `TestLiveModelDiscovery` 9 个模型（本地 Cookie 仅 38 字节，多模态目录被拒）；本地 mock 宿主浏览器验证 10 项全通过、控制台 0 错误。
-  - **发布（0.2.0）**：CI run `39065042718` 全绿 → `16cddd8`(源码) → `2c6d528`(assets) → `ee4f2c2`(registry + prune 0.1.3) → `1931cd7`(文档)；远端 6/6 raw URL 200 且 size 全等；`validate-registry.py` OK（12 插件）。
-  - **生产部署（2026-10-18 04:48:23）**：`plugin-store install?version=0.2.0` → HTTP 200 + `restart_required:false`，**零容器重启**；日志 `plugin hot reloaded active_version=0.2.0 retired_version=0.1.3`。验收：`auth-files/models` 返回真实模型（含 `coze/MiniMax-H3` 等视频族）；插件 `/models` → `source=upstream count=16`；`/test-active` → `ok=true 会话有效，可见 16 个模型`；`/panel` 中「授权扣子账号」出现 0 次。
-  - **未验证**：真实推理链路（`coze_claw/message/chat` 需桌面端 `claw_id` / `session_id`，属 CYCLE-01）；AC-001 真实浏览器授权仍需用户先在浏览器登录扣子。
-  - 文档：`doc/5-tests/2026-10-18_050000_CozeProvider模型发现与面板重做验证.md`、`doc/6-review/2026-10-18_050000_CozeProvider模型发现与面板重做_6-review.md`（STYLE: PASS）。
+- 当前会话（2026-10-18）：**coze-provider 0.2.2 定时续期改由插件自建定时器执行**：
+  - 需求：用户问「续期是自动的吗?」，随后要求「定时 4 小时补 `refresh_interval_seconds`，续期，和其他插件的定时一样」，并要求面板展示积分余额。
+  - **根因（宿主源码取证）**：`refresh_interval_seconds` 只决定宿主「何时把账号排进刷新队列」；`auto_refresh_loop.handleDueAuth` 在 `exec == nil` 时只做 `l.upsert(authID, now.Add(interval))` 空转重排，**不调用 `auth.refresh`**。`RegisterExecutors` 只注册声明 executor 的插件，coze 声明 `Executor:false`，因此宿主的 4 小时排期对本插件永不产生续期。生产证据：24h 内 0 条 auto-refresh 日志，3 次续期全是手动点击。
+  - **实现**：新增 `coze/renew_loop.go`（默认 4 小时遍历启用账号执行 `renewSession` + `applyRenewal`；热重载后立即跑首轮；`reconfigure` 即时重排；`Shutdown` 关闭停止信号；并发上限 4；经宿主 `host.log` 留痕）。`main.go` 在 `cliproxy_plugin_init` 启动、`Shutdown` 停止。
+  - **顺带修复真实缺陷**：`applyRenewal` 原防覆盖判据 `bindStore(path).replaced()` 在写前才取摘要，比对对象永远是文件自身 → 外部重新授权的新凭据会被旧快照静默覆盖。改为读取时锚定 `StoredAuth.LoadedDigest`，删除失效的 `storeBinding`/`bindStore`。
+  - **验证**：cgo-shim build/vet/test 全绿（新增 12 个用例）；哨兵证明测试真实进编译；7 次变异反证全部精确命中；真实 cgo 构建 10.9MB `.so`（8 个 ABI 符号、版本串 0.2.2）；真实 `.so` ctypes 探针 `test/coze/renew_loop_probe.py` **7/7 PASS**（含判别力变异：注释掉 `startRenewLoop` → 4 项 FAIL）。
+  - **发布（0.2.2）**：CI run `39106119186` success → `90edaae`(源码) → 资产 6/6 `ALL CHECKSUMS OK` → `4f45084`(registry)；远端 git 内容 version=0.2.2、6 artifacts sha256+size 齐全（raw CDN 有缓存延迟）。
+  - **生产部署（15:15:18）**：`plugin-store install?version=0.2.2` → 200 + `restart_required:false`，**零容器重启（Up 2 days）**；`active_version=0.2.2 retired_version=0.2.1`；落盘 `.so` sha256 `589830201cba…` 与本地 zip 一致。
+  - **生产行为验收（关键）**：15:15:19 与 15:15:38 各一轮 `定时续期完成`（**无手动点击**）；`last_renew_at` 推进到 `15:15:38`，`auth_state=ok`；`/panel` 200；`/credits` 返回 3000/3000/1500；0 error/panic。
+  - **未验证（诚实标注）**：4 小时排期的第二/三轮（仅等到首轮与热重载轮），由 `TestRenewLoopFiresOnInterval` 覆盖；插件直连 `www.coze.cn` 不经宿主 `host.http.do`，`.so` 探针无法拦截上游往返，换发与落盘由 Go 单测覆盖。
+
+- 前序会话（2026-10-18）：**coze-provider 0.2.0 模型动态发现 + 面板重做**：声明 `model_provider` 并实现 `model.static`/`model.for_auth`（`/v1/model/list` 的 `model_type` 必须是字符串枚举，多模态目录才有完整视频族，生产实测 16 模型）；面板移除授权区、按 workbuddy 风格重做、加 `/models` 与 `/test-active`、时间统一 `Asia/Shanghai`。已发布 0.2.0 并生产热重载验收（`active_version=0.2.0`、`/test-active` 可见 16 模型）。未验证：真实推理链路（属 CYCLE-01）。
 - 当前会话（2026-10-18）：**qwenwork CYCLE-02 多账号调度：修复账号身份 key 失配（P0）**：
   - 需求：用户「启动 CYCLE-02 多账号调度」，范围为账号池 / 调度三模式+会话粘性 / 冷却阶梯+换号重试。
   - **核心缺陷（克隆遗留，P0）**：执行器把 `auth.accessToken` 当账号身份，而调度候选、冷却表、会话绑定、积分缓存全按宿主 `auth.ID`（`qwenwork-<uid>.json`，由 [authIDForPath](file:///C:/Users/luode/go/pkg/mod/github.com/router-for-me/!c!l!i!proxy!a!p!i/v7@v7.2.129/internal/pluginhost/auth_callbacks.go#L504) 从相对路径派生）索引。实测 token 是 552 字符 JWT ⇒ 冷却写到永远查不到的键 ⇒ 故障账号永不退出轮转，多账号调度退化为单账号。
@@ -49,9 +51,12 @@
   - **验证**：新增 10 个单测；四次变异反证全部精确命中（身份退回 token / 删 off 解析 / 折叠改重建 / 同关两处冷却闸门 → 分别 2/1/2/4 个用例 FAIL）；真实 `.so` ctypes 探针 `test/qwenwork/multiaccount_probe.py` 9/9 PASS（含探针自身判别力变异验证）；WSL 真实 cgo 构建 + test + vet 全绿；gofmt 空；版本 0.1.0→**0.2.0**。
   - **未验证（诚实标注）**：真实双账号端到端切换。本机仅 1 个真实账号，且失败路径需先过真实 MaaS 签发（`sharedHTTPClient` 直连，不经宿主桥），桩驱动无法不联网注入 401；该链路由「同键一致性单测 + 调度侧冷却排除单测」组合覆盖。
   - **0.2.0 已发布（2026-10-18）**：CI run `39062771266` 全绿（Test + 6 平台 build/cross + Release）→ `cc7fe59`(assets，先于 registry 推送) → `bf36ab1`(registry 0.2.0，6 artifacts) → `33d5fb2`(prune 0.1.0)。远端 6/6 raw URL HTTP 200 且 Content-Length 与 registry size 全等，下载复算 sha256 6/6 一致；6 个二进制内均含 `0.2.0`；远端 registry 12 插件无空 artifacts；旧 0.1.0 URL 现 404（预期）。
-  - **生产部署（2026-10-18 04:04:54，首次安装）**：`plugin-store install?version=0.2.0` → HTTP 200 + `restart_required:false`，**零容器重启**（Up 2 days）；日志 `plugin loaded`/`plugin registered` 均为 `version=0.2.0`；落盘 `.so` sha256 `b75b5628…` 与本地 zip 逐字节一致；插件列表 `registered=true enabled=true 0.2.0`；`/accounts`（`scheduler_mode:session`、0 账号）/`/config`/`/models`/面板资源全 200；外网 `/v1/models` 200（36 模型）；`config_store` 真实换行 1502 行未塌缩、端口稳定 `:8317`；无 error/panic。生产账号为空，需用户面板 Device Flow 登录。
+  - **生产部署（2026-10-18 04:04:54，首次安装）**：`plugin-store install?version=0.2.0` → HTTP 200 + `restart_required:false`，**零容器重启**；日志 `plugin loaded`/`plugin registered` 均为 `version=0.2.0`；落盘 `.so` sha256 `b75b5628…` 与本地 zip 逐字节一致；`/accounts`（`scheduler_mode:session`、0 账号）/`/config`/`/models`/面板资源全 200；外网 `/v1/models` 200（36 模型）；`config_store` 真实换行 1502 行未塌缩、端口稳定 `:8317`。
+  - **别名 400 缺陷修复（0.2.3~0.2.6，2026-10-18）**：new-api 测试 `qwen-3.8-max` 失败而面板测试同模型成功。**四层缺陷串联，逐层暴露**：① 0.2.3 执行器不做别名反解；② 0.2.4 `ExecutorModelScope=OAuth` 致宿主跳过 `StaticModels`、别名缓存恒空；③ **0.2.5 真正主因——透传 body 未改写 `model`**（生产日志 `model=qwen3.8-max-preview alias=qwen-3.8-max` 证明宿主早已反解 `ExecutorRequest.Model`，插件却透传 `req.Payload` 原文）；④ 0.2.6 调度会话键被当作 MaaS `session_id` → `422 not a valid UUID`（新增 `maasSessionID` 做 SHA-256 确定性派生 v4 UUID）。
+  - **生产验收（0.2.6，热重载零重启）**：`qwen3.8-max-preview`/`qwen-3.8-max`/`qwen-3.8`/`qwen3.8-max` 四条全部 **200**（修复前 200/500/503/503）；流式 + `X-Session-ID` 头同样 200，SSE 正常 `[DONE]`，响应 `model` 为真实 ID。每次修复均做变异反证精确命中。
+  - **安装坑**：`plugin-store install` 不带 `source` 参数报 `direct plugin version "x" not found`（多源合并路径版本解析失败），必须带 `&source=source-636fa01121af`。
   - **有意保留**：`clientUA = "qoderwork/1.3.1"` 是实测通过的 UA（探针同值），非残留；`isDailyCountExceeded` 的 110 判定实测四形态不误伤，留作防御。
-  - 文档：实施总览 § CYCLE-02 执行结果、`doc/5-tests/2026-10-18_021000_*`、`doc/6-review/2026-10-18_021000_*`（STYLE: PASS）。
+  - 文档：实施总览 § CYCLE-02 执行结果、`doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`、`doc/5-tests/2026-10-18_021000_*`、`doc/6-review/2026-10-18_021000_*`（STYLE: PASS）。
 - 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：
   - 需求背景：用户发现千问办公（qwenwork.cn，与 Qoder 不同产品）并希望做成 CPA 插件；先分析开源与插件库（无现成项目）→ 选方案 A 做真实登录验证 → 参照 workbuddy 插件功能实现。
   - **协议链路（真机实证）**：Device Flow + PKCE（`gateway.qwenwork.cn`，`clientId=e883ade2-…`，`redirect=qwenwork-cn://`）换宿主 token（JWT 7d）→ `POST /api/desktop-sessions`（**返回 201 非 200**）签发 `sk-mm-v1.*` 短票据（TTL 2h）→ 裸 Bearer 打 `{base_url}/v1/chat/completions`；轮换走 `POST {base}/v1/access-tokens/exchange`。MaaS 无 `/v1/models`（404），真实目录在 `GET /api/desktop/chat-modes`（`schema_version=2`，仅 flash / pro / qwen3.8-max-preview 三档）。
@@ -106,14 +111,7 @@
 
 - 会话（2026-10-15，已压缩）：**zcode-provider 0.1.30 面板额度改用 `billing/balance` 取真实用量**：根因是 `billing/current` 只返回授予量、无已用/剩余，且面板进度条硬编码 100%；改走 balance（强制设备三头 `X-Platform`/`X-Device-Mid`/`X-ZCode-App-Version`）+ `friendlyClaimError` 文案友好化；发布链 `a49101a`→`1b80e6f`(assets)→`6fd166d`(registry)，生产热重载零重启，`/credits` 返回 `source=balance has_usage=True` 且用量真实。Bug 文档 `doc/4-bugs/2026-10-15_023000_zcode面板额度永远显示满额根因诊断.md`。
 
-- 会话（2026-10-14/15）：**zcode-provider 默认中国区 + 面板内无感验证领取额度（0.1.28 新增 → 0.1.29 修复配置缺陷），全链路发布生产**：
-  - 需求背景：用户要求「默认中国区，OAuth 登录页也默认中国区授权」，并「通过逆向工程激活额度，不用手动去 zcode 客户端登录激活」；经确认范围收敛为「只做无感验证（不做交互滑块）」+「先预研可行性」。
-  - 预研（`doc/5-tests/2026-10-14_151500_*`）：逆向 asar 3.15.1 + 真实浏览器实测，证实官方用的就是标准阿里云无感验证 SDK，**插件端可自主领取**（推翻此前「只能引导用户去桌面客户端」的结论）；识别三项此前遗漏的必需项：`region=sgp`（非 configs 字面下发的 `cn`）、`plan_id` 带批次后缀 `zcode-v3-start-plan-0817`（须由 `/billing/preview` 动态解析）、`X-Device-Mid`（UUID v4）。
-  - **0.1.28 实施**：① 默认中国区——面板下拉 `bigmodel` 置首位 + `resolveOAuthProvider`/`providerFromMetadata` 空值默认 `bigmodel`（显式 `zai` 仍可用）；② claim 契约——新增 `fetchClaimablePlanID()` 动态解析 planId、`zcodeDeviceMid()` 稳定 UUID、claim 请求补 `X-Device-Mid`；③ 面板新增 `runTracelessVerification` + `claimQuota`，未领取卡片按钮改「🎁 领取额度」，原「📖 领取指引」降级兜底。发布链 `89837d9`→CI `38590147511`→`80eadd8`(assets)→`9635fa0`(registry)；生产热重载 `active_version=0.1.28 retired_version=0.1.27`，零容器重启。
-  - **0.1.29 缺陷修复（本会话端到端实证中发现）**：0.1.28 面板产出的 `captchaVerifyParam` 仅 76 字符、不含 `securityToken`，`/claim` 始终返回 `captcha_required`。根因（真实浏览器 A/B/C/D/E 五组受控实验锁定）：`initAliyunCaptcha` 未传 `prefix`/`region`，且只设了 SDK **不读**的全局名 `AliyunRequestVerificationConfig`（SDK 实读 `window.AliyunCaptchaConfig` 且**仅在脚本加载期读取一次**）→ 请求打到 `undefined.captcha-open.aliyuncs.com`。修复：init 入参显式传 `prefix`/`region`（与时机无关的权威通道）+ 加载前预设 `window.AliyunCaptchaConfig`。修复后参数 **76→280 字符且含 `securityToken`**，生产 `/claim` 上游响应由 **captcha 层 `captcha_required` → 业务层 `no permission`**，证明 captcha 校验已通过。Bug 文档 `doc/4-bugs/2026-10-15_001240_*`。
-  - **0.1.29 发布闭环**：提交 `c757927`(fix 5 文件) → CI `38596835494` success → `fb5f8d8`(assets, 7/7 sha256 OK) → `1a8bc97`(registry) → `db66489`(docs) → `0612449`(prune 0.1.27/0.1.28)；远端 raw URL 200；生产热重载 `active_version=0.1.29 retired_version=0.1.28`，零容器重启，落盘 `.so` sha256 `9dc184d9…b10da` 与 zip 内 `.so` 逐字节一致；**生产面板行为验收**：面板自身 `runTracelessVerification` 产出 280 字符有效参数。
-  - 未覆盖：**「未领取 → 已激活」完整激活未取得实证**——上游当前对全部账号 `billing/preview` 返回 `plans:[]`（无下发可领取计划），claim 业务层返回 `no permission`，属上游活动态非插件缺陷；captcha 层已独立判据通过。
-  - 门禁：`cgo-shim-build.py zcode` build/vet/test 全绿；面板 JS `node --check` 双块 rc=0；`gofmt` LF 归一后空；`POLLUTION: PASS`；`STYLE: PASS`（`doc/6-review/2026-10-15_003700_*`）。
+- 会话（2026-10-14/15，已压缩）：**zcode-provider 默认中国区 + 面板内无感验证领取额度（0.1.28 → 0.1.29）**：逆向 asar 证实官方用标准阿里云无感验证 SDK，插件可自主领取；0.1.28 加中国区默认、`fetchClaimablePlanID` 动态解析 planId、`zcodeDeviceMid`、`X-Device-Mid`；0.1.29 修 `captchaVerifyParam` 仅 76 字符缺陷（根因：`initAliyunCaptcha` 未传 `prefix`/`region` 且只设 SDK 不读的全局名），修复后 280 字符含 `securityToken`，`/claim` 由 captcha 层 `captcha_required` 进到业务层 `no permission`。发布链 `89837d9`/`c757927` 两次闭环，生产热重载零重启。**未覆盖**：上游对全部账号 `billing/preview` 返回 `plans:[]`，完整激活未实证（上游活动态，非插件缺陷）。
 
 - 会话（2026-10-14，已压缩）：**zcode-provider 支持 bigmodel（中国区）OAuth 授权，0.1.25~0.1.27 三连发**：`provider=bigmodel` 完全复用既有 CLI 轮询链路（仅 provider 参数 / authorize 域名 / 回调路径不同，属参数化非重写）；CYCLE-1 `c84088f` 加 `ProviderFamily` 字段与全链参数化，CYCLE-2 `0e88c4c` 加面板下拉与归属徽标。三版闭环：0.1.25 中国区（`797d807`）→ 0.1.26 修非法 provider 静默回退（`cbbca35`）→ 0.1.27 修 bigmodel 推理 401（`open.bigmodel.cn/api/anthropic` 不接受 ZCode JWT，start-plan 两站共用 `zcode.z.ai`，`c19493b`）。GAP-004/005/006 全解除；`quota.go` 无需 family 分支（实测额度端点两家共用）。上游 `zcode.z.ai` 对生产 IP 有时段性 WAF（405/3012）与限流（429/3009），zai 账号同样受影响，属外部因素。
 
