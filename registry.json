@@ -713,7 +713,7 @@
       "name": "Coze Provider",
       "description": "Coze (扣子) account provider for CLIProxyAPI: one-shot same-origin authorization script that trades a login token for session cookies, login-state validation, triple-keyed cookie persistence with rolling token renewal, and a dedicated management panel.",
       "author": "luode0320",
-      "version": "0.2.1",
+      "version": "0.2.2-verify2",
       "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
       "logo": "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/assets/icons/Coze.png",
       "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/coze",
@@ -730,44 +730,44 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_darwin_amd64.zip",
-            "sha256": "f2b68bf921d2db648955f65ee9199e7f16d3c7edc7444e515e5779a541934212",
-            "size": 3058001
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_darwin_amd64.zip",
+            "sha256": "392c0f6160d80f70be80643be1bb03d0cfe6b55fc928da2538e6c919f97a6542",
+            "size": 3057978
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_darwin_arm64.zip",
-            "sha256": "91c55c3d1a8288547727c0bcd0d893b2ccc379fa39e86c219c064ca8440f40fc",
-            "size": 2817048
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_darwin_arm64.zip",
+            "sha256": "f11815304dc07db4adef61311d2b299f8b23d306d34aef1b8411f1da28a50cbe",
+            "size": 2816989
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_linux_amd64.zip",
-            "sha256": "464d5775fc62e3219f3c75adcb035daee9dae5004dd31fe4a3d35f43066569a4",
-            "size": 3203707
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_linux_amd64.zip",
+            "sha256": "c71126931cbd3113298c76d380365dfbfc84b106694e92a1557464c5af7695f9",
+            "size": 3203840
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_linux_arm64.zip",
-            "sha256": "f9f21bec4d80512292010a3dd5246fde9bc88d7a2654f6c73fd8152122f1fd0e",
-            "size": 2906776
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_linux_arm64.zip",
+            "sha256": "370e60832fb621832ad911cf37be40a4182258a7c099365d0acbad66ab684101",
+            "size": 2906900
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_windows_amd64.zip",
-            "sha256": "1171b42693fec61bc42b9ace2e1bf92fcc0e36ca4f37b31f7705743b32ab52e9",
-            "size": 3128290
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_windows_amd64.zip",
+            "sha256": "08f1b92a20e31aa7762584671bea77b8319b14f7a77d3b127bbe678daa8c2be8",
+            "size": 3128348
           },
           {
             "goos": "windows",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.1/coze-provider_0.2.1_windows_arm64.zip",
-            "sha256": "ebd638ed2b0480eb70ac55a5d42fd7ad148e34fa0844f18a8305b9ddfa72f1e1",
-            "size": 2893854
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/coze-provider-v0.2.2-verify2/coze-provider_0.2.2-verify2_windows_arm64.zip",
+            "sha256": "514213172463edec6f9283576f663f5debcd0be48de15eeef780d7c8eb5907aa",
+            "size": 2893962
           }
         ]
       }
