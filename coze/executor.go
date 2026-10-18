@@ -383,11 +383,15 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 					})
 				}
 			}
-			if strings.TrimSpace(collector.text()) == "" {
+			// 收尾了却既没有正文也没有图片：上游确实没产出内容。
+			// 必须返回错误，否则调用方会把它当「空正文的成功响应」
+			// 一路带到下游，表现为「成功但 0 输出」（2026-10-19 生产实测）。
+			if strings.TrimSpace(collector.text()) == "" && len(collector.imagesSnapshot()) == 0 {
 				hostLogf("warn", "回复正文为空", map[string]any{
 					"message_id": messageID,
 					"finished":   true,
 				})
+				return "", fmt.Errorf("回复正文为空")
 			}
 			if err := flush(); err != nil {
 				return collector.text(), err
@@ -407,6 +411,11 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 			}
 			if err := flush(); err != nil {
 				return collector.text(), err
+			}
+			// 轮询成功但既无正文也无图片：这一轮上游确实没产出，
+			// 返回 nil 会被下游记成「成功但 0 输出」。
+			if strings.TrimSpace(collector.text()) == "" && len(collector.imagesSnapshot()) == 0 {
+				return "", fmt.Errorf("回复正文为空")
 			}
 			return collector.text(), nil
 		}
@@ -630,6 +639,24 @@ func streamHeaders() http.Header {
 	}
 }
 
+// hostStreamSend 是 stream.emit 的唯一出口。
+//
+// 抽成变量是为了测试可注入：宿主 API 只在 .so 加载后才可用，
+// 单测无法构造真实宿主，只能替换这一层断言「到底发了什么帧」。
+var hostStreamSend = func(streamID string, body []byte) error {
+	_, errCall := hostCall(pluginabi.MethodHostStreamEmit, body)
+	return errCall
+}
+
+// runExecutorConversation 跑一整轮对话，是流式路径的唯一执行入口。
+//
+// 抽成变量便于测试注入失败：宿主 API 与上游都只在运行时可用，
+// 单测需要直接模拟「上游拒收消息、一个字节都没产出」这一分支。
+var runExecutorConversation = func(ctx context.Context, sa *StoredAuth, model, prompt string, emit func(string) error) (string, error) {
+	exec := newCozeExecutor(sa, model, nil)
+	return exec.runStream(ctx, prompt, emit)
+}
+
 // streamEmit 向宿主推送一帧。
 //
 // payload 必须是裸 JSON 对象：宿主按请求格式决定是否补 `data: ` 前缀，
@@ -642,8 +669,52 @@ func streamEmit(streamID string, payload []byte) error {
 	if errMarshal != nil {
 		return errMarshal
 	}
-	_, errCall := hostCall(pluginabi.MethodHostStreamEmit, body)
-	return errCall
+	return hostStreamSend(streamID, body)
+}
+
+// marshalStreamErrorEnvelope 构造带 error 字段的 stream.emit 信封。
+//
+// 宿主的 rpcStreamEmitRequest 只有 error 字段能表达失败：写成 payload
+// 会被当成正常内容帧，请求最终以「成功」告终。
+// [参数] streamID: 宿主流标识；message: 终态错误文本。
+// [返回] 信封 JSON 与错误。
+// 最近修改时间：2026-10-19；改动原因：新增，上游失败透传通道。
+func marshalStreamErrorEnvelope(streamID, message string) ([]byte, error) {
+	return json.Marshal(map[string]any{"stream_id": streamID, "error": message})
+}
+
+// emitStreamError 通过宿主 stream.emit 的 error 字段上报终态失败。
+//
+// 只有真正的错误帧才会让宿主把请求判为失败；下游因此能看到明确的
+// 错误文案，而不是「成功但 0 输出」。
+// [参数] streamID: 宿主流标识；message: 终态错误文本。
+// [返回] 推送错误。
+// 最近修改时间：2026-10-19；改动原因：新增，上游失败不再伪装成功。
+func emitStreamError(streamID, message string) error {
+	body, errMarshal := marshalStreamErrorEnvelope(streamID, message)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	return hostStreamSend(streamID, body)
+}
+
+// streamTerminal 决定一轮流式执行结束时的收尾方式。
+//
+// 失败且从未发出过任何 payload 时必须返回错误：宿主把「首个 payload」
+// 当作流已成功的判据，此时补一个空终止帧会被记成「成功但 0 输出」，
+// 下游既看不到错误也无法计费（2026-10-19 生产实测：积分耗尽被记成功）。
+// 正文已泄漏后失败仍用 length 收尾，客户端保留已生成内容。
+// [参数] errRun: 执行错误；emitted: 是否已发出过 payload。
+// [返回] 终止原因（空表示改用错误帧）与需要上报的错误。
+// 最近修改时间：2026-10-19；改动原因：新增，失败收尾判定。
+func streamTerminal(errRun error, emitted bool) (string, error) {
+	if errRun == nil {
+		return openAIFinishStop, nil
+	}
+	if !emitted {
+		return "", errRun
+	}
+	return openAIFinishLength, nil
 }
 
 // streamClose 关闭宿主流。
@@ -662,9 +733,13 @@ func streamClose(streamID string) {
 //
 // 为什么必须异步：宿主在拿到响应后立即开始向客户端转发，
 // 同步阻塞会让客户端在整轮对话期间收不到任何字节。
+//
+// 首帧必须延迟到真正有内容时再发：宿主把「首个 payload」当作流已成功的
+// 判据，抢先发角色帧会让随后所有的上游失败都退化成「成功但 0 输出」，
+// 下游既看不到错误也无法计费（2026-10-19 生产实测：积分耗尽被记成功）。
 // [参数] streamID: 宿主流标识；sa: 账号；model: 模型名；prompt: 用户提示。
 // [返回] 无。
-// 最近修改时间：2026-10-18；改动原因：新增，异步流式主循环。
+// 最近修改时间：2026-10-19；改动原因：首帧延迟，修复上游失败被当成功。
 func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 	defer streamClose(streamID)
 
@@ -672,45 +747,60 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 	defer cancel()
 
 	id := newCompletionID()
+	emitted := false
+
+	// emitContent 在首个内容帧前补发角色声明，部分客户端据此决定渲染方式。
+	emitContent := func(payload []byte) error {
+		if !emitted {
+			first, errFirst := buildFirstChunk(id, model)
+			if errFirst != nil {
+				return errFirst
+			}
+			if errEmit := streamEmit(streamID, first); errEmit != nil {
+				return errEmit
+			}
+			emitted = true
+		}
+		return streamEmit(streamID, payload)
+	}
+
 	emit := func(delta string) error {
 		chunk, errBuild := buildChunk(id, model, delta, nil, nil)
 		if errBuild != nil {
 			return errBuild
 		}
-		return streamEmit(streamID, chunk)
+		return emitContent(chunk)
 	}
 
-	// 首帧声明 assistant 角色，部分客户端据此决定渲染方式。
-	if first, errFirst := buildFirstChunk(id, model); errFirst == nil {
-		if errEmit := streamEmit(streamID, first); errEmit != nil {
-			return
-		}
-	}
+	reply, errRun := runExecutorConversation(ctx, sa, model, prompt, emit)
 
-	exec := newCozeExecutor(sa, model, nil)
-	reply, errRun := exec.runStream(ctx, prompt, emit)
-
-	finishReason := openAIFinishStop
-	if errRun != nil {
-		// 正文已泄漏时用 length 收尾：客户端保留已生成内容，
-		// 下游计费也能凭终态事件恢复（本仓库既有教训）。
-		finishReason = openAIFinishLength
-		// 必须留痕：空正文 + length 对下游表现为「成功但 0 输出」，
-		// 没有任何错误信息，只能靠这条日志区分是上游失败还是真没内容。
+	finishReason, errTerminal := streamTerminal(errRun, emitted)
+	if errTerminal != nil {
+		// 一个字节都没发出去：必须走错误通道，不能补空终止帧。
 		hostLogf("warn", "对话执行失败", map[string]any{
-			"model":       model,
-			"prompt_len":  len(prompt),
-			"reply_len":   len(reply),
-			"finish":      finishReason,
-			"error":       errRun.Error(),
+			"model":      model,
+			"prompt_len": len(prompt),
+			"error":      errTerminal.Error(),
+		})
+		_ = emitStreamError(streamID, errTerminal.Error())
+		return
+	}
+	if errRun != nil {
+		// 正文已泄漏后失败：用 length 收尾，客户端保留已生成内容。
+		hostLogf("warn", "对话执行中断", map[string]any{
+			"model":      model,
+			"prompt_len": len(prompt),
+			"reply_len":  len(reply),
+			"finish":     finishReason,
+			"error":      errRun.Error(),
 		})
 	}
 
 	// 用量挂在终止帧上：宿主与 new-api 都从这一帧取 token 数，
 	// 缺了会让整轮请求记零用量、下游无法计费。
-	terminal, errTerminal := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply))
-	if errTerminal == nil {
-		_ = streamEmit(streamID, terminal)
+	terminal, errBuild := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply))
+	if errBuild == nil {
+		_ = emitContent(terminal)
 	}
 }
 
@@ -718,18 +808,32 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 //
 // 仅用于宿主没有提供 stream_id 的同步路径；代价是失去实时性，
 // 但比直接报错让请求失败更好。
+//
+// 首帧同样延迟到有内容时再补：宿主把首个 chunk 当成功判据，
+// 抢先发角色帧会让上游失败退化成「成功但 0 输出」。
+// 一个字节都没产生时直接返回错误，由宿主按失败处理。
 // [参数] sa: 账号；model: 模型名；prompt: 用户提示。
 // [返回] chunk 列表与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，同步路径兜底。
+// 最近修改时间：2026-10-19；改动原因：失败透传，不再伪造空终止帧。
 func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.ExecutorStreamChunk, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
 	defer cancel()
 
 	id := newCompletionID()
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0, 64)
+	emitted := false
 
-	if first, errFirst := buildFirstChunk(id, model); errFirst == nil {
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: first})
+	emitContent := func(payload []byte) error {
+		if !emitted {
+			first, errFirst := buildFirstChunk(id, model)
+			if errFirst != nil {
+				return errFirst
+			}
+			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: first})
+			emitted = true
+		}
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
+		return nil
 	}
 
 	emit := func(delta string) error {
@@ -737,19 +841,19 @@ func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.Exec
 		if errBuild != nil {
 			return errBuild
 		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk})
-		return nil
+		return emitContent(chunk)
 	}
 
-	exec := newCozeExecutor(sa, model, nil)
-	reply, errRun := exec.runStream(ctx, prompt, emit)
+	reply, errRun := runExecutorConversation(ctx, sa, model, prompt, emit)
 
-	finishReason := openAIFinishStop
-	if errRun != nil {
-		finishReason = openAIFinishLength
+	finishReason, errTerminal := streamTerminal(errRun, emitted)
+	if errTerminal != nil {
+		return nil, errTerminal
 	}
-	if terminal, errTerminal := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply)); errTerminal == nil {
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: terminal})
+	if terminal, errBuild := buildChunk(id, model, "", &finishReason, buildUsage(prompt, reply)); errBuild == nil {
+		if errAppend := emitContent(terminal); errAppend != nil {
+			return nil, errAppend
+		}
 	}
 	return chunks, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -828,4 +829,266 @@ func TestFallbackPollCollectsImagesFromFiles(t *testing.T) {
 	if len(images) != 1 || images[0] != "https://static.coze.site/x.jpg?sign=Z" {
 		t.Fatalf("未从 files 取到图片，Images = %#v", images)
 	}
+}
+
+// TestStreamTerminalReportsFailureBeforeFirstPayload 验证首帧前的失败必须上报。
+//
+// 生产实测（2026-10-19）：账号积分耗尽时上游 message/chat 直接返回
+// code=1000521，插件补了一个空正文的 length 终止帧，宿主据此判成功，
+// 下游记录「成功但 0 输出」且不计费。这里锁定契约：一个 payload 都没发
+// 出去时必须走错误通道，不能伪造终止帧。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，上游失败被当成功的回归。
+func TestStreamTerminalReportsFailureBeforeFirstPayload(t *testing.T) {
+	upstreamErr := errors.New("提交消息失败：该用户积分已耗尽（code=1000521）")
+
+	finishReason, errTerminal := streamTerminal(upstreamErr, false)
+	if errTerminal == nil {
+		t.Fatal("首帧前失败必须返回错误，不能补终止帧")
+	}
+	if errTerminal.Error() != upstreamErr.Error() {
+		t.Errorf("错误被改写：%v", errTerminal)
+	}
+	if finishReason != "" {
+		t.Errorf("失败路径不应给出终止原因，实际 %q", finishReason)
+	}
+
+	// 正文已泄漏后失败仍用 length 收尾，客户端保留已生成内容。
+	finishReason, errTerminal = streamTerminal(upstreamErr, true)
+	if errTerminal != nil {
+		t.Errorf("已发内容后失败不应再报错：%v", errTerminal)
+	}
+	if finishReason != openAIFinishLength {
+		t.Errorf("finish = %q，期望 length", finishReason)
+	}
+
+	finishReason, errTerminal = streamTerminal(nil, true)
+	if errTerminal != nil || finishReason != openAIFinishStop {
+		t.Errorf("正常结束应为 stop，实际 %q / %v", finishReason, errTerminal)
+	}
+}
+
+// TestMarshalStreamErrorEnvelope 验证错误信封走 error 字段。
+//
+// 宿主的 rpcStreamEmitRequest 只有 error 字段能表达失败；写成 payload
+// 会被当成正常内容帧，请求最终以「成功」告终。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，错误通道契约。
+func TestMarshalStreamErrorEnvelope(t *testing.T) {
+	raw, errMarshal := marshalStreamErrorEnvelope("sid-1", "积分已耗尽")
+	if errMarshal != nil {
+		t.Fatalf("构造失败：%v", errMarshal)
+	}
+	var body struct {
+		StreamID string `json:"stream_id"`
+		Error    string `json:"error"`
+		Payload  string `json:"payload"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &body); errUnmarshal != nil {
+		t.Fatalf("解析失败：%v", errUnmarshal)
+	}
+	if body.StreamID != "sid-1" {
+		t.Errorf("stream_id = %q", body.StreamID)
+	}
+	if body.Error != "积分已耗尽" {
+		t.Errorf("error = %q", body.Error)
+	}
+	if body.Payload != "" {
+		t.Errorf("错误信封不得携带 payload，实际 %q", body.Payload)
+	}
+}
+
+// TestRunStreamFailsWhenChatRejected 验证上游拒收消息时返回错误。
+//
+// 这是本轮生产缺陷的完整复现：握手正常、WS 就绪，但 message/chat
+// 返回 code=1000521。旧实现返回空正文 + nil，调用方只能记成功。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，端到端失败透传。
+func TestRunStreamFailsWhenChatRejected(t *testing.T) {
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		// 不推业务帧：本轮上游根本没接受消息。
+		time.Sleep(200 * time.Millisecond)
+	})
+	env.doer.handler = func(req *http.Request, _ []byte) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, clawInfoPath):
+			return jsonResponse(200, `{"code":0,"data":{"user_claw_info":{"claw_id":"c1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawMainSessionPath):
+			return jsonResponse(200, `{"code":0,"data":{"session":{"id":"s1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, frontierKeyPath):
+			return jsonResponse(200, `{"code":0,"data":{"access_key":"k","device_id":"d"}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawChatPath):
+			return jsonResponse(200, `{"code":1000521,"msg":"该用户积分已耗尽"}`), nil
+		default:
+			return jsonResponse(404, `{}`), nil
+		}
+	}
+
+	exec := env.newExecutor()
+	exec.frontierServerURL = env.ws.server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	content, err := exec.runStream(ctx, "你好", func(string) error { return nil })
+	if err == nil {
+		t.Fatalf("上游拒收必须返回错误，实际 content=%q", content)
+	}
+	if !strings.Contains(err.Error(), "积分已耗尽") {
+		t.Errorf("错误应透传上游文案，实际 %v", err)
+	}
+}
+
+// TestWaitForReplyFailsOnEmptyFinished 验证「收尾但无内容」不再返回 nil。
+//
+// WS 推了 event_final 却没有正文与图片、兜底轮询也拿不到消息时，
+// 旧实现返回空串 + nil，下游记为成功。必须返回错误。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，空正文缺陷回归。
+func TestWaitForReplyFailsOnEmptyFinished(t *testing.T) {
+	collector := newReplyCollector()
+	collector.accept(&frontierMessage{Phase: "event_final", TurnID: "t1", SeqNum: "1"})
+	if !collector.isFinished() {
+		t.Fatal("前置条件：收集器应已收尾")
+	}
+
+	exec := newCozeExecutor(&StoredAuth{CookieHeader: "sessionid=x"}, "coze/m", &fakeDoer{
+		handler: func(*http.Request, []byte) (*http.Response, error) {
+			return jsonResponse(200, `{"code":0,"data":{"messages":[]}}`), nil
+		},
+	})
+
+	// 兜底轮询会一直跑，用短超时让它尽快放弃。
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	content, err := exec.waitForReply(ctx, collector, func(string) error { return nil }, "mid-1")
+	if err == nil {
+		t.Fatalf("收尾但无内容必须返回错误，实际 content=%q", content)
+	}
+}
+
+// captureHostStream 拦截 stream.emit，记录发出的每一个信封。
+//
+// 返回的 restore 必须在测试结束前调用，否则会影响后续用例。
+// [参数] t: 测试上下文。
+// [返回] 记录切片（按发送顺序）。
+// 最近修改时间：2026-10-19；改动原因：新增，流式出口注入。
+func captureHostStream(t *testing.T) *[]map[string]any {
+	t.Helper()
+	var sent []map[string]any
+	original := hostStreamSend
+	hostStreamSend = func(_ string, body []byte) error {
+		var item map[string]any
+		_ = json.Unmarshal(body, &item)
+		sent = append(sent, item)
+		return nil
+	}
+	t.Cleanup(func() { hostStreamSend = original })
+	return &sent
+}
+
+// TestPumpClawStreamEmitsErrorBeforeFirstPayload 验证首帧前失败走错误通道。
+//
+// 生产实测（2026-10-19）：积分耗尽时上游拒收消息，旧实现仍补一个
+// 空正文终止帧，宿主据此判成功——下游记录「成功但 0 输出」且不计费。
+// 这里锁定契约：首帧前失败只能发 error 信封，绝不能发 payload。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，端到端失败透传回归。
+func TestPumpClawStreamEmitsErrorBeforeFirstPayload(t *testing.T) {
+	restore := stubConversation(t, "", errors.New("提交消息失败：该用户积分已耗尽（code=1000521）"))
+	defer restore()
+
+	sent := captureHostStream(t)
+
+	pumpClawStream("sid-test", &StoredAuth{CookieHeader: "sessionid=x"}, "coze/m", "你好")
+
+	for _, item := range *sent {
+		if _, hasPayload := item["payload"]; hasPayload {
+			t.Fatalf("首帧前失败不得发出任何 payload，实际 %#v", item)
+		}
+	}
+	found := false
+	for _, item := range *sent {
+		if msg, ok := item["error"].(string); ok && strings.Contains(msg, "积分已耗尽") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("必须发出带上游错误文案的 error 信封，实际 %#v", *sent)
+	}
+}
+
+// TestPumpClawStreamKeepsContentAfterPartialFailure 验证正文已泄漏后仍正常收尾。
+//
+// 已经发出过内容的失败不能改走错误通道：客户端此时已渲染正文，
+// 再报错会让整轮结果作废。约定是用 length 收尾并补齐 usage。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，防过度上报。
+func TestPumpClawStreamKeepsContentAfterPartialFailure(t *testing.T) {
+	restore := stubConversation(t, "部分正文", errors.New("上游连接中断"))
+	defer restore()
+
+	sent := captureHostStream(t)
+
+	pumpClawStream("sid-test", &StoredAuth{CookieHeader: "sessionid=x"}, "coze/m", "你好")
+
+	var sawError, sawLength, sawUsage bool
+	for _, item := range *sent {
+		if _, hasError := item["error"]; hasError {
+			sawError = true
+		}
+		payload, ok := item["payload"].(string)
+		if !ok {
+			continue
+		}
+		raw, errDecode := base64.StdEncoding.DecodeString(payload)
+		if errDecode != nil {
+			continue
+		}
+		if strings.Contains(string(raw), `"finish_reason":"length"`) {
+			sawLength = true
+		}
+		if strings.Contains(string(raw), `"usage"`) {
+			sawUsage = true
+		}
+	}
+	if sawError {
+		t.Error("正文已泄漏后失败不应再发错误帧")
+	}
+	if !sawLength {
+		t.Error("正文已泄漏后失败应以 length 收尾")
+	}
+	if !sawUsage {
+		t.Error("终止帧必须带 usage")
+	}
+}
+
+// stubConversation 把对话执行替换成固定结果。
+//
+// 直接注入执行结果，跳过真实 WS 与 HTTP：用例只关心收尾契约，
+// 上游细节已由 Executor 系列用例覆盖。
+// [参数] t: 测试上下文；reply: 假正文；err: 假错误。
+// [返回] 还原函数。
+// 最近修改时间：2026-10-19；改动原因：新增，收尾契约注入。
+func stubConversation(t *testing.T, reply string, errRun error) func() {
+	t.Helper()
+	original := runExecutorConversation
+	runExecutorConversation = func(_ context.Context, _ *StoredAuth, _, _ string, emit func(string) error) (string, error) {
+		if reply != "" {
+			if errEmit := emit(reply); errEmit != nil {
+				return reply, errEmit
+			}
+		}
+		return reply, errRun
+	}
+	restore := func() { runExecutorConversation = original }
+	t.Cleanup(restore)
+	return restore
 }
