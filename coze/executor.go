@@ -374,7 +374,20 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 						return collector.text(), errFlush
 					}
 					return collector.text(), nil
+				} else {
+					// 兜底也失败时留痕：否则空正文会被当成「正常完成」
+					// 一路带到下游，表现为「成功但 0 输出」。
+					hostLogf("warn", "空正文兜底轮询失败", map[string]any{
+						"message_id": messageID,
+						"error":      errPoll.Error(),
+					})
 				}
+			}
+			if strings.TrimSpace(collector.text()) == "" {
+				hostLogf("warn", "回复正文为空", map[string]any{
+					"message_id": messageID,
+					"finished":   true,
+				})
 			}
 			if err := flush(); err != nil {
 				return collector.text(), err
