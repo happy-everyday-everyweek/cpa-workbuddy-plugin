@@ -180,8 +180,8 @@ jobs:
           print(f"target plugin: {plugin} (src={src})")
           print(f"native jobs: {len(native)}, cross jobs: {len(cross)}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"native={json.dumps(native)}\n")
-              fh.write(f"cross={json.dumps(cross)}\n")
+              fh.write(f"native={json.dumps({'include': native})}\n")
+              fh.write(f"cross={json.dumps({'include': cross})}\n")
           PY
 
   build:
