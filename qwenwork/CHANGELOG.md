@@ -1,5 +1,17 @@
 # QwenWork Plugin Changelog
 
+## 0.2.5
+
+### Fix - 透传请求体的 model 改写为上游真实 ID（别名 400 的真正根因）
+
+- 变更要点:
+  1. 0.2.3（执行器反解）与 0.2.4（作用域改 both）上线后**别名请求仍 400**。生产日志给出决定性证据：`provider=qwenwork-provider model=qwen3.8-max-preview alias=qwen-3.8-max`——**宿主早已把 `ExecutorRequest.Model` 反解为真实 ID**，传给上游的却是 `req.Payload`（客户端原文，其中 `model` 仍是别名）。
+  2. 真正根因：插件透传路径 `prepareUpstreamBody(bodyRaw)` 原样转发客户端请求体，从未改写其中的 `model` 字段；`upstreamModel` 仅用于用量统计，未回写 body。
+  3. 修复：`prepareUpstreamBody` 增加 `upstreamModel` 参数，在强制 `stream=true` 与 `max_tokens` 自适应之外，把 body 的 `model` 改写为已解析的上游 ID；空值时保留原值。同步与流式两条路径都传入 `upstreamModel`。
+  4. 0.2.3/0.2.4 的改动保留：执行器反解（兼容 auth 属性别名通道）与 `ExecutorModelScopeBoth`（让 `StaticModels`/`ModelsForAuth` 能填充别名缓存）本身正确且必要，只是不足以覆盖「body 未改写」这条真正的失效路径。
+- 验证: 新增 `TestPrepareUpstreamBody_RewritesModelToUpstreamID`（断言别名被改写为真实 ID、空上游名保留原值）；**变异反证**：删除 model 重写 → 该用例精确 FAIL；还原后 cgo-shim build/vet/test 全绿。
+- 涉及文件: qwenwork/payload.go、qwenwork/main.go、qwenwork/max_tokens_test.go、qwenwork/VERSION、qwenwork/CHANGELOG.md
+
 ## 0.2.4
 
 ### Fix - 模型作用域改为 both，让宿主注册期填充 oauth-model-alias 缓存

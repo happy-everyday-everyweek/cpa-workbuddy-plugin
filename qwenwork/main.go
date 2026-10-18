@@ -329,7 +329,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.2.4"
+var version = "0.2.5"
 
 func wbRegistration() registration {
 	return registration{
@@ -676,7 +676,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// body（QwenWork 模板无此字段位点），仅用于对齐 workbuddy 的用量维度。
 	reasoningEffort := strings.TrimSpace(qwReq.ReasoningEffort)
 	// QwenWork 透传客户端请求体，只强制 stream 并按官方规格自适应 max_tokens。
-	body := prepareUpstreamBody(bodyRaw)
+	body := prepareUpstreamBody(bodyRaw, upstreamModel)
 
 	// Per-request account-failover loop. We try the prepared body against
 	// the configured account first; on an account-level 4xx
@@ -932,7 +932,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// 客户端请求的推理强度：写入 usage feed 供 dashboard 展示（同非流式路径）。
 	reasoningEffort := strings.TrimSpace(qwReq.ReasoningEffort)
 	// QwenWork 透传客户端请求体，只强制 stream 并按官方规格自适应 max_tokens。
-	body := prepareUpstreamBody(bodyRaw)
+	body := prepareUpstreamBody(bodyRaw, upstreamModel)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)

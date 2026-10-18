@@ -12,10 +12,10 @@ import (
 
 // prepareUpstreamBody 对客户端请求体做透传前的最小改写。
 //
-// [参数] bodyRaw: 客户端原始请求体。
+// [参数] bodyRaw: 客户端原始请求体；upstreamModel: 已反解出的上游模型 ID。
 // [返回] 改写后的请求体；解析失败时原样返回，保证请求仍可发出。
-// 最近修改时间：2026-10-18 00:36:00；改动原因：模板链路删除后补回透传改写。
-func prepareUpstreamBody(bodyRaw []byte) []byte {
+// 最近修改时间：2026-10-18 14:40:00；改动原因：请求体里的 model 必须改写为真实 ID。
+func prepareUpstreamBody(bodyRaw []byte, upstreamModel string) []byte {
 	if len(bodyRaw) == 0 {
 		return bodyRaw
 	}
@@ -25,7 +25,13 @@ func prepareUpstreamBody(bodyRaw []byte) []byte {
 	}
 	// 1. 上游按 SSE 返回；同步路径同样依赖事件流聚合。
 	obj["stream"] = true
-	// 2. max_tokens 自适应：思考模型被客户端传入保守小值时放宽到官方上限。
+	// 2. 透传体会原样带上客户端模型名。宿主虽然已把 ExecutorRequest.Model
+	// 反解为真实 ID，但 Payload 是客户端原文、里面的 model 仍是别名；不重写
+	// 就会把别名发给上游，被判 invalid_request（400，param=None）。
+	if m := strings.TrimSpace(upstreamModel); m != "" {
+		obj["model"] = m
+	}
+	// 3. max_tokens 自适应：思考模型被客户端传入保守小值时放宽到官方上限。
 	relaxMaxTokensInPlace(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {

@@ -70,7 +70,7 @@ func TestWbModels_OfficialSpecs(t *testing.T) {
 func TestPrepareUpstreamBody_ForcesStreamAndRelaxesTokens(t *testing.T) {
 	raw := []byte(`{"model":"qwen3.8-max-preview","stream":false,"max_tokens":8192,` +
 		`"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
-	out := prepareUpstreamBody(raw)
+	out := prepareUpstreamBody(raw, "")
 	var obj map[string]any
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("prepareUpstreamBody produced invalid JSON: %v", err)
@@ -87,11 +87,39 @@ func TestPrepareUpstreamBody_ForcesStreamAndRelaxesTokens(t *testing.T) {
 	}
 }
 
+// TestPrepareUpstreamBody_RewritesModelToUpstreamID 验证透传体会把客户端
+// 模型名改写为已反解的上游真实 ID。
+//
+// 缺陷背景（2026-10-18 生产实证）：宿主虽把 ExecutorRequest.Model 反解成
+// 真实 ID，但 Payload 是客户端原文、里面仍是别名。插件此前直接透传 Payload，
+// 上游收到别名后返回 400 invalid_request（param=None）。
+func TestPrepareUpstreamBody_RewritesModelToUpstreamID(t *testing.T) {
+	raw := []byte(`{"model":"qwen-3.8-max","stream":true,` +
+		`"messages":[{"role":"user","content":"hi"}]}`)
+	out := prepareUpstreamBody(raw, "qwen3.8-max-preview")
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("prepareUpstreamBody produced invalid JSON: %v", err)
+	}
+	if got := jsonStr(obj, "model"); got != "qwen3.8-max-preview" {
+		t.Fatalf("body model = %q, want qwen3.8-max-preview (alias must be rewritten)", got)
+	}
+	// 空上游模型名时不得清空原值。
+	out2 := prepareUpstreamBody(raw, "")
+	var obj2 map[string]any
+	if err := json.Unmarshal(out2, &obj2); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got := jsonStr(obj2, "model"); got != "qwen-3.8-max" {
+		t.Fatalf("empty upstreamModel must keep original model, got %q", got)
+	}
+}
+
 // TestPrepareUpstreamBody_InvalidJSONPassthrough 验证非法 JSON 原样返回，
 // 保证请求仍能发到上游由其报错，而不是被插件吞掉。
 func TestPrepareUpstreamBody_InvalidJSONPassthrough(t *testing.T) {
 	raw := []byte(`not-json`)
-	if got := prepareUpstreamBody(raw); string(got) != string(raw) {
+	if got := prepareUpstreamBody(raw, ""); string(got) != string(raw) {
 		t.Fatalf("invalid JSON must pass through unchanged, got %q", got)
 	}
 }
