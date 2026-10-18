@@ -101,389 +101,95 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+  prepare:
+    name: Prepare matrix
+    # Runs in parallel with the test matrix so dispatch/tag runs do not pay an
+    # extra serialization hop before the builds start.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    outputs:
+      native: ${{ steps.matrix.outputs.native }}
+      cross: ${{ steps.matrix.outputs.cross }}
+    steps:
+      - name: Resolve target plugin and build matrices
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PLUGIN: ${{ github.event.inputs.plugin }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          # Plugin id -> source directory. Every plugin shares the same five
+          # native targets plus one windows-arm64 cross target, so the matrix is
+          # derived from the target plugin instead of being hardcoded 60+12 times.
+          PLUGINS = {
+              "workbuddy-provider": "workbuddy",
+              "qoderwork-provider": "qoderwork",
+              "workbuddy-token-usage": "token-usage-tracker",
+              "traework-provider": "traework",
+              "workbuddy-ai-provider": "workbuddy-ai",
+              "cursor-provider": "cursor",
+              "qoder-ai-provider": "qoder-ai",
+              "zcode-provider": "zcode",
+              "copilot-provider": "copilot",
+              "doubao-provider": "doubao",
+              "coze-provider": "coze",
+              "qwenwork-provider": "qwenwork",
+          }
+          NATIVE = [
+              ("linux", "amd64", "ubuntu-24.04", "so"),
+              ("linux", "arm64", "ubuntu-24.04-arm", "so"),
+              ("darwin", "amd64", "macos-15-intel", "dylib"),
+              ("darwin", "arm64", "macos-15", "dylib"),
+              ("windows", "amd64", "windows-2025", "dll"),
+          ]
+
+          def resolve_plugin():
+              if os.environ["EVENT_NAME"] == "workflow_dispatch":
+                  return os.environ["INPUT_PLUGIN"]
+              # Tag name is <plugin-id>-v<version>; longest id wins in case one
+              # id is a prefix of another.
+              ref = os.environ["REF_NAME"]
+              matches = [pid for pid in PLUGINS if ref.startswith(pid + "-v")]
+              return max(matches, key=len) if matches else ""
+
+          plugin = resolve_plugin()
+          if plugin not in PLUGINS:
+              sys.exit(
+                  "无法解析目标插件："
+                  f"event={os.environ['EVENT_NAME']} "
+                  f"ref={os.environ['REF_NAME']} "
+                  f"input={os.environ['INPUT_PLUGIN']!r}"
+              )
+
+          src = PLUGINS[plugin]
+          native = [
+              {"id": plugin, "src": src, "goos": goos, "goarch": goarch, "runner": runner, "ext": ext}
+              for goos, goarch, runner, ext in NATIVE
+          ]
+          cross = [{"id": plugin, "src": src, "target": "windows-arm64", "ext": "dll"}]
+          if not native or not cross:
+              sys.exit(f"目标插件 {plugin} 的构建矩阵为空")
+
+          print(f"target plugin: {plugin} (src={src})")
+          print(f"native jobs: {len(native)}, cross jobs: {len(cross)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"native={json.dumps(native)}\n")
+              fh.write(f"cross={json.dumps(cross)}\n")
+          PY
+
   build:
     name: ${{ matrix.id }} ${{ matrix.goos }}/${{ matrix.goarch }}
     # Branch pushes and PRs only run the test matrix; builds are reserved for
     # dispatch and tag releases.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    needs: test
+    needs: [test, prepare]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # workbuddy-provider native (sources in workbuddy/)
-          - id: workbuddy-provider
-            src: workbuddy
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: workbuddy-provider
-            src: workbuddy
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: workbuddy-provider
-            src: workbuddy
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: workbuddy-provider
-            src: workbuddy
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: workbuddy-provider
-            src: workbuddy
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # qoderwork-provider native (sources in qoderwork/)
-          - id: qoderwork-provider
-            src: qoderwork
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: qoderwork-provider
-            src: qoderwork
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: qoderwork-provider
-            src: qoderwork
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: qoderwork-provider
-            src: qoderwork
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: qoderwork-provider
-            src: qoderwork
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # workbuddy-token-usage native (sources in token-usage-tracker/)
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # traework-provider native (sources in traework/)
-          - id: traework-provider
-            src: traework
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: traework-provider
-            src: traework
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: traework-provider
-            src: traework
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: traework-provider
-            src: traework
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: traework-provider
-            src: traework
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # workbuddy-ai-provider native (sources in workbuddy-ai/)
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # cursor-provider native (sources in cursor/)
-          - id: cursor-provider
-            src: cursor
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: cursor-provider
-            src: cursor
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: cursor-provider
-            src: cursor
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: cursor-provider
-            src: cursor
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: cursor-provider
-            src: cursor
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # qoder-ai-provider native (sources in qoder-ai/)
-          - id: qoder-ai-provider
-            src: qoder-ai
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: qoder-ai-provider
-            src: qoder-ai
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: qoder-ai-provider
-            src: qoder-ai
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: qoder-ai-provider
-            src: qoder-ai
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: qoder-ai-provider
-            src: qoder-ai
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # zcode-provider native (sources in zcode/)
-          - id: zcode-provider
-            src: zcode
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: zcode-provider
-            src: zcode
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: zcode-provider
-            src: zcode
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: zcode-provider
-            src: zcode
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: zcode-provider
-            src: zcode
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # copilot-provider native (sources in copilot/)
-          - id: copilot-provider
-            src: copilot
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: copilot-provider
-            src: copilot
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: copilot-provider
-            src: copilot
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: copilot-provider
-            src: copilot
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: copilot-provider
-            src: copilot
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # doubao-provider native (sources in doubao/)
-          - id: doubao-provider
-            src: doubao
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: doubao-provider
-            src: doubao
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: doubao-provider
-            src: doubao
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: doubao-provider
-            src: doubao
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: doubao-provider
-            src: doubao
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # coze-provider native (sources in coze/)
-          - id: coze-provider
-            src: coze
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: coze-provider
-            src: coze
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: coze-provider
-            src: coze
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: coze-provider
-            src: coze
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: coze-provider
-            src: coze
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
-          # qwenwork-provider native (sources in qwenwork/)
-          - id: qwenwork-provider
-            src: qwenwork
-            goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - id: qwenwork-provider
-            src: qwenwork
-            goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - id: qwenwork-provider
-            src: qwenwork
-            goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - id: qwenwork-provider
-            src: qwenwork
-            goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - id: qwenwork-provider
-            src: qwenwork
-            goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
+      matrix: ${{ fromJSON(needs.prepare.outputs.native) }}
     defaults:
       run:
         shell: bash
@@ -578,60 +284,11 @@ jobs:
   build-cross:
     name: ${{ matrix.id }} ${{ matrix.target }} (go-cross)
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    needs: test
+    needs: [test, prepare]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - id: workbuddy-provider
-            src: workbuddy
-            target: windows-arm64
-            ext: dll
-          - id: qoderwork-provider
-            src: qoderwork
-            target: windows-arm64
-            ext: dll
-          - id: workbuddy-token-usage
-            src: token-usage-tracker
-            target: windows-arm64
-            ext: dll
-          - id: traework-provider
-            src: traework
-            target: windows-arm64
-            ext: dll
-          - id: workbuddy-ai-provider
-            src: workbuddy-ai
-            target: windows-arm64
-            ext: dll
-          - id: cursor-provider
-            src: cursor
-            target: windows-arm64
-            ext: dll
-          - id: qoder-ai-provider
-            src: qoder-ai
-            target: windows-arm64
-            ext: dll
-          - id: zcode-provider
-            src: zcode
-            target: windows-arm64
-            ext: dll
-          - id: copilot-provider
-            src: copilot
-            target: windows-arm64
-            ext: dll
-          - id: doubao-provider
-            src: doubao
-            target: windows-arm64
-            ext: dll
-          - id: coze-provider
-            src: coze
-            target: windows-arm64
-            ext: dll
-          - id: qwenwork-provider
-            src: qwenwork
-            target: windows-arm64
-            ext: dll
+      matrix: ${{ fromJSON(needs.prepare.outputs.cross) }}
     defaults:
       run:
         shell: bash
@@ -726,6 +383,12 @@ jobs:
     name: Release
     # Only for a tag of a specific plugin, or dispatch with a version.
     if: >-
+      always() &&
+      needs.test.result == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.build-cross.result == 'success' &&
+      (
       (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '') ||
       startsWith(github.ref, 'refs/tags/workbuddy-provider-v') ||
       startsWith(github.ref, 'refs/tags/qoderwork-provider-v') ||
@@ -739,7 +402,10 @@ jobs:
         startsWith(github.ref, 'refs/tags/doubao-provider-v') ||
         startsWith(github.ref, 'refs/tags/coze-provider-v') ||
         startsWith(github.ref, 'refs/tags/qwenwork-provider-v')
+      )
     needs:
+      - test
+      - prepare
       - build
       - build-cross
     runs-on: ubuntu-24.04
