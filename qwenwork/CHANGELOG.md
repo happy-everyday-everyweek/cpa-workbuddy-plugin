@@ -1,5 +1,20 @@
 # QwenWork Plugin Changelog
 
+## 0.2.7
+
+### Fix - 额度耗尽账号自动禁用并对齐面板展示（推翻「0 积分仍可用免费模型」前提）
+
+- 变更要点:
+  1. 用户反馈面板第一个账号「可用积分」永久卡在「加载中…」，且没有任何 0 积分耗尽表现。生产实证：该账号上游 `account-context` 返回 `quota.exceeded=true`、`remaining=0`，但钱包三项全为 0，导致快照 `total_remain/total_used/total_size` 全 0、无 packages ⇒ 被判为「数据未知」而非「耗尽」。
+  2. **关键前提被实测推翻**：原实现按「0 积分仍可用免费模型」设计（lifecycle/active_auth/policy/面板文案四处）。生产用该账号签发 MaaS 会话后实测 `qwen3.8-max-preview` / `qwen3.8-flash` / `qwen3.8-plus` / `glm-5.2` **全部 429 `balance_insufficient`** —— QwenWork 没有免费模型。
+  3. 修复一（信号层）：`creditsSummary` 新增 `Exceeded` 字段，`buildCreditsSummary` 把上游 `quota.exceeded` 写入快照；`isCreditsExhausted` 将其作为权威判据（有余额时仍以余额优先，防陈旧标记）。
+  4. 修复二（路由层）：新增 `isCreditsLowOrExhausted`，调度过滤、`cachedCreditsScore`、`accountRoutable`、换号候选四处统一改用该判定，耗尽账号不再承接流量。
+  5. 修复三（生命周期）：新增 `disableAuth`，耗尽时写 `disabled:true` + `exhausted_disable:true`（可自动恢复）；已禁用文件保持原状，`manual_disable` 与无标记禁用永不被自动改动。`reconcileOneAccount` 在启用态判定耗尽即禁用，禁用态仅当积分恢复为正数才重新启用。
+  6. 修复四（面板）：新增 `isAccountExhausted` 统一判定并纳入 `exceeded`；耗尽时进度条显示「已耗尽 · 余0」而非无限转圈；可用/0积分筛选、计数、汇总卡与文案全部改为「耗尽不可用」口径。
+- 验证: cgo-shim build/vet/test 全绿；新增 `billing_exceeded_test.go`（3 用例）覆盖 `exceeded` 映射、正常账号不误判、钱包失败回落；`lifecycle_test.go` 改为 `TestExhaustedCreditsAreNotRoutable` + `TestExceededFlagMarksExhausted`；调度与会话用例改为「耗尽必须换号/让位」。**变异反证三组**：① 恢复旧「0 积分可路由」→ 2 用例 FAIL；② `accountRoutable` 失效 → 2 用例 FAIL；③ 解析层不写 `exceeded` → 接线用例 FAIL（首次变异未捕获，据此抽出 `buildCreditsSummary` 纯函数补测后命中）。
+- 已知边界: `lifecycle_auto` 默认关闭，写 disabled 的自动禁用需开启该开关；路由排除与面板展示**无条件生效**，不依赖开关。
+- 涉及文件: qwenwork/management.go、billing.go、policy.go、lifecycle.go、scheduler.go、active_auth.go、failover_retry.go、panel.go、credits_handler.go、panel.html、main.go、lifecycle_test.go、scheduler_test.go、session_auth_test.go、billing_exceeded_test.go、VERSION、CHANGELOG.md
+
 ## 0.2.6
 
 ### Fix - MaaS session_id 必须是合法 UUID（执行器路径 422 的真正原因）

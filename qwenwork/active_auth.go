@@ -47,7 +47,7 @@ func clearActiveAuthIfMatch(id string) {
 }
 
 // activeAuthCandidate is a thin view used by pickActiveAuth.
-// Exhausted 仅用于展示（0 积分），不参与可路由判定：免费模型不消耗积分。
+// 耗尽账号在调度入口已被过滤，这里只承载禁用状态。
 type activeAuthCandidate struct {
 	ID       string
 	Disabled bool
@@ -104,17 +104,17 @@ func pickActiveAuth(candidates []activeAuthCandidate) string {
 //
 // Rules (single source of truth, same as pickActiveAuth):
 //  1. If current selection is live AND routable (not disabled / cooling /
-//     low residual credits) → keep it.
+//     exhausted / low residual credits) → keep it.
 //  2. If current selection is not routable → switch to the routable account
 //     with the HIGHEST remaining credits (unknown credits rank last).
 //  3. If current selection is gone (disabled/deleted) → same as rule 2.
 //  4. If none is routable → keep current if alive, else first.
 //
-// 0 积分账号仍视为可路由：免费模型不消耗积分，因此这里不按 exhausted 排除。
+// 耗尽账号不保留选中资格：QwenWork 无免费模型，0 积分只会 429。
 //
 // [参数] accounts：面板全量账号行（含本轮排除项）。
 // [返回] 面板应选中的 auth_id；无可用账号时退化为存活/首个账号。
-// 最近修改时间 2026-10-17 15:12:00（0 积分账号保留选中资格）
+// 最近修改时间 2026-10-18 17:10:00（耗尽账号不再保留选中资格）
 func ensureDefaultActiveAuth(accounts []wbAccount) string {
 	cur := getActiveAuthID()
 	live := make(map[string]wbAccount, len(accounts))
@@ -176,14 +176,15 @@ func ensureDefaultActiveAuth(accounts []wbAccount) string {
 }
 
 // accountRoutable reports whether an auth ID may carry traffic at all: not
-// cooling down (failover) and not below the residual-credit floor. Zero
-// credits stay routable because free models do not consume credits.
+// cooling down (failover) and not exhausted or below the residual-credit floor.
+// QwenWork has no free models (verified 2026-10-18: 0-credit accounts get
+// 429 balance_insufficient on every model), so exhausted accounts are excluded.
 func accountRoutable(authID string) bool {
 	if isAccountCoolingDown(authID) {
 		return false
 	}
-	_, lowCredits := cachedCreditsScore(authID)
-	if lowCredits {
+	_, lowOrExhausted := cachedCreditsScore(authID)
+	if lowOrExhausted {
 		return false
 	}
 	return true

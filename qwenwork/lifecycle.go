@@ -1,11 +1,16 @@
 // lifecycle.go 实现 qwenwork 基于积分的账号生命周期：
-//   - 0 积分不自动禁用：免费模型仍可用，账号继续参与路由
+//   - 额度耗尽（含上游 quota.exceeded）→ 自动禁用：写 disabled:true 与顶层
+//     exhausted_disable:true；积分恢复后由校验流程自动重新启用
 //   - 积分未知时不动作，避免误判
 //   - 带 exhausted_disable 标记的历史自动禁用账号在校验时恢复启用
 //   - 手动禁用（manual_disable 标记，或宿主 UI 写入的无标记禁用）永不自动改动；
 //     SESSION-DEAD / TOKEN_EXPIRE 备注守卫同样保留
 //   - 上游硬额度错误 → 复查积分后按策略处理
 //   - 软限流 → 不删除 CN 账号
+//
+// QwenWork 没有免费模型：2026-10-18 生产实测 0 积分账号对
+// qwen3.8-max-preview / qwen3.8-flash / qwen3.8-plus / glm-5.2 一律返回
+// 429 balance_insufficient，故耗尽账号必须停止参与路由。
 package main
 
 import (
@@ -73,7 +78,7 @@ func pruneLifecycleState() {
 // reenableAuth 把历史自动禁用的账号恢复为启用态。
 // [参数] authIndex：宿主账号索引；authID：账号标识；sa：账号凭据；cr：积分快照。
 // [返回] 落盘错误；成功返回 nil。
-// 最近修改时间 2026-10-17 15:12:00（0 积分不再是禁用理由，恢复不再依赖积分快照）
+// 最近修改时间 2026-10-18 17:10:00（仅当积分恢复为正数时才重新启用）
 func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) error {
 	mu := authFileLockFor(authIndex)
 	mu.Lock()
@@ -98,6 +103,63 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 		return err
 	}
 	rememberLifecycleState(authID, false, note)
+	accountCache.Delete(authID)
+	return nil
+}
+
+// disableAuth 对额度耗尽的账号写入自动禁用状态。
+// 语义与 workbuddy 对齐：仅在账号当前处于启用态时写 disabled:true 与
+// exhausted_disable:true；已禁用的文件保持原状（manual_disable 与
+// exhausted_disable 一律原样带过），避免把用户手动禁用的账号变成可自动恢复。
+// [参数] authIndex：宿主账号索引；authID：账号标识；sa：账号凭据；
+// cr：积分快照；reason：附加到备注的原因短语。
+// [返回] 落盘错误；成功返回 nil。
+// 最近修改时间：2026-10-18 17:10:00；改动原因：QwenWork 无免费模型，耗尽需自动禁用。
+func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, reason string) error {
+	mu := authFileLockFor(authIndex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	phys, err := hostAuthGetPhysical(authIndex)
+	name := authFileNameFor(sa)
+	path := ""
+	legacyPath := ""
+	extra := map[string]any{}
+	finalDisabled := true
+	if err == nil {
+		name, path, legacyPath = resolveAuthFileTarget(sa, phys)
+		switch {
+		case manualDisableFromAuthJSON(phys.JSON):
+			// 用户手动禁用：保留意图标记，不写 exhausted_disable。
+			extra["manual_disable"] = true
+			finalDisabled = parseDisabledFromAuthJSON(phys.JSON)
+		case exhaustedDisableFromAuthJSON(phys.JSON):
+			// 已被本生命周期禁用：标记继续保留，恢复能力保持武装。
+			extra["exhausted_disable"] = true
+			finalDisabled = parseDisabledFromAuthJSON(phys.JSON)
+		case parseDisabledFromAuthJSON(phys.JSON):
+			// 无标记的禁用属未知写入方（如宿主 UI 切换）：保持原状。
+			finalDisabled = true
+		default:
+			// 启用态 → 耗尽自动禁用（可自动恢复）。
+			extra["exhausted_disable"] = true
+		}
+	}
+	note := displayNote(sa, cr, finalDisabled)
+	if reason != "" && !strings.Contains(note, reason) && len(note)+len(reason) < 75 {
+		note = note + " · " + reason
+	}
+	if lifecycleStateUnchanged(authID, finalDisabled, note) {
+		return nil
+	}
+	raw, err := buildAuthFileJSON(sa, finalDisabled, note, extra)
+	if err != nil {
+		return err
+	}
+	if err := persistAuthDirect(name, path, legacyPath, raw); err != nil {
+		return err
+	}
+	rememberLifecycleState(authID, finalDisabled, note)
 	accountCache.Delete(authID)
 	return nil
 }
@@ -325,13 +387,24 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 			_ = syncAuthNote(authIndex, authID, sa, cr, true)
 			return lifecycleNone, nil
 		}
+		// 积分仍耗尽则保持禁用，只刷新备注（避免无谓落盘）。
+		if isCreditsExhausted(cr) {
+			_ = syncAuthNote(authIndex, authID, sa, cr, true)
+			return lifecycleNone, nil
+		}
 		if err := reenableAuth(authIndex, authID, sa, cr); err != nil {
 			return lifecycleReenable, err
 		}
 		return lifecycleReenable, nil
 	}
 
-	// 账号可用：仅刷新备注，0 积分不再触发自动禁用
+	// 账号启用中：额度耗尽则自动禁用（可自动恢复），否则仅刷新备注。
+	if isCreditsExhausted(cr) {
+		if err := disableAuth(authIndex, authID, sa, cr, "耗尽"); err != nil {
+			return lifecycleDisable, err
+		}
+		return lifecycleDisable, nil
+	}
 	_ = syncAuthNote(authIndex, authID, sa, cr, false)
 	return lifecycleNone, nil
 }

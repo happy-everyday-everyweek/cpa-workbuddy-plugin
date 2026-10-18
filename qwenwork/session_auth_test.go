@@ -204,7 +204,7 @@ func TestPickSessionAuth_TTLExpiryReassigns(t *testing.T) {
 }
 
 // TestPickSessionAuth_LowCreditAccountReassigns 验证会话绑定的账号落入残血保护后
-// 会被重新分配；判据是正积分低于安全红线，0 积分不触发重分配。
+// 会被重新分配；判据是正积分低于安全红线。
 func TestPickSessionAuth_LowCreditAccountReassigns(t *testing.T) {
 	resetSessionRouting(t)
 	resetFailover(t)
@@ -223,15 +223,24 @@ func TestPickSessionAuth_LowCreditAccountReassigns(t *testing.T) {
 	}
 }
 
-// TestPickSessionAuth_ZeroCreditStaysRoutable 验证 0 积分账号仍可承接会话：
-// 免费模型不消耗积分，因此 0 积分不得触发换号或让位。
-func TestPickSessionAuth_ZeroCreditStaysRoutable(t *testing.T) {
+// TestPickSessionAuth_ExhaustedAccountReassigns 验证耗尽账号被重新分配：
+// QwenWork 无免费模型，0 积分账号无法服务任何请求，会话必须换到有额度的账号。
+func TestPickSessionAuth_ExhaustedAccountReassigns(t *testing.T) {
 	resetSessionRouting(t)
 	resetFailover(t)
-	storeCredits(t, "wb-zero", 0, 500, 500)
-	cands := []activeAuthCandidate{{ID: "wb-zero"}}
-	if got := pickSessionAuth("conv-1", cands); got != "wb-zero" {
-		t.Fatalf("0-credit account should stay routable for free models, got %q", got)
+	storeCredits(t, "wb-a", 500, 0, 500)
+	storeCredits(t, "wb-b", 500, 0, 500)
+	cands := []activeAuthCandidate{
+		{ID: "wb-a"}, {ID: "wb-b"},
+	}
+	first := pickSessionAuth("conv-1", cands)
+	if first == "" {
+		t.Fatal("healthy pool should assign an account")
+	}
+	// 把已绑定账号压到 0 积分，下一次选取必须换号
+	storeCredits(t, first, 0, 500, 500)
+	if got := pickSessionAuth("conv-1", cands); got == first {
+		t.Fatalf("exhausted pinned account should be re-assigned, stuck at %q", got)
 	}
 }
 
@@ -254,12 +263,12 @@ func TestPickSessionAuth_NoSessionFallsBackToPanel(t *testing.T) {
 }
 
 // TestPickSessionAuth_AllCoolingDefers 验证全池处于日限冷却时选取让位；
-// 0 积分账号不属于不可用，故不得作为让位理由。
+// 冷却解除后账号必须能重新承接会话。
 func TestPickSessionAuth_AllCoolingDefers(t *testing.T) {
 	resetSessionRouting(t)
 	resetFailover(t)
-	storeCredits(t, "wb-a", 0, 100, 100)
-	storeCredits(t, "wb-b", 0, 100, 100)
+	storeCredits(t, "wb-a", 100, 0, 100)
+	storeCredits(t, "wb-b", 100, 0, 100)
 	future := time.Now().Add(time.Hour)
 	dailyCoolingMu.Lock()
 	dailyCoolingMap["wb-a"] = future
@@ -280,7 +289,7 @@ func TestPickSessionAuth_AllCoolingDefers(t *testing.T) {
 	if got := pickSessionAuth("conv-1", allCooling); got != "" {
 		t.Fatalf("all-cooling should defer (empty pick), got %q", got)
 	}
-	// 冷却解除后（积分仍为 0）必须能重新分配：免费模型可用
+	// 冷却解除后必须能重新分配
 	dailyCoolingMu.Lock()
 	delete(dailyCoolingMap, "wb-a")
 	delete(dailyCoolingMap, "wb-b")

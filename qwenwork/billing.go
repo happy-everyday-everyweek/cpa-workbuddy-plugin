@@ -121,23 +121,28 @@ func fetchPaymentType(sa *storedAuth) string {
 
 // fetchUserResource 聚合账号可用额度。
 //
-// QwenWork 的 quota.total/used 常为 null，因此 TotalSize 由 remaining 与
-// 钱包余额推导；Packages 拆成「日额度 / 月额度 / 长期额度」三档，便于面板
-// 直接展示来源。
-//
 // [参数] sa 账号凭据。
 // [返回] 聚合后的额度快照；任一请求失败时返回错误。
-// 最近修改时间：2026-10-18 00:02:00；改动原因：新建 QwenWork 额度层。
+// 最近修改时间：2026-10-18 17:10:00；改动原因：解析逻辑抽成纯函数以便测试接线。
 func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 	ctxRaw, errCtx := billingGet(sa, endpointUserInfo)
 	walRaw, errWal := billingGet(sa, endpointUserWallets)
 	if errCtx != nil && errWal != nil {
 		return nil, fmt.Errorf("credits: account-context=%v wallets=%v", errCtx, errWal)
 	}
+	return buildCreditsSummary(ctxRaw, walRaw, errCtx == nil, errWal == nil), nil
+}
 
+// buildCreditsSummary 把 account-context 与 wallets 的原始响应聚合成额度快照。
+// 独立成纯函数，使测试能直接断言「上游 quota.exceeded 被写入快照」——
+// 只测 isCreditsExhausted 无法发现解析层漏映射该信号。
+// [参数] ctxRaw：account-context 响应体；walRaw：wallets 响应体；
+// ctxOK / walOK：对应请求是否成功。
+// [返回] 聚合后的额度快照。
+func buildCreditsSummary(ctxRaw, walRaw []byte, ctxOK, walOK bool) *creditsSummary {
 	var remaining float64
 	exceeded := false
-	if errCtx == nil {
+	if ctxOK {
 		var env accountContextEnvelope
 		if err := json.Unmarshal(ctxRaw, &env); err == nil {
 			if env.Data.Quota.Remaining != nil {
@@ -149,7 +154,7 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 
 	var daily, monthly, longterm, expiring float64
 	var expiringCount int
-	if errWal == nil {
+	if walOK {
 		var env walletsEnvelope
 		if err := json.Unmarshal(walRaw, &env); err == nil {
 			daily = env.Data.DailyCredits.TotalBalance
@@ -187,6 +192,7 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 		PackCount:   len(packs),
 		Packages:    packs,
 		FetchedAt:   time.Now().UTC().Format(time.RFC3339),
+		Exceeded:    exceeded,
 	}
 	if exceeded {
 		// 上游明确标记超额时把可用额度归零，供 lifecycle 判定禁用。
@@ -199,5 +205,5 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 			Size:   int64(expiring),
 		})
 	}
-	return summary, nil
+	return summary
 }

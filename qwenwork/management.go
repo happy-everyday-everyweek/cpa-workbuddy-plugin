@@ -30,8 +30,12 @@ type creditsSummary struct {
 	// FetchedAt is when this snapshot was taken (RFC3339). Upstream billing lag
 	// can make remain/used look "stuck" for minutes after chat; compare this
 	// timestamp — not only the numbers — when diagnosing frozen credits.
-	FetchedAt string           `json:"fetched_at,omitempty"`
-	Packages  []packageSummary `json:"packages"`
+	FetchedAt string `json:"fetched_at,omitempty"`
+	// Exceeded 表示上游 account-context 明确标记 quota.exceeded=true。
+	// 该信号是「确定耗尽」的权威判据：免费版账号没有额度包时
+	// total_used/total_size 恒为 0，仅靠数值无法与「未知」区分。
+	Exceeded bool             `json:"exceeded,omitempty"`
+	Packages []packageSummary `json:"packages"`
 }
 
 type packageSummary struct {

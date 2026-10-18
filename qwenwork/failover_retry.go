@@ -61,8 +61,8 @@ func pickNextAuth(currentAuthID string) (nextAuthID string, nextSA *storedAuth, 
 		if isAccountCoolingDown(id) {
 			continue
 		}
-		// 跳过残血账号（正积分低于安全红线）；0 积分账号可继续走免费模型
-		if _, lowCredits := cachedCreditsScore(id); lowCredits {
+		// 跳过耗尽与残血账号：QwenWork 无免费模型，换过去只会再吃一次 429
+		if _, lowOrExhausted := cachedCreditsScore(id); lowOrExhausted {
 			continue
 		}
 		// Skip candidates with no usable auth index — we can't load

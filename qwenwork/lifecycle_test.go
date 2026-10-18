@@ -77,14 +77,18 @@ func TestBuildAuthFileJSONExhaustedMarker(t *testing.T) {
 	}
 }
 
-// TestZeroCreditsNotDisabling 验证 0 积分不再触发自动禁用，也不被路由排除：
-// 免费模型不消耗积分，因此 0 积分账号必须保持可路由且不写入禁用状态。
-func TestZeroCreditsNotDisabling(t *testing.T) {
+// TestExhaustedCreditsAreNotRoutable 验证耗尽账号被排除路由并显示「耗尽」：
+// QwenWork 无免费模型（2026-10-18 生产实测 0 积分账号对全部模型返回
+// 429 balance_insufficient），因此 0 积分不得继续参与路由。
+func TestExhaustedCreditsAreNotRoutable(t *testing.T) {
 	zero := &creditsSummary{TotalRemain: 0, TotalUsed: 500, TotalSize: 500}
 
-	// 1. 0 积分仍判定为可路由
-	if isCreditsLowForRouting(zero) {
-		t.Fatal("0-credit account must stay routable (free models)")
+	// 1. 耗尽账号不可路由
+	if !isCreditsLowForRouting(zero) {
+		t.Fatal("exhausted account must be excluded from routing (no free models)")
+	}
+	if !isCreditsLowOrExhausted(zero) {
+		t.Fatal("isCreditsLowOrExhausted must flag exhausted credits")
 	}
 
 	// 2. 只有正积分残血才触发低额保护
@@ -93,8 +97,37 @@ func TestZeroCreditsNotDisabling(t *testing.T) {
 		t.Fatal("positive residual below the floor must be excluded")
 	}
 
-	// 3. 面板备注不再出现「耗尽」字样
-	if note := displayNote(&storedAuth{}, zero, false); strings.Contains(note, "耗尽") {
-		t.Fatalf("zero-credit note must not say 耗尽, got %q", note)
+	// 3. 未知额度不得误判为耗尽
+	if isCreditsExhausted(&creditsSummary{}) {
+		t.Fatal("empty snapshot with no usage signal must stay unknown")
+	}
+
+	// 4. 面板备注明确显示「耗尽」
+	if note := displayNote(&storedAuth{}, zero, false); !strings.Contains(note, "耗尽") {
+		t.Fatalf("exhausted note must say 耗尽, got %q", note)
+	}
+}
+
+// TestExceededFlagMarksExhausted 验证上游 quota.exceeded 是权威耗尽判据。
+// 免费版账号没有额度包，total_used/total_size 恒为 0，仅靠数值会被误判成未知。
+func TestExceededFlagMarksExhausted(t *testing.T) {
+	// 三项数值全 0 + exceeded=true：必须判为耗尽
+	upstreamExceeded := &creditsSummary{Exceeded: true}
+	if !isCreditsExhausted(upstreamExceeded) {
+		t.Fatal("quota.exceeded=true must be treated as exhausted")
+	}
+	if !isCreditsLowForRouting(upstreamExceeded) {
+		t.Fatal("quota.exceeded=true must be excluded from routing")
+	}
+
+	// 三项数值全 0 且无 exceeded：未知，不得误判
+	if isCreditsExhausted(&creditsSummary{}) {
+		t.Fatal("zero snapshot without exceeded must stay unknown")
+	}
+
+	// 有余额时即使 exceeded 残留也不得判为耗尽
+	withRemain := &creditsSummary{TotalRemain: 100, Exceeded: true}
+	if isCreditsExhausted(withRemain) {
+		t.Fatal("positive remain must win over a stale exceeded flag")
 	}
 }

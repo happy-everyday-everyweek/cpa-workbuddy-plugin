@@ -102,16 +102,22 @@ func setMinRoutableCredits(n int64) func() {
 	}
 }
 
-// isCreditsExhausted 判定积分快照是否归零（仅用于面板展示「0积分」标签）。
+// isCreditsExhausted 判定积分快照是否归零。
 // [参数] cr：积分快照。
-// [返回] 有消耗或额度池信号且剩余为 0 时返回 true；缺失数据视为未知返回 false。
-// 最近修改时间：2026-10-18 00:25:00；改动原因：QwenWork 额度层重建，补回展示判定。
+// [返回] 上游明确标记 exceeded、或有消耗/额度池信号且剩余为 0 时返回 true；
+// 缺失数据视为未知返回 false。
+// 最近修改时间：2026-10-18 17:10:00；改动原因：纳入上游 quota.exceeded 权威信号。
 func isCreditsExhausted(cr *creditsSummary) bool {
 	if cr == nil {
 		return false
 	}
 	if cr.TotalRemain > 0 {
 		return false
+	}
+	// 上游明确标记超额：权威判据。免费版账号没有额度包，
+	// total_used/total_size 恒为 0，仅靠数值会被误判成「未知」。
+	if cr.Exceeded {
+		return true
 	}
 	// remain==0: exhausted only when we know there was/is a package total
 	// (used>0, size>0, or packages present). Pure zero with no packages = no data.
@@ -121,19 +127,26 @@ func isCreditsExhausted(cr *creditsSummary) bool {
 	return len(cr.Packages) > 0
 }
 
-// isCreditsLowForRouting 判定账号是否因残血积分暂停路由。
+// isCreditsLowOrExhausted 判定账号是否额度耗尽或低于安全缓冲红线。
 // [参数] cr：积分快照。
-// [返回] 剩余积分为 0 时返回 false（可走免费模型）；仅正积分低于安全红线时返回 true。
-// 最近修改时间 2026-10-17 15:12:00（0 积分账号仍可走免费模型，仅保留残血保护）
-func isCreditsLowForRouting(cr *creditsSummary) bool {
+// [返回] 耗尽或正积分低于安全红线时返回 true；未知额度返回 false。
+// 最近修改时间：2026-10-18 17:10:00；改动原因：耗尽账号不得再参与路由。
+func isCreditsLowOrExhausted(cr *creditsSummary) bool {
 	if cr == nil {
 		return false
 	}
-	// 0 积分不等于不可用：免费模型不消耗积分，仅残血账号需暂停路由。
-	if cr.TotalRemain <= 0 {
-		return false
+	if isCreditsExhausted(cr) {
+		return true
 	}
 	return cr.TotalRemain < loadedMinRoutableCredits()
+}
+
+// isCreditsLowForRouting 判定账号是否因额度不足暂停路由。
+// [参数] cr：积分快照。
+// [返回] 耗尽（含上游 exceeded）或正积分低于安全红线时返回 true。
+// 最近修改时间 2026-10-18 17:10:00（QwenWork 无免费模型，0 积分不可路由）
+func isCreditsLowForRouting(cr *creditsSummary) bool {
+	return isCreditsLowOrExhausted(cr)
 }
 
 // isDailyCountExceeded 判定上游是否返回 Qoder 专属的 110 日请求次数上限限制。
@@ -394,6 +407,8 @@ func displayNote(sa *storedAuth, cr *creditsSummary, disabled bool) string {
 	switch {
 	case cr == nil:
 		parts = append(parts, "积分未知")
+	case isCreditsExhausted(cr):
+		parts = append(parts, fmt.Sprintf("耗尽 · 余%d 已用%d", cr.TotalRemain, cr.TotalUsed))
 	default:
 		// Show remain as primary (what you can still spend). Used is real cycle spend.
 		// Size (capacity) grows with check-in packs — do not treat size↑ as usage↓.

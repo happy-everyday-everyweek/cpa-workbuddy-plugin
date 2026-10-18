@@ -212,7 +212,7 @@ button.danger:hover{background:var(--err);color:#fff}
 <body>
 <div class="wrap">
   <h1>QwenWork 账号面板</h1>
-  <div class="sub">积分余额 · 0 积分仍可用免费模型 · 登录走 CPA 账号登录（Device Flow）</div>
+  <div class="sub">积分余额 · 额度耗尽自动停用，充值后自动恢复 · 登录走 CPA 账号登录（Device Flow）</div>
   <div id="authBox" class="card" style="display:none;margin-bottom:16px">
     <div style="margin-bottom:8px;color:var(--mut)">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。错误密钥请勿连点，避免 IP 封禁。</div>
     <div style="display:flex;gap:8px">
@@ -230,9 +230,9 @@ button.danger:hover{background:var(--err);color:#fff}
   </div>
   <div class="filter-bar" id="filterBar">
     <button type="button" class="ftag active" data-region="all" onclick="filterRegion('all',this)">全部 <span class="cnt" id="cntAll">0</span></button>
-    <button type="button" class="ftag" data-region="available" onclick="filterRegion('available',this)" title="未禁用 · 未处于日限冷却，可正常路由（0 积分账号仍可用免费模型）">可用 <span class="cnt" id="cntAvailable">0</span></button>
+    <button type="button" class="ftag" data-region="available" onclick="filterRegion('available',this)" title="未禁用 · 未耗尽 · 未低额 · 未处于日限冷却，可正常路由">可用 <span class="cnt" id="cntAvailable">0</span></button>
     <button type="button" class="ftag" data-region="cooling" onclick="filterRegion('cooling',this)" title="触发上游每日调用次数上限，处于 24 小时冷却中">冷却 <span class="cnt" id="cntCooling">0</span></button>
-    <button type="button" class="ftag" data-region="exhausted" onclick="filterRegion('exhausted',this)" title="积分为 0 的账号（仍可调用免费模型）">0积分 <span class="cnt" id="cntExhausted">0</span></button>
+    <button type="button" class="ftag" data-region="exhausted" onclick="filterRegion('exhausted',this)" title="额度耗尽的账号（已停止参与路由，充值后自动恢复）">0积分 <span class="cnt" id="cntExhausted">0</span></button>
   </div>
   <div class="summary card" id="summaryBox" style="display:none"></div>
   <div id="grid" class="grid"><div class="loading">加载中…</div></div>
@@ -380,6 +380,12 @@ function progressHTML(c, a){
   }
   const statHTML=statSegments.join('');
   const primaryHTML=`<span class="pb-primary"><span class="pb-segment">可用积分</span>${statHTML}</span>`;
+  // 已知耗尽优先于「加载中」判定：上游 quota.exceeded 明确时即使三项数值
+  // 全为 0 也是确定状态，不能继续转圈。
+  if(c&&(c.exceeded===true||a.exhausted)){
+    const when0=c.fetched_at?` · 快照 ${esc(String(c.fetched_at).replace('T',' ').replace('Z',' UTC'))}`:'';
+    return `<div class="pb"><div class="pb-label"><span class="pb-primary"><span class="pb-segment">已耗尽 · 余0</span>${statHTML}</span><span class="pb-used">已用 ${Number(c.total_used)||0}</span></div><div class="pb-track"><div class="pb-bar" style="width:100%;background:var(--err)"></div></div><div class="pb-meta">额度已耗尽，账号已停止参与路由；充值或领取额度后自动恢复${when0}</div></div>`;
+  }
   if(!c||(!(c.total_remain||0)&&!(c.total_used||0)&&!(c.total_size||0)))return `<div class="pb"><div class="pb-label">${primaryHTML}<span class="pb-used"><span class="spin"></span>加载中…</span></div><div class="pb-track"><div class="pb-bar" style="width:0%"></div></div></div>`;
   const remain=c.total_remain||0, used=c.total_used||0;
   const size=c.total_size||(remain+used);
@@ -418,7 +424,9 @@ function refreshStateHTML(a){
 function card(a){
   const plan=(a.plan||"unknown").toLowerCase();
   const cr=a.credits;
-  const exhausted=!!a.exhausted||(!!cr&&(cr.total_remain||0)===0&&((cr.total_used||0)>0||(cr.total_size||0)>0||(cr.packages&&cr.packages.length)));
+  // 耗尽判定：上游 quota.exceeded 是权威信号，免费版账号没有额度包时
+  // total_used/total_size 恒为 0，仅靠数值会被误判成「未知」。
+  const exhausted=!!a.exhausted||(!!cr&&(cr.exceeded===true||((cr.total_remain||0)===0&&((cr.total_used||0)>0||(cr.total_size||0)>0||(cr.packages&&cr.packages.length)))));
   const lowCredits=!exhausted && (!!a.low_credits || (!!cr && (cr.total_remain||0) > 0 && (cr.total_remain||0) < 20));
   const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(20)，已暂停路由，防止推理中途断开">低额保护</span>`:"";
   const dailyCooling=!!a.daily_cooling;
@@ -435,7 +443,7 @@ function card(a){
     : (disabled?``:`<button class="sec" data-action="select" data-auth-index="${esc(a.auth_index)}">选用</button>`);
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
   const clearCooldownBtn=dailyCooling?`<button class="sec" data-action="clear-cooldown" data-auth-index="${esc(a.auth_index)}" title="手动解除 110 日调用上限冷却">解冷</button>`:"";
-  const badges=(selected?`<span class="badge" style="background:var(--acc-ring);color:var(--acc);border-color:var(--acc)">使用中</span>`:"")+(disabled?`<span class="badge disabled">已禁用</span>`:"")+(exhausted?`<span class="badge exhausted" title="积分为 0，仍可调用免费模型">0积分</span>`:lowCreditsBadge)+coolingBadge+regionBadge+`<span class="badge ${esc(plan)}">${esc(a.plan||"-")}</span>`;
+  const badges=(selected?`<span class="badge" style="background:var(--acc-ring);color:var(--acc);border-color:var(--acc)">使用中</span>`:"")+(disabled?`<span class="badge disabled">已禁用</span>`:"")+(exhausted?`<span class="badge exhausted" title="额度耗尽，已停止参与路由；充值后自动恢复">0积分</span>`:lowCreditsBadge)+coolingBadge+regionBadge+`<span class="badge ${esc(plan)}">${esc(a.plan||"-")}</span>`;
   const display=(a.nickname||a.label||a.name||"").replace(/^qwenwork-?/i,"");
   const nick=display||("u"+(a.uid||"").slice(-8));
   return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-refresh-state="${a._refreshState||""}" data-nickname="${esc(display)}" data-uid="${esc(a.uid||"")}" data-name="${esc(a.name||"")}">
@@ -517,8 +525,8 @@ function filterRegion(region, btn){
     const r=c.dataset.region||"cn";
     let show=true;
     if(currentFilter==="all") show=true;
-    // 0 积分不算不可用：免费模型不消耗积分，只有禁用 / 残血 / 日限冷却才排除
-    else if(currentFilter==="available") show=!(c.dataset.disabled==="1"||c.querySelector(".badge.low-credits")!=null||c.querySelector(".badge.cooling")!=null);
+    // 耗尽账号属不可用：QwenWork 无免费模型，0 积分只会 429
+    else if(currentFilter==="available") show=!(c.dataset.disabled==="1"||c.querySelector(".badge.exhausted")!=null||c.querySelector(".badge.low-credits")!=null||c.querySelector(".badge.cooling")!=null);
     else if(currentFilter==="cooling") show=c.querySelector(".badge.cooling")!=null;
     else if(currentFilter==="exhausted") show=c.querySelector(".badge.exhausted")!=null;
     else show=r===currentFilter;
@@ -530,16 +538,30 @@ function filterRegion(region, btn){
   });
   renderSummary(lastAccounts);
 }
+// 账号耗尽判定（面板唯一入口）：后端 exhausted 字段优先，其次看上游
+// quota.exceeded 权威信号，最后才用数值推断。免费版账号没有额度包时
+// total_used/total_size 恒为 0，只靠数值会把确定耗尽误判成「未知」。
+function isAccountExhausted(a){
+  if(!a) return false;
+  if(a.exhausted) return true;
+  const cr=a.credits;
+  if(!cr) return false;
+  if(cr.exceeded===true) return true;
+  if((Number(cr.total_remain)||0)>0) return false;
+  const used=Number(cr.total_used)||0;
+  const size=Number(cr.total_size)||0;
+  return used>0||size>0||(Array.isArray(cr.packages)&&cr.packages.length>0);
+}
 function updateFilterCounts(accounts){
   let ex=0, avail=0, cooling=0;
   (accounts||[]).forEach(a=>{
-    if(a.exhausted||(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length)))) ex++;
+    if(isAccountExhausted(a)) ex++;
     if(a.daily_cooling) cooling++;
+    const isExhausted=isAccountExhausted(a);
     const c=creditOf(a);
-    const isExhausted=!!a.exhausted||(c.known&&c.remain===0&&(c.used>0||c.size>0));
     const isLowCredits=!isExhausted&&(!!a.low_credits||(c.known&&c.remain>0&&c.remain<20));
-    // 0 积分不参与可用性排除：免费模型不消耗积分
-    if(!(a.disabled||isLowCredits||a.daily_cooling)) avail++;
+    // 耗尽账号不参与可用性统计：QwenWork 无免费模型，0 积分只会 429。
+    if(!(a.disabled||isExhausted||isLowCredits||a.daily_cooling)) avail++;
   });
   const elAll=document.getElementById("cntAll");
   const elCool=document.getElementById("cntCooling");
@@ -554,19 +576,19 @@ function accountsForFilter(accounts){
   const list=accounts||[];
   if(currentFilter==="all") return list;
   if(currentFilter==="available"){
-    // 可用 = 不属于已禁用 / 低额保护 / 日限冷却；0 积分仍可走免费模型
+    // 可用 = 未禁用 / 未耗尽 / 未低额保护 / 未日限冷却
     return list.filter(a=>{
+      const isExhausted=isAccountExhausted(a);
       const c=creditOf(a);
-      const isExhausted=!!a.exhausted||(c.known&&c.remain===0&&(c.used>0||c.size>0));
       const isLowCredits=!isExhausted&&(!!a.low_credits||(c.known&&c.remain>0&&c.remain<20));
-      return !(a.disabled||isLowCredits||a.daily_cooling);
+      return !(a.disabled||isExhausted||isLowCredits||a.daily_cooling);
     });
   }
   if(currentFilter==="cooling"){
     return list.filter(a=>!!a.daily_cooling);
   }
   if(currentFilter==="exhausted"){
-    return list.filter(a=>a.exhausted||(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length))));
+    return list.filter(a=>isAccountExhausted(a));
   }
   return list.filter(a=>(a.region||"cn")===currentFilter);
 }
@@ -642,15 +664,15 @@ function renderSummary(accounts){
   const scoped=accountsForFilter(all);
   // 5 卡片口径：剩余(可用) / 剩余(不可用) / 已用(消耗) / 额度池 / 消耗占比
   // 「剩余(可用)/已用/额度池/占比」按可用账号统计；「剩余(不可用)」独立统计不可用账号。
-  // 不可用 = 已禁用 / 低额保护 / 日限冷却（0 积分仍可走免费模型）
+  // 不可用 = 已禁用 / 耗尽 / 低额保护 / 日限冷却
   let remainAvail=0, remainUnavail=0, used=0, size=0, knownN=0, disabledN=0, exhaustedN=0, coolingN=0, unavailN=0;
   let cnRemain=0, cnUsed=0;
   scoped.forEach(a=>{
     const c=creditOf(a);
-    const isExhausted=!!a.exhausted||(c.known&&c.remain===0&&(c.used>0||c.size>0));
+    const isExhausted=isAccountExhausted(a);
     const isLowCredits=!isExhausted&&(!!a.low_credits||(c.known&&c.remain>0&&c.remain<20));
-    // 0 积分账号仍可路由（免费模型），不计入不可用
-    const isUnavailable=!!a.disabled||isLowCredits||!!a.daily_cooling;
+    // 耗尽账号计入不可用：QwenWork 无免费模型，0 积分只会 429。
+    const isUnavailable=!!a.disabled||isExhausted||isLowCredits||!!a.daily_cooling;
     if(c.known){
       if(isUnavailable){ remainUnavail+=c.remain; unavailN++; }
       else { remainAvail+=c.remain; used+=c.used; size+=c.size; knownN++; }

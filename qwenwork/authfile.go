@@ -246,7 +246,7 @@ func manualDisableFromAuthJSON(raw []byte) bool {
 // exhaustedDisableFromAuthJSON 读取顶层 exhausted_disable 标记。
 // [参数] raw：物理 auth 文件原始 JSON 字节流。
 // [返回] 标记为 true 时返回 true；缺失或非布尔值返回 false。
-// 最近修改时间 2026-10-17 15:12:00（该标记只保留恢复语义，0 积分不再写入）
+// 最近修改时间 2026-10-18 17:10:00（该标记重新用于耗尽自动禁用与自动恢复）
 func exhaustedDisableFromAuthJSON(raw []byte) bool {
 	var m struct {
 		ExhaustedDisable bool `json:"exhausted_disable"`

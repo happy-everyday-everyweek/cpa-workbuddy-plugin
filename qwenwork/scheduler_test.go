@@ -130,9 +130,9 @@ func TestSchedulerPick_KeepsHealthyPanelSelection(t *testing.T) {
 	}
 }
 
-// TestSchedulerPick_ZeroCreditSelectionKept 验证 0 积分账号仍可路由：
-// 免费模型不消耗积分，选中账号不得因积分为 0 被换掉。
-func TestSchedulerPick_ZeroCreditSelectionKept(t *testing.T) {
+// TestSchedulerPick_ZeroCreditSelectionSwitches 验证耗尽账号被换掉：
+// QwenWork 无免费模型，0 积分账号只会 429，选中项必须让位给有额度的账号。
+func TestSchedulerPick_ZeroCreditSelectionSwitches(t *testing.T) {
 	resetActiveAuth(t)
 	resetFailover(t)
 	accountCache.Store("qo-zero", &accountCacheEntry{
@@ -157,14 +157,14 @@ func TestSchedulerPick_ZeroCreditSelectionKept(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	resp := parsePickResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "qo-zero" {
-		t.Fatalf("0-credit selection should be kept for free models, got %+v", resp)
+	if !resp.Handled || resp.AuthID != "qo-ok" {
+		t.Fatalf("exhausted selection must switch to the funded account, got %+v", resp)
 	}
 }
 
-// TestSchedulerPick_AllZeroCreditStillRoutes 验证全池 0 积分时插件仍自行接管：
-// 免费模型可用，不得让位给宿主跨 provider 轮转。
-func TestSchedulerPick_AllZeroCreditStillRoutes(t *testing.T) {
+// TestSchedulerPick_AllExhaustedDefers 验证全池耗尽时让位给宿主：
+// 0 积分账号无法服务任何模型，插件不得把它们当作可用账号硬扛。
+func TestSchedulerPick_AllExhaustedDefers(t *testing.T) {
 	resetActiveAuth(t)
 	resetFailover(t)
 	accountCache.Store("qo-a", &accountCacheEntry{
@@ -190,8 +190,41 @@ func TestSchedulerPick_AllZeroCreditStillRoutes(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	resp := parsePickResponse(t, raw)
-	if !resp.Handled {
-		t.Fatalf("0-credit pool must stay handled (free models), got %+v", resp)
+	if resp.Handled {
+		t.Fatalf("all-exhausted pool must defer to host scheduling, got %+v", resp)
+	}
+}
+
+// TestSchedulerPick_ExceededFlagExcludes 验证仅靠上游 quota.exceeded 信号
+// （三项数值全 0）也能把账号排除出调度：免费版账号没有额度包，
+// 数值层面与「未知」完全一样，只有该信号能区分。
+func TestSchedulerPick_ExceededFlagExcludes(t *testing.T) {
+	resetActiveAuth(t)
+	resetFailover(t)
+	accountCache.Store("qo-exceeded", &accountCacheEntry{
+		credits: &creditsSummary{Exceeded: true},
+	})
+	accountCache.Store("qo-ok", &accountCacheEntry{
+		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
+	})
+	defer func() {
+		accountCache.Delete("qo-exceeded")
+		accountCache.Delete("qo-ok")
+	}()
+	setActiveAuthID("qo-exceeded")
+	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
+		Provider: providerName,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "qo-exceeded", Provider: providerName},
+			{ID: "qo-ok", Provider: providerName},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := parsePickResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "qo-ok" {
+		t.Fatalf("quota.exceeded account must be excluded, got %+v", resp)
 	}
 }
 
