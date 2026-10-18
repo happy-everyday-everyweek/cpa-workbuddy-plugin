@@ -301,7 +301,7 @@ func pumpNotionStream(streamID string, auth *StoredAuth, chatReq *openAIChatRequ
 		return
 	}
 
-	_, errRun := runInferenceWithFailover(context.Background(), auth, chatReq, func(event streamEvent) error {
+	result, errRun := runInferenceWithFailover(context.Background(), auth, chatReq, func(event streamEvent) error {
 		switch event.Kind {
 		case "delta":
 			return streamEmit(streamID, buildStreamDelta(chunkID, created, model, event.Text))
@@ -317,7 +317,7 @@ func pumpNotionStream(streamID string, auth *StoredAuth, chatReq *openAIChatRequ
 		return
 	}
 
-	_ = streamEmit(streamID, buildStreamFinish(chunkID, created, model))
+	_ = streamEmit(streamID, buildStreamFinish(chunkID, created, model, result.inputTokens, result.outputTokens))
 }
 
 // buildStreamError 构造错误分片。

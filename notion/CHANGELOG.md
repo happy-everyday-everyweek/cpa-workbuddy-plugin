@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.2 (2026-10-19)
+
+### 修复
+
+- **流式响应不输出 usage，导致下游用量与计费全部记零**。宿主只从分片或
+  响应体里读 token 数；0.1.1 的终止帧只带 `finish_reason`，没有 `usage`，
+  实测生产流式请求在 new-api 通用日志里 Tokens 恒为 `-`、费用 $0
+  （非流式路径正常，因为它整体返回 usage）。
+  修复为在终止帧输出 OpenAI 规范 `usage`，数值取自上游
+  `agent-inference` 段的 inputTokens / outputTokens。增量帧保持不带
+  usage，避免下游重复累加。
+
+### 测试
+
+- `TestBuildStreamFinishIncludesUsage`：锁定终止帧必须带 usage 且数值正确。
+- `TestBuildStreamDeltaOmitsUsage`：锁定增量帧不得带 usage。
+
 ## 0.1.1 (2026-10-19)
 
 ### 修复

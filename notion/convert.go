@@ -161,6 +161,9 @@ func buildCompletionResponse(model, text string, inputTokens, outputTokens int) 
 }
 
 // streamChunk 是 SSE 分片。
+//
+// Usage 只在终止帧出现（OpenAI 规范用 `stream_options.include_usage` 控制，
+// 但宿主只从分片里读 token 数，不输出就会导致下游用量全记为 0）。
 type streamChunk struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
@@ -176,6 +179,7 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *openAIUsage `json:"usage,omitempty"`
 }
 
 // buildStreamDelta 构造正文增量分片。
@@ -203,13 +207,21 @@ func buildStreamReasoning(id string, created int64, model, text string) []byte {
 }
 
 // buildStreamFinish 构造收尾分片。
-// [参数] id: 分片 id；created: 创建时间；model: 模型名。
+//
+// 同时带上 usage：宿主只从分片/响应体取 token 数，终止帧不带用量会让
+// 下游统计与计费全部记零。
+// [参数] id: 分片 id；created: 创建时间；model: 模型名；inputTokens / outputTokens: 用量。
 // [返回] 分片字节。
-// 最近修改时间：2026-10-18；改动原因：新增，finish_reason 分片。
-func buildStreamFinish(id string, created int64, model string) []byte {
+// 最近修改时间：2026-10-19；改动原因：补 usage，修复下游用量记零。
+func buildStreamFinish(id string, created int64, model string, inputTokens, outputTokens int) []byte {
 	chunk := newStreamChunk(id, created, model)
 	reason := "stop"
 	chunk.Choices[0].FinishReason = &reason
+	chunk.Usage = &openAIUsage{
+		PromptTokens:     inputTokens,
+		CompletionTokens: outputTokens,
+		TotalTokens:      inputTokens + outputTokens,
+	}
 	return mustMarshal(chunk)
 }
 
