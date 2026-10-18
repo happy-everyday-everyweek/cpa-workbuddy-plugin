@@ -43,7 +43,8 @@
   - **0.3.5（21:08:42 热重载）**：面板测试改为三层真实推理探活（判据 + 模型目录 + 极小推理），移除「不产生推理请求」过期文案。
   - **发布态复核（21:24）**：远端 registry 0.3.5 + 6 平台资产 sha256 ALL PASS；生产落盘 `.so` sha256 `5706a80c…` 与 Release 产物逐字节一致；零容器重启。行为验收：单轮流式 19 帧 / TTFB 7ms / 10.92s，多轮流式返回 `5`，非流式「你好！」，探活 `scope=auth+models+inference` 回复「可用」；accounts / models / panel 均 200。
   - **模型清单澄清**：16 个模型是 `/v1/model/list`（在线 9）+ 多模态目录（8，去重 1）动态合并结果，与 CPA `/v1/models` 逐条一致；`staticFallbackModels()` 的 5 条仅用于启动期无账号兜底。
-  - **待办**：无（0.3.5 已发布生产并通过流式/多轮/非流式/探活四场景验收）。
+  - **0.3.6（22:00:10 热重载）**：修复 `/v1/responses` 入口必然 503。根因 `executorRequestBody` 优先读 `OriginalRequest`（客户端原始体，Responses 入口只有 `input`），而宿主只翻译 `Payload`；解析失败还会让宿主把账号标记不可用，连带 chat 请求 503。改为 Payload 优先。生产验收：responses 非流式 / 流式 / chat 三场景均 200，账号 `auth_state=ok`，`请求缺少 messages` 归零。
+  - **待办**：new-api 渠道 4「混合」的 `models` 仍需手工追加 coze 模型名，否则 new-api 侧不会转发到 CPA。
 
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
