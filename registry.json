@@ -649,7 +649,7 @@
       "name": "QwenWork Provider",
       "description": "QwenWork (千问办公) account provider for CLIProxyAPI: device-flow + PKCE login, short-lived MaaS credential minting with automatic rotation, OpenAI-compatible passthrough inference, multi-account pool with laddered cooldown failover, and a dedicated management panel.",
       "author": "luode0320",
-      "version": "0.2.5",
+      "version": "0.2.6",
       "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
       "logo": "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/assets/icons/QwenWork.png",
       "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/qwenwork",
@@ -666,44 +666,44 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_darwin_amd64.zip",
-            "sha256": "934aa0c215441aa858d54844e6171a9ef644ab423922cec07c2979d4a78ba06c",
-            "size": 3007991
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_darwin_amd64.zip",
+            "sha256": "9b7496c8dfd535e4afa05dbc51acd895e93626a81cae5e302b9571ae057846b8",
+            "size": 3009339
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_darwin_arm64.zip",
-            "sha256": "77556017c160e0d7111f691612b619e0c34f7565438c723b173475773283169d",
-            "size": 2779346
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_darwin_arm64.zip",
+            "sha256": "496384247eab09bc47adf39310abdfce77568910c414cf258181dbb85992de0b",
+            "size": 2780127
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_linux_amd64.zip",
-            "sha256": "cca4d40323b9a6bda59815907a290755634fb71a5de1ef63e3f4e048bc1f1bec",
-            "size": 3169138
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_linux_amd64.zip",
+            "sha256": "5f669cd6eda8efb9f8513d4454d6d941d4cdaa057c4095968c759c9baeec54ae",
+            "size": 3170279
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_linux_arm64.zip",
-            "sha256": "a702420259a1b1c31b7b5e213df932ead11fb7ce1a0e21a6dd9015ba7295e832",
-            "size": 2878911
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_linux_arm64.zip",
+            "sha256": "95c5cb9f02587bd4c22a09baa3ba14fca3c66bb41089ec68710ead3ab32b91d6",
+            "size": 2879799
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_windows_amd64.zip",
-            "sha256": "381dfc42d4ae2f3a07d88fcaacd5cb261e03192c7540ffd0cae02c7734a9252e",
-            "size": 3093966
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_windows_amd64.zip",
+            "sha256": "3ef6046ec6fd58f0181d93dc3403314cd6f7da132c6c0d8e6f6b0d0dcbaccc6f",
+            "size": 3094498
           },
           {
             "goos": "windows",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.5/qwenwork-provider_0.2.5_windows_arm64.zip",
-            "sha256": "706dff3bc48e2f8613b77c4c9be92462920b2193ed7a38baf56b232f9cd52c14",
-            "size": 2867348
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qwenwork-provider-v0.2.6/qwenwork-provider_0.2.6_windows_arm64.zip",
+            "sha256": "ff6f185985af30af22e724defc95e84f5d229f407c6360ec56b9f4ab78233cce",
+            "size": 2867704
           }
         ]
       }
