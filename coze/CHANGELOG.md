@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.4 (2026-10-18)
+
+### 修复
+
+- **多轮对话返回空正文**。生产实测：单条 user 正常（65 字），带
+  `assistant` 历史的多轮请求正文 0 字、`finish_reason=stop`。
+- **根因**：`runStream` 用固定 `300ms` 猜 WS 是否连上再提交消息。
+  网络慢时 chat 抢在连接之前发出；快速回复（多轮场景实测约 2 秒结束）
+  的 `event_delta` 在连接就绪前就推完了，只收到重放的 `event_final`，
+  而 final 的 delta 已被 0.3.3 清空 → 正文为空。
+  WS 抓帧佐证：同一 prompt 上游确实推了 start / delta(28 字) / final 三帧。
+- **修复**：
+  - 新增 `frontierClient.WaitReady`，握手成功即关闭 `ready` 通道，
+    调用方等真实就绪信号（上限为握手超时 10s），不再靠猜。
+  - `waitForReply` 增加兜底：已收尾但正文为空时，按本轮 `message_id`
+    去 `message/list` 取落库正文补齐。
+  - `fallbackPoll` 改为按 `reply_to_message_id` 精确配对；原实现取
+    「最新一条 reply」，可能把上一轮回复当成本轮结果。
+
+### 测试
+
+- 新增 `TestWaitReadySignalsAfterHandshake`（握手后立即就绪）与
+  `TestEmptyReplyFallsBackToPolling`（只发 final 时靠轮询补回正文）。
+  变异移除空正文兜底后，后者精确失败并在断言里复现空正文。
+
 ## 0.3.3 (2026-10-18)
 
 ### 修复

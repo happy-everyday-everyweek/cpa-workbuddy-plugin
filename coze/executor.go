@@ -263,21 +263,23 @@ func (e *cozeExecutor) runStream(ctx context.Context, prompt string, emit func(s
 	}()
 	defer client.Close()
 
-	// 等连接真正建立：DialContext 在 Run 内部，没有就绪信号，
-	// 因此用「短等待 + 首帧到达」的折中，避免 chat 抢在连接之前。
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-time.After(300 * time.Millisecond):
+	// 等连接真正建立再提交消息：chat 一旦发出上游就开始推送，
+	// 快速回复（约 2 秒）的增量会在连接就绪前全部丢掉，只剩重放的
+	// event_final，最终正文为空（2026-10-18 多轮场景实测）。
+	readyCtx, cancelReady := context.WithTimeout(ctx, frontierHandshakeTimeout)
+	errReady := client.WaitReady(readyCtx)
+	cancelReady()
+	if errReady != nil {
+		client.Close()
+		return "", fmt.Errorf("frontier 连接未就绪：%w", errReady)
 	}
 
 	messageID, errChat := e.client.sendChat(sessionID, prompt)
 	if errChat != nil {
 		return "", errChat
 	}
-	_ = messageID
 
-	content, errWait := e.waitForReply(ctx, collector, emit)
+	content, errWait := e.waitForReply(ctx, collector, emit, messageID)
 	return content, errWait
 }
 
@@ -288,7 +290,7 @@ func (e *cozeExecutor) runStream(ctx context.Context, prompt string, emit func(s
 // [参数] ctx: 生命周期；collector: 收集器；emit: 增量回调。
 // [返回] 完整正文与错误。
 // 最近修改时间：2026-10-18；改动原因：新增，等待与降级。
-func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollector, emit func(string) error) (string, error) {
+func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollector, emit func(string) error, messageID string) (string, error) {
 	deadline := time.Now().Add(executorReplyTimeout)
 	firstTokenDeadline := time.Now().Add(executorFirstTokenTimeout)
 
@@ -305,6 +307,16 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 
 	for {
 		if collector.isFinished() {
+			// 收尾了但一个字都没有：说明增量帧在连接就绪前就推完了，
+			// 只剩重放的 final。此时降级轮询把落库正文补齐。
+			if strings.TrimSpace(collector.text()) == "" && messageID != "" {
+				if errPoll := e.fallbackPoll(ctx, collector, messageID); errPoll == nil {
+					if errFlush := flush(); errFlush != nil {
+						return collector.text(), errFlush
+					}
+					return collector.text(), nil
+				}
+			}
 			if err := flush(); err != nil {
 				return collector.text(), err
 			}
@@ -318,7 +330,7 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 		// 首字长时间不来：上游偶发不推 WS 帧，但消息会落库。
 		// 降级到轮询能把答案给用户，代价是失去实时性。
 		if !collector.hasFirstToken() && time.Now().After(firstTokenDeadline) {
-			if err := e.fallbackPoll(ctx, collector); err != nil {
+			if err := e.fallbackPoll(ctx, collector, messageID); err != nil {
 				return collector.text(), err
 			}
 			if err := flush(); err != nil {
@@ -344,12 +356,13 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 
 // fallbackPoll 用 message/list 轮询补齐回复。
 //
-// 只在首字超时时使用：它拿到的是已落库的完整消息（实测约 4 秒延迟），
-// 没有增量语义，但能保证「至少有答案」。
-// [参数] ctx: 生命周期；collector: 收集器。
+// 只在「首字超时」或「已收尾但正文为空」时使用：它拿到的是已落库的
+// 完整消息（实测约 4 秒延迟），没有增量语义，但能保证「至少有答案」。
+// 必须按 userMessageID 精确配对，否则会把上一轮的回复当成本轮结果。
+// [参数] ctx: 生命周期；collector: 收集器；userMessageID: 本轮用户消息 ID。
 // [返回] 错误。
-// 最近修改时间：2026-10-18；改动原因：新增，兜底轮询。
-func (e *cozeExecutor) fallbackPoll(ctx context.Context, collector *replyCollector) error {
+// 最近修改时间：2026-10-18；改动原因：补 message_id 配对，修复空回复。
+func (e *cozeExecutor) fallbackPoll(ctx context.Context, collector *replyCollector, userMessageID string) error {
 	// 这里不重取 sessionID：调用方已确认会话可用，
 	// 重取只会增加一次无谓的上游往返。
 	sessionID, _, errPrepare := e.prepare()
@@ -365,25 +378,14 @@ func (e *cozeExecutor) fallbackPoll(ctx context.Context, collector *replyCollect
 
 		messages, errList := e.client.listMessages(sessionID)
 		if errList == nil {
-			// 取最新一条 reply：兜底场景下没有可用的 message_id 配对，
-			// 而本轮刚刚提交，最新 reply 必然属于本轮。
-			for _, msg := range messages {
-				if msg.MessageType != "reply" {
-					continue
-				}
-				var payload clawReplyPayload
-				if errUnmarshal := json.Unmarshal([]byte(msg.Content), &payload); errUnmarshal != nil {
-					continue
-				}
-				if payload.MessageData.Reply.Content != "" {
-					collector.accept(&frontierMessage{
-						ID:       payload.ID,
-						Phase:    "event_final",
-						Delta:    payload.MessageData.Reply.Content,
-						Snapshot: payload.MessageData.Reply.Content,
-					})
-					return nil
-				}
+			reply, found := findReplyFor(messages, userMessageID)
+			if found && reply.MessageData.Reply.Content != "" {
+				collector.accept(&frontierMessage{
+					ID:       reply.ID,
+					Phase:    "event_final",
+					Snapshot: reply.MessageData.Reply.Content,
+				})
+				return nil
 			}
 		}
 

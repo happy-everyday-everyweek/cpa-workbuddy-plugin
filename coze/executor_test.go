@@ -457,3 +457,87 @@ func TestStreamHeadersCarryNoBufferHint(t *testing.T) {
 		t.Errorf("X-Accel-Buffering = %q，期望 no", got)
 	}
 }
+
+// TestWaitReadySignalsAfterHandshake 验证连接就绪信号。
+//
+// 之前调用方用固定 300ms 猜连接是否就绪；网络慢时 chat 会抢在连接
+// 之前发出，快速回复的 event_delta 全部丢失，只剩重放的 event_final，
+// 最终正文为空（2026-10-18 多轮场景实测）。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，就绪信号回归。
+func TestWaitReadySignalsAfterHandshake(t *testing.T) {
+	ts := newWSTestServer(t, func(conn *websocket.Conn) {
+		time.Sleep(100 * time.Millisecond)
+	})
+	client := newTestFrontierClient(ts, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go client.Run(ctx)
+
+	readyCtx, cancelReady := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelReady()
+	if err := client.WaitReady(readyCtx); err != nil {
+		t.Fatalf("连接应在握手后立即就绪：%v", err)
+	}
+
+	ts.mu.Lock()
+	conns := ts.conns
+	ts.mu.Unlock()
+	if conns == 0 {
+		t.Error("WaitReady 返回时应当已经建立过连接")
+	}
+}
+
+// TestEmptyReplyFallsBackToPolling 验证「收尾但正文为空」时降级轮询。
+//
+// 场景：WS 只重放了 event_final、增量帧在连接就绪前就推完了。
+// 直接返回会让客户端拿到空回复；必须去 message/list 按 message_id 取正文。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，空回复兜底回归。
+func TestEmptyReplyFallsBackToPolling(t *testing.T) {
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		// 只发收尾帧，不带任何正文——模拟增量全部错过。
+		payload := replyFrame("event_final", "9", "", "")
+		frame := encodeFrontierFrame(&frontierFrame{
+			Service:     frontierServiceClaw,
+			PayloadType: "message",
+			Payload:     payload,
+		})
+		_ = conn.WriteMessage(websocket.BinaryMessage, frame)
+	})
+	// 轮询返回一条配对本轮 message_id 的完整回复。
+	env.doer.handler = func(req *http.Request, body []byte) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, clawInfoPath):
+			return jsonResponse(200, `{"code":0,"data":{"user_claw_info":{"claw_id":"c1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawMainSessionPath):
+			return jsonResponse(200, `{"code":0,"data":{"session":{"id":"s1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, frontierKeyPath):
+			return jsonResponse(200, `{"code":0,"data":{"access_key":"k","device_id":"d"}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawChatPath):
+			return jsonResponse(200, `{"code":0,"data":{"message_id":"mid-1"}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawMessageListPath):
+			return jsonResponse(200, `{"code":0,"data":{"messages":[{"message_type":"reply","content":"{\"message_data\":{\"reply\":{\"content\":\"轮询补回的正文\",\"reply_to_message_id\":\"mid-1\"}}}"}]}}`), nil
+		default:
+			t.Errorf("未预期的请求路径: %s", req.URL.Path)
+			return jsonResponse(404, `{}`), nil
+		}
+	}
+
+	exec := env.newExecutor()
+	exec.client.baseURL = cozeSiteHost
+	exec.frontierServerURL = env.ws.server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	content, err := exec.runStream(ctx, "你好", func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if content != "轮询补回的正文" {
+		t.Errorf("正文 = %q，期望 轮询补回的正文", content)
+	}
+}

@@ -187,6 +187,13 @@ type frontierClient struct {
 	mu          sync.Mutex
 	conn        *websocket.Conn
 	closed      bool
+	// ready 在首次握手成功后关闭并通知调用方，可重复关闭。
+	//
+	// 之前调用方靠固定 300ms 等待猜连接是否就绪：网络慢时 chat 会
+	// 抢在连接之前发出，快速回复（约 2 秒内结束）的 event_delta 全部
+	// 丢失，只剩重放的 event_final，最终正文为空（2026-10-18 实测）。
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 // newFrontierClient 构造 WS 客户端。
@@ -201,6 +208,26 @@ func newFrontierClient(key *frontierKeyResponse, cookieHeader string, onEvent fu
 		onEvent:      onEvent,
 		logf:         hostLogf,
 		cookieHeader: cookieHeader,
+		ready:        make(chan struct{}),
+	}
+}
+
+// WaitReady 等待首次握手完成。
+//
+// 握手失败后 Run 会退避重连，这里只等第一轮；超时或 ctx 取消时返回错误，
+// 调用方据此决定是否继续提交消息。
+// [参数] ctx: 生命周期。
+// [返回] 连接就绪时返回 nil。
+// 最近修改时间：2026-10-18；改动原因：新增，替代固定等待。
+func (c *frontierClient) WaitReady(ctx context.Context) error {
+	if c == nil || c.ready == nil {
+		return nil
+	}
+	select {
+	case <-c.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -310,6 +337,7 @@ func (c *frontierClient) runOnce(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.logf("info", "frontier 已连接", map[string]any{"device_id": c.key.DeviceID})
+	c.readyOnce.Do(func() { close(c.ready) })
 
 	// 读循环独占 conn：gorilla 不允许并发读，心跳只写不读。
 	// 心跳协程通过 ctx 或连接关闭感知退出，不在 defer 里空等 ticker。
