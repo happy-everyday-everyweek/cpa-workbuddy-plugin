@@ -32,15 +32,20 @@
 
 ## 活动会话进展摘要
 
-- 当前会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
+- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收发现流式 500 并修复为 0.3.1**：
+  - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS（version 0.3.0、6 平台 sha256 全对、无旧版残留）→ 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200，账号 `auth_state=ok`、积分 2669/3000。
+  - **生产行为验收发现真实缺陷**：`POST /v1/chat/completions`（`coze/doubao-seed-2-0-mini-260215`，stream）立即返回 `{"error":{"message":"json: unsupported type: <-chan pluginapi.ExecutorStreamChunk"}}`，0 字节正文、0 chunk。
+  - **根因（宿主源码取证）**：`internal/pluginhost/rpc_schema.go:52` 的 `rpcExecutorStreamResponse.Chunks` 是 **slice**，`rpc_client_stream.go:29` 先判 `len(resp.Chunks) > 0` 再转 channel。0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化阶段即失败。宿主的正确异步路径是 `stream_id` + `host.stream.emit` / `host.stream.close`（workbuddy 同款）。
+  - **修复（0.3.1）**：`handleExecStream` 改为解析 `executorStreamRequest`（内嵌 `ExecutorRequest` + `stream_id`）；有 `stream_id` 时立即返回响应头，`pumpClawStream` 后台逐帧 `streamEmit`；无 `stream_id` 时 `collectStreamChunks` 同步收集返回 slice。补 `X-Accel-Buffering: no`（缺它会攒缓冲，真流式表现为卡住后一次性蹦出）。
+  - **回归与反证**：新增 `TestStreamResponseSerializable`（变异回 channel 形态 → 精确复现生产报错文案）、`TestStreamHeadersCarryNoBufferHint`；cgo-shim build/vet/test 全绿。
+  - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
+  - **待办**：0.3.1 走完整发布链并重新做生产流式验收。
+
+- 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
   - **实现（5 个新文件，约 1600 行）**：`frontier_frame.go`（12 字段 protobuf 手写编解码，按 tag 分派+跳过未知字段）、`frontier.go`（WS 客户端：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`、10s `hi` 心跳、读超时、指数退避重连）、`claw.go`（claw/info→get_main→chat→message/list→get_frontier_key，统一 `code` 业务判定）、`convert.go`（OpenAI messages 折叠、chunk/completion 构造）、`executor.go`（流式/非流式入口、`turn_id+seq_num+phase` 去重、`event_final` 收尾、首字超时降级轮询）。
-  - **main.go**：声明 `Executor:true` + `ExecutorModelScopeBoth` + `openai` 输入输出；新增 4 个 executor 方法分发。
-  - **实现中修复的两个真实缺陷**：① 心跳协程只在 ticker 触发时检查状态，服务端断开后要空等 10 秒才重连 → 改为读循环结束即取消心跳协程；② 增量按「累积差值」下发，两帧间隔小于轮询间隔时被合并成一大块（客户端「卡一下蹦一大段」）→ 改为 `pending` 队列逐帧 emit。
-  - **验证**：cgo-shim build/vet/test 全绿（9.4s）；新增 46 个用例（含 2 个 live test）；3 次变异反证均被精确捕获（解码器不写 service → 3 FAIL；去掉 service 过滤 → 1 FAIL；不投递 pending → 3 FAIL）；关键用例用 2026-10-18 抓到的真实帧 hex 而非自造样本。
-  - **清理死代码**：`upstreamModelName`（message/chat 不接受模型参数）、`frontierFrameTypeBusiness`、`frontierFrameTypeCursor`。
-  - **未验证（诚实标注）**：真实账号端到端——本地 `coze-7a7b35ecc5d043a8.json` 的 Cookie 仅 38 字节且已失效（`code=700012006`），按 AGENTS.md 本地连接红线未取生产凭据；`TestLiveClawStream` 已就绪，用户提供 `COZE_LIVE_COOKIE` 即可验收。**未发布**：未 bump registry、未 dispatch CI、未做生产热重载。
-  - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
+  - **实现中修复的两个真实缺陷**：① 心跳协程只在 ticker 触发时检查状态，服务端断开后要空等 10 秒才重连 → 改为读循环结束即取消心跳协程；② 增量按「累积差值」下发，两帧间隔小于轮询间隔时被合并成一大块 → 改为 `pending` 队列逐帧 emit。
+  - **验证**：cgo-shim build/vet/test 全绿；新增 46 个用例（含 2 个 live test）；3 次变异反证均被精确捕获；关键用例用真实帧 hex 而非自造样本。
 
 - 前序会话（2026-10-18，已压缩）：**coze CYCLE-01 协议取证：抓到真流式帧，TASK-004 阻断解除**：浏览器内给 `WebSocket.prototype.send` 打补丁捕获页面真实 WS 实例，抓到 100 帧业务数据（44 条 reply 增量）。关键实测：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`（`connection-params` 的 `aid=578287`/`service=33555616` 是另一条通道，用错只收心跳）；claw 业务 `service=33555657`；protobuf 12 字段；阶段机 `event_start`→`event_delta`→`event_final`；`content.message_data.reply.content` 是 delta、`content_v2.session.final` 是累积快照（实测 10 个 delta 拼接 371 字符 == final 371）；去重键 `turn_id+seq_num+phase`。文档见 `doc/5-tests/2026-10-18_164500_Coze对话链路协议补全.md` §4.6。
 
@@ -96,14 +101,7 @@
 
 - 上一会话（2026-10-15）：**五插件签到节奏统一为每 4 小时，四插件全链路发布生产**：workbuddy/workbuddy-ai/traework 后端本就六槽；qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效的 `shouldRunCheckinNow` 门控（两表取值一致后恒真）；同步修正 workbuddy/traework 面板与文档长期错标的 `09:00/21:00`。发布链 `91ca440`→CI→`cf40437`(32 assets)→`97db81e`(registry)→`8c2ea35`(prune)。生产四插件热重载零重启，`.so` 与 zip 逐字节一致，远端 28/28 ALL PASS。
 
-- 上一会话（2026-10-15）：**zcode-provider 面板额度改为逐模型独立进度条并移除冗余信息（0.1.31），全链路发布生产**：
-  - 需求背景：用户反馈截图显示一个账号的 GLM-5.3 / GLM-5.3-Flash 仍共用**一条**汇总进度条，看不出各模型各自消耗；并要求移除「过期」等与额度判断无关的信息。
-  - **改造（纯前端，`zcode/panel.html`）**：`quotaHTML` 由「单条汇总条」改为按 `entitlements[]` **逐模型渲染独立进度条**——每个模型一条 `.pb-item`，标签显示「剩 X / Y」并按「剩余/授予」着色（≤30% 黄、≤10% 红）；回退通道（无真实用量）模型单独展示「授予 X」+ 半透明满格条；`card()` 移除「过期」行。CSS 新增 `.pb-item`/`.pb-name`/`.pb-used.warn|err`，移除本轮失效的 `.pb-primary`/`.pb-segment`。
-  - **回归脚本同步（`test/zcode/panel_quota_render_repro.mjs`）**：新增逐模型进度条数量、逐模型剩余/授予文案、耗尽模型转红、卡片不展示过期行等断言；并修正两处**既有失配**（0.1.28 默认授权站点已改中国区、0.1.30 汇总文案已改「今日授予合计」，脚本此前仍断言旧值，长期失去判别力）。
-  - **发布闭环**：提交 `0702b84`(feat 7 文件) → CI `38615248982` success → `b7b754a`(assets 7/7 sha256 OK) → `0d6c46a`(registry) → `7df26e2`(prune 0.1.29/0.1.30)；远端 raw URL 7/7 全部 200；生产热重载 `active_version=0.1.31 retired_version=0.1.30`（02:40:58），**零容器重启**；落盘 `.so` sha256 `5938fcc1…b0dd58` 与本地 zip 逐字节一致。
-  - **生产面板验收**：面板资源 73,742 字节，`pb-item`/`pb-name` 各 4 处（CSS + 渲染），旧结构 `pb-primary`/`pb-segment` 与「过期」行残留均为 **0**。
-  - 门禁：`cgo-shim-build.py zcode` build/vet/test 全绿；面板回归 PASS；哨兵变异（回退为单条汇总条）精确 FAIL 2 项后恢复全绿；`gofmt -l` LF 归一后空；`POLLUTION: PASS`；`STYLE: PASS`（`doc/6-review/2026-10-15_034500_*`）。
-  - 文档：测试主文档 `doc/5-tests/2026-10-15_034500_zcode面板额度逐模型进度条测试.md`、6-review `doc/6-review/2026-10-15_034500_zcode面板额度逐模型进度条_6-review.md`。
+- 会话（2026-10-15，已压缩）：**zcode-provider 0.1.31 面板额度改为逐模型独立进度条**：`quotaHTML` 由单条汇总条改为按 `entitlements[]` 逐模型渲染，移除「过期」行；回归脚本补逐模型断言；发布链 `0702b84`→CI success→`b7b754a`(assets)→`0d6c46a`(registry)；生产面板 `pb-item`/`pb-name` 各 4 处、旧结构残留 0。
 
 - 会话（2026-10-15，已压缩）：**zcode-provider 0.1.30 面板额度改用 `billing/balance` 取真实用量**：根因是 `billing/current` 只返回授予量、无已用/剩余，且面板进度条硬编码 100%；改走 balance（强制设备三头 `X-Platform`/`X-Device-Mid`/`X-ZCode-App-Version`）+ `friendlyClaimError` 文案友好化；发布链 `a49101a`→`1b80e6f`(assets)→`6fd166d`(registry)，生产热重载零重启，`/credits` 返回 `source=balance has_usage=True` 且用量真实。Bug 文档 `doc/4-bugs/2026-10-15_023000_zcode面板额度永远显示满额根因诊断.md`。
 

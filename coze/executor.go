@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -447,17 +449,44 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: payload})
 }
 
+// executorStreamRequest 是流式执行请求。
+//
+// 宿主在 ExecutorRequest 之外追加 stream_id / host_callback_id；
+// 没有 stream_id 说明宿主走同步收集路径，需要返回完整 chunk 列表。
+// [参数] 无。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，异步流式需要宿主 stream_id。
+type executorStreamRequest struct {
+	pluginapi.ExecutorRequest
+	StreamID       string `json:"stream_id,omitempty"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// streamResponse 是同步路径的流式响应。
+//
+// 宿主的 RPC 桥把 Chunks 定义成 slice 再转 channel；
+// 直接返回 channel 会让 JSON 序列化报
+// `json: unsupported type: <-chan pluginapi.ExecutorStreamChunk`。
+// [参数] 无。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，同步收集路径的响应结构。
+type streamResponse struct {
+	Headers http.Header                     `json:"headers,omitempty"`
+	Chunks  []pluginapi.ExecutorStreamChunk `json:"chunks,omitempty"`
+}
+
 // handleExecStream 处理流式执行请求。
 //
-// 返回的 channel 由宿主消费；每个 chunk 是一条完整的
-// `data: {...}\n\n` SSE 行（宿主负责加 [DONE]）。
+// 宿主提供 stream_id 时走异步：立刻返回响应头，再由后台协程用
+// `host.stream.emit` 逐帧推送，客户端才能看到真流式。没有 stream_id
+// 时退化为同步收集，一次性返回全部 chunk（宿主 RPC 的 slice 形态）。
 // [参数] raw: 宿主下发的 ExecutorRequest JSON。
 // [返回] 流式响应信封与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，流式入口。
+// 最近修改时间：2026-10-18；改动原因：改为宿主异步 emit，修复生产 JSON 序列化失败。
 func handleExecStream(raw []byte) ([]byte, error) {
-	var req pluginapi.ExecutorRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
+	var req executorStreamRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return nil, errUnmarshal
 	}
 
 	sa, errParse := parseStoredAuth(req.StorageJSON)
@@ -465,7 +494,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return nil, errParse
 	}
 
-	chatReq, errChat := parseChatRequest(executorRequestBody(req))
+	chatReq, errChat := parseChatRequest(executorRequestBody(req.ExecutorRequest))
 	if errChat != nil {
 		return nil, errChat
 	}
@@ -479,64 +508,143 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		model = chatReq.Model
 	}
 
-	chunks := make(chan pluginapi.ExecutorStreamChunk, 16)
-	response := pluginapi.ExecutorStreamResponse{
-		Headers: map[string][]string{
-			"Content-Type":  {"text/event-stream"},
-			"Cache-Control": {"no-cache"},
-		},
-		Chunks: chunks,
+	headers := streamHeaders()
+
+	// 同步路径：宿主没有给 stream_id，只能收集完再一次性返回。
+	if req.StreamID == "" {
+		chunks, errCollect := collectStreamChunks(sa, model, prompt)
+		if errCollect != nil {
+			return nil, errCollect
+		}
+		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
-	go func() {
-		defer close(chunks)
+	go pumpClawStream(req.StreamID, sa, model, prompt)
+	return okEnvelope(streamResponse{Headers: headers})
+}
 
-		ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
-		defer cancel()
+// streamHeaders 返回流式响应的公共头。
+// [参数] 无。
+// [返回] 响应头。
+// 最近修改时间：2026-10-18；改动原因：新增，异步与同步路径共用。
+func streamHeaders() http.Header {
+	return http.Header{
+		"Content-Type":      {"text/event-stream"},
+		"Cache-Control":     {"no-cache"},
+		"X-Accel-Buffering": {"no"},
+	}
+}
 
-		id := newCompletionID()
-		emit := func(delta string) error {
-			chunk, errBuild := buildChunk(id, model, delta, nil)
-			if errBuild != nil {
-				return errBuild
-			}
-			select {
-			case chunks <- pluginapi.ExecutorStreamChunk{Payload: chunk}:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+// streamEmit 向宿主推送一帧。
+//
+// payload 必须是裸 JSON 对象：宿主按请求格式决定是否补 `data: ` 前缀，
+// 插件提前加前缀会让 chat/completions 客户端收到双重包裹。
+// [参数] streamID: 宿主流标识；payload: 一帧内容。
+// [返回] 推送错误；客户端断开时宿主会返回错误，调用方据此停止上游读取。
+// 最近修改时间：2026-10-18；改动原因：新增，异步流式唯一出口。
+func streamEmit(streamID string, payload []byte) error {
+	body, errMarshal := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
+	if errMarshal != nil {
+		return errMarshal
+	}
+	_, errCall := hostCall(pluginabi.MethodHostStreamEmit, body)
+	return errCall
+}
+
+// streamClose 关闭宿主流。
+// [参数] streamID: 宿主流标识。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，异步流式收尾。
+func streamClose(streamID string) {
+	body, errMarshal := json.Marshal(map[string]any{"stream_id": streamID})
+	if errMarshal != nil {
+		return
+	}
+	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+}
+
+// pumpClawStream 在后台跑完一轮对话并逐帧推送。
+//
+// 为什么必须异步：宿主在拿到响应后立即开始向客户端转发，
+// 同步阻塞会让客户端在整轮对话期间收不到任何字节。
+// [参数] streamID: 宿主流标识；sa: 账号；model: 模型名；prompt: 用户提示。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，异步流式主循环。
+func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
+	defer streamClose(streamID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
+	defer cancel()
+
+	id := newCompletionID()
+	emit := func(delta string) error {
+		chunk, errBuild := buildChunk(id, model, delta, nil)
+		if errBuild != nil {
+			return errBuild
 		}
+		return streamEmit(streamID, chunk)
+	}
 
-		// 首帧声明 assistant 角色，部分客户端据此决定渲染方式。
-		if first, errFirst := buildFirstChunk(id, model); errFirst == nil {
-			select {
-			case chunks <- pluginapi.ExecutorStreamChunk{Payload: first}:
-			case <-ctx.Done():
-				return
-			}
+	// 首帧声明 assistant 角色，部分客户端据此决定渲染方式。
+	if first, errFirst := buildFirstChunk(id, model); errFirst == nil {
+		if errEmit := streamEmit(streamID, first); errEmit != nil {
+			return
 		}
+	}
 
-		exec := newCozeExecutor(sa, model, nil)
-		content, errRun := exec.runStream(ctx, prompt, emit)
+	exec := newCozeExecutor(sa, model, nil)
+	_, errRun := exec.runStream(ctx, prompt, emit)
 
-		finishReason := openAIFinishStop
-		if errRun != nil {
-			// 正文已泄漏时用 length 收尾：客户端保留已生成内容，
-			// 下游计费也能凭终态事件恢复（本仓库既有教训）。
-			finishReason = openAIFinishLength
+	finishReason := openAIFinishStop
+	if errRun != nil {
+		// 正文已泄漏时用 length 收尾：客户端保留已生成内容，
+		// 下游计费也能凭终态事件恢复（本仓库既有教训）。
+		finishReason = openAIFinishLength
+	}
+
+	if terminal, errTerminal := buildChunk(id, model, "", &finishReason); errTerminal == nil {
+		_ = streamEmit(streamID, terminal)
+	}
+}
+
+// collectStreamChunks 同步收集整轮对话的所有 chunk。
+//
+// 仅用于宿主没有提供 stream_id 的同步路径；代价是失去实时性，
+// 但比直接报错让请求失败更好。
+// [参数] sa: 账号；model: 模型名；prompt: 用户提示。
+// [返回] chunk 列表与错误。
+// 最近修改时间：2026-10-18；改动原因：新增，同步路径兜底。
+func collectStreamChunks(sa *StoredAuth, model, prompt string) ([]pluginapi.ExecutorStreamChunk, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
+	defer cancel()
+
+	id := newCompletionID()
+	chunks := make([]pluginapi.ExecutorStreamChunk, 0, 64)
+
+	if first, errFirst := buildFirstChunk(id, model); errFirst == nil {
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: first})
+	}
+
+	emit := func(delta string) error {
+		chunk, errBuild := buildChunk(id, model, delta, nil)
+		if errBuild != nil {
+			return errBuild
 		}
-		_ = content
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk})
+		return nil
+	}
 
-		if terminal, errTerminal := buildChunk(id, model, "", &finishReason); errTerminal == nil {
-			select {
-			case chunks <- pluginapi.ExecutorStreamChunk{Payload: terminal}:
-			case <-ctx.Done():
-			}
-		}
-	}()
+	exec := newCozeExecutor(sa, model, nil)
+	_, errRun := exec.runStream(ctx, prompt, emit)
 
-	return okEnvelope(response)
+	finishReason := openAIFinishStop
+	if errRun != nil {
+		finishReason = openAIFinishLength
+	}
+	if terminal, errTerminal := buildChunk(id, model, "", &finishReason); errTerminal == nil {
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: terminal})
+	}
+	return chunks, nil
 }
 
 // executorRequestBody 取执行请求的原始 OpenAI 请求体。

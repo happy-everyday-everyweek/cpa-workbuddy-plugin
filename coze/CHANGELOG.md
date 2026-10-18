@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1 (2026-10-18)
+
+### 修复
+
+- **流式请求 500：宿主 RPC 无法序列化 channel**。0.3.0 的
+  `handleExecStream` 把 `Chunks` 填成 `chan pluginapi.ExecutorStreamChunk`
+  直接返回，而宿主 `rpcExecutorStreamResponse.Chunks` 是 slice，RPC 桥在
+  JSON 序列化阶段就失败，客户端拿到
+  `{"error":{"message":"json: unsupported type: <-chan pluginapi.ExecutorStreamChunk"}}`，
+  生产实测 0 字节正文、0 个 chunk。
+  改为宿主提供的异步路径：带 `stream_id` 时立即返回响应头，由后台协程用
+  `host.stream.emit` 逐帧推送、`host.stream.close` 收尾；无 `stream_id`
+  时退化为同步收集，一次性返回 slice 形态的完整 chunk 列表。
+- **响应头补 `X-Accel-Buffering: no`**。缺这一项时反向代理会攒够缓冲才下发，
+  真流式在客户端表现为「长时间无输出后一次性蹦出全文」。
+
+### 测试
+
+- 新增 `TestStreamResponseSerializable`：锁定「流式响应必须可 JSON 序列化」
+  契约。变异回 channel 形态后该用例精确复现生产报错文案。
+- 新增 `TestStreamHeadersCarryNoBufferHint`：锁定 `text/event-stream` 与
+  `X-Accel-Buffering: no`。
+
 ## 0.3.0 (2026-10-18)
 
 ### 新增

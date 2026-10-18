@@ -406,3 +406,54 @@ func TestExecutorRequestBodyPreference(t *testing.T) {
 		t.Errorf("应当回退 Payload，实际 %q", got)
 	}
 }
+
+// TestStreamResponseSerializable 验证流式响应能被 JSON 序列化。
+//
+// 生产实测（2026-10-18）：直接把 channel 塞进 ExecutorStreamResponse
+// 会让宿主 RPC 报 `json: unsupported type: <-chan ...`，请求直接 500。
+// 这里锁定契约：信封里的 Chunks 必须是 slice。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，生产缺陷回归。
+func TestStreamResponseSerializable(t *testing.T) {
+	resp := streamResponse{
+		Headers: streamHeaders(),
+		Chunks: []pluginapi.ExecutorStreamChunk{
+			{Payload: []byte(`{"id":"c1"}`)},
+			{Payload: []byte(`{"id":"c2"}`)},
+		},
+	}
+	raw, errMarshal := json.Marshal(resp)
+	if errMarshal != nil {
+		t.Fatalf("流式响应必须可序列化，实际报错：%v", errMarshal)
+	}
+	var back struct {
+		Chunks []pluginapi.ExecutorStreamChunk `json:"chunks"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &back); errUnmarshal != nil {
+		t.Fatalf("回读失败：%v", errUnmarshal)
+	}
+	if len(back.Chunks) != 2 {
+		t.Errorf("chunks 数量 = %d，期望 2", len(back.Chunks))
+	}
+	if got := string(back.Chunks[0].Payload); got != `{"id":"c1"}` {
+		t.Errorf("首帧 = %q", got)
+	}
+}
+
+// TestStreamHeadersCarryNoBufferHint 验证流式响应头关闭中间层缓冲。
+//
+// 缺 X-Accel-Buffering 时 nginx 会攒够缓冲才下发，
+// 客户端表现为「卡住很久再一次性蹦出全部内容」。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，真流式前置条件。
+func TestStreamHeadersCarryNoBufferHint(t *testing.T) {
+	h := streamHeaders()
+	if got := h.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := h.Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q，期望 no", got)
+	}
+}
