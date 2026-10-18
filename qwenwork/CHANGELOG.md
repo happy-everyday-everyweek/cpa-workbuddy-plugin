@@ -1,5 +1,18 @@
 # QwenWork Plugin Changelog
 
+## 0.2.8
+
+### Fix - 流式 usage 帧被吞致下游全部记 $0；刷新路径补生命周期对账
+
+- 变更要点:
+  1. **0 计费根因**：上游把计费 usage 挂在 `choices[0].delta` 为 `{}`、且没有 `finish_reason` 的终止 chunk 上（`{"choices":[{"delta":{},"index":0}],"usage":{...}}`）。`cleanChunkJSON` 的「全空 delta 整帧丢弃」规则命中该帧，把它当噪声丢掉，于是下游（new-api 等）收到的流里完全没有 token 数，逐条记 `$0`。
+  2. 直连上游实测确认上游确有该帧（`usage_frames=1`），而 CPA 输出流里最后一帧是 `finish_reason:stop` 后直接 `[DONE]`，`stream_options.include_usage:true` 也拿不到——证明是插件侧丢弃，不是上游不给。
+  3. 修复：`delta` 为空且无 `finish_reason` 时，若 chunk 顶层存在 `usage` 则保留整帧（仍清理空 `tool_calls`/`function_call` 噪声），否则维持丢弃。异步 `streamEmit` 与同步 `collectUpstreamStreamOpenAI` 两条路径共用该函数，一处修复双路生效。
+  4. **刷新路径缺生命周期对账**：`doFetchOne` 只刷新积分缓存，不触发 `reconcileOneAccount`，导致开启 `lifecycle_auto` 后耗尽账号仍不会被停用（只有面板 force 加载与保活时刻才跑对账）。现于刷新完成后立即对账（非 force，复用刚写入的缓存，不产生第二次上游请求）。
+- 验证: `cleanchunk_test.go` 新增 5 个用例（usage 终止帧保留、带空壳噪声仍保留、纯空帧仍丢弃、finish_reason 帧保留、role 首帧保留）；cgo-shim build/vet/test 全绿；**变异反证**：把 usage 分支改回无条件丢弃 → `TestCleanChunkJSONKeepsUsageOnlyFrame` 与 `TestCleanChunkJSONKeepsUsageWithNoiseFields` 精确 FAIL，还原后全绿。
+- 首字延迟说明: 生产 feed 实测 104s TTFT 对应输入 **388,677 tokens**（同一会话逐轮累积，每轮 +300~5000），属上游预填充耗时，非插件开销；同会话输入涨到 31 万后单轮 TTFT 稳定在 7~12s。
+- 涉及文件: qwenwork/stream.go、qwenwork/refresh_runner.go、qwenwork/cleanchunk_test.go、qwenwork/VERSION、qwenwork/CHANGELOG.md、qwenwork/main.go
+
 ## 0.2.7
 
 ### Fix - 额度耗尽账号自动禁用并对齐面板展示（推翻「0 积分仍可用免费模型」前提）

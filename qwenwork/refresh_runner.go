@@ -301,6 +301,9 @@ func doFetchOne(authIndex, authID string) error {
 			return errors.New(e)
 		}
 	}
+	// 刷新后立即对账：耗尽账号在此自动停用，充值后自动恢复。非 force
+	// 复用刚写入的 credits 缓存，不产生第二次上游请求。
+	_, _ = reconcileOneAccount(authIndex, authID, false)
 	// QwenWork 后台刷新严禁自动触发探活推理，避免无意义消耗用户配额。
 	return nil
 }
