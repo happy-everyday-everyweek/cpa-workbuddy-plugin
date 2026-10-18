@@ -1,131 +1,289 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Notion Provider</title>
 <style>
-  :root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --panel-2: #1e222b;
-    --border: #2a2f3a;
-    --text: #e6e8ee;
-    --muted: #9aa3b2;
-    --accent: #6ea8fe;
-    --ok: #3fb950;
-    --warn: #d29922;
-    --err: #f85149;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 24px;
-    background: var(--bg); color: var(--text);
-    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-  }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; padding: 16px; margin-bottom: 16px;
-  }
-  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
-  input, textarea, select {
-    width: 100%; background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px;
-    padding: 9px 10px; font: inherit; outline: none;
-  }
-  textarea { min-height: 82px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
-  input:focus, textarea:focus, select:focus { border-color: var(--accent); }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
-  .row > .grow { flex: 1 1 240px; }
-  button {
-    background: var(--accent); color: #06121f; border: 0;
-    border-radius: 6px; padding: 9px 16px; font: inherit; font-weight: 600;
-    cursor: pointer;
-  }
-  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); font-weight: 500; }
-  button.danger { background: transparent; color: var(--err); border: 1px solid var(--border); font-weight: 500; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; }
-  tr:last-child td { border-bottom: 0; }
-  .tag {
-    display: inline-block; padding: 1px 8px; border-radius: 999px;
-    font-size: 11px; border: 1px solid var(--border); color: var(--muted);
-  }
-  .tag.ok { color: var(--ok); border-color: rgba(63,185,80,.4); }
-  .tag.err { color: var(--err); border-color: rgba(248,81,73,.4); }
-  .tag.warn { color: var(--warn); border-color: rgba(210,153,34,.4); }
-  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
-  .log {
-    margin-top: 12px; padding: 10px 12px; border-radius: 6px;
-    background: var(--panel-2); border: 1px solid var(--border);
-    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
-    white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto;
-  }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  .spaces { margin-top: 6px; }
-  .space-item { font-size: 12px; color: var(--muted); }
-  .space-item b { color: var(--text); font-weight: 600; }
+/* 主题令牌与 CPA 管理台对齐：默认 :root 为纸感亮色，data-theme=white|dark 覆盖，
+   嵌入 iframe 时镜像父级 data-theme。 */
+:root{
+  --bg:#faf9f5;--card:#ffffff;--border:#e3e1db;--fg:#2d2a26;--mut:#6d6760;
+  --acc:#4c8dff;--on-acc:#ffffff;--ok:#10b981;--warn:#e0aa14;--err:#c65746;
+  --surface:#f0eee8;--surface-muted:#e9e6df;--btn-sec:#eef1f6;--btn-sec-hover:#e4e8ef;
+  --input-bg:#ffffff;--code-bg:#f3f4f6;--code-fg:#374151;--placeholder:rgba(109,103,96,.55);
+  --ok-soft:rgba(16,185,129,.10);--ok-border:rgba(16,185,129,.30);
+  --warn-soft:rgba(224,170,20,.12);--warn-border:rgba(224,170,20,.32);
+  --err-soft:rgba(198,87,70,.10);--err-border:rgba(198,87,70,.30);
+  --mut-soft:rgba(109,103,96,.12);--mut-border:rgba(109,103,96,.28);
+  --scrim:rgba(45,42,38,.35);--toast-shadow:0 10px 28px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.04);
+  --modal-shadow:0 24px 56px rgba(0,0,0,.18),0 0 0 1px rgba(0,0,0,.04);
+  --acc-ring:rgba(76,141,255,.18);--radius-md:12px;--radius-lg:16px;
+  color-scheme:light
+}
+:root[data-theme="white"]{
+  --bg:#f5f5f5;--card:#ffffff;--border:#e6e6e6;--fg:#1f1f1f;--mut:#707070;
+  --surface:#fafafa;--surface-muted:#efefef;--btn-sec:#f0f0f0;--btn-sec-hover:#e8e8e8;
+  --input-bg:#ffffff;--code-bg:#f3f4f6;--code-fg:#374151;--placeholder:rgba(112,112,112,.55);
+  --scrim:rgba(0,0,0,.32);--toast-shadow:0 10px 28px rgba(0,0,0,.10),0 0 0 1px rgba(0,0,0,.04);
+  --modal-shadow:0 24px 56px rgba(0,0,0,.16),0 0 0 1px rgba(0,0,0,.04);
+  color-scheme:light
+}
+:root[data-theme="dark"]{
+  --bg:#1e1d1b;--card:#26241f;--border:#3a3833;--fg:#ede9e3;--mut:#9a948c;
+  --acc:#4c8dff;--on-acc:#ffffff;--ok:#34d399;--warn:#f0c050;--err:#e07a6a;
+  --surface:#2f2d28;--surface-muted:#35332e;--btn-sec:#35332e;--btn-sec-hover:#3f3c36;
+  --input-bg:#1e1d1b;--code-bg:#35332e;--code-fg:#d6d1c9;--placeholder:rgba(154,148,140,.55);
+  --ok-soft:rgba(52,211,153,.12);--ok-border:rgba(52,211,153,.38);
+  --warn-soft:rgba(240,192,80,.14);--warn-border:rgba(240,192,80,.38);
+  --err-soft:rgba(224,122,106,.12);--err-border:rgba(224,122,106,.38);
+  --mut-soft:rgba(154,148,140,.16);--mut-border:rgba(154,148,140,.32);
+  --scrim:rgba(0,0,0,.55);--toast-shadow:0 10px 28px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.03);
+  --modal-shadow:0 24px 56px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.04);
+  --acc-ring:rgba(76,141,255,.28);
+  color-scheme:dark
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1400px;margin:0 auto;padding:24px 20px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--mut);font-size:13px;margin-bottom:20px}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+button{background:var(--acc);color:var(--on-acc);border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px;font-family:inherit}
+button.sec{background:var(--btn-sec);color:var(--fg)}
+button.sec:hover{background:var(--btn-sec-hover)}
+button:disabled{opacity:.5;cursor:default}
+button.done{background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border);cursor:default;opacity:1}
+button.danger{background:var(--err-soft);color:var(--err);border:1px solid var(--err-border)}
+button.danger:hover{background:var(--err);color:#fff}
+.bar .search{max-width:220px;flex:0 1 220px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--fg);font-size:13px;outline:none}
+.bar .search:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-ring)}
+.bar .search::placeholder{color:var(--placeholder)}
+.bar .sort-btn{font-size:13px;white-space:nowrap}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+@media (max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:720px){.grid{grid-template-columns:1fr}}
+.card,.summary{background:var(--card);border:1px solid var(--border);border-radius:12px}
+.card{padding:16px;display:flex;flex-direction:column}
+.card.disabled{opacity:.72}
+.card h2{font-size:15px;margin:0 0 2px;display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.card h2 .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badges{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end;flex:none}
+.uid{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px}
+.uid.gap{margin-bottom:12px}
+.badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border);white-space:nowrap}
+.badge.off{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border)}
+.badge.plan{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-border)}
+.badge.space{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border);font-weight:500}
+.card-del{background:transparent;color:var(--mut);border:0;padding:2px 7px;font-size:16px;line-height:1;border-radius:6px;cursor:pointer;flex:none}
+.card-del:hover{background:var(--err-soft);color:var(--err)}
+.pb{margin:10px 0 2px}
+.pb-label{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin-bottom:6px}
+.pb-track{height:8px;background:var(--surface-muted);border-radius:99px;overflow:hidden}
+.pb-bar{height:100%;background:var(--ok);border-radius:99px;transition:width .6s ease}
+.pb-meta{font-size:11px;color:var(--mut);margin-top:6px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px dashed var(--border);font-size:13px}
+.row:first-of-type{border-top:0}
+.row .k{color:var(--mut);flex:none}
+.row .v{font-weight:600;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .v.ok{color:var(--ok)}.row .v.warn{color:var(--warn)}.row .v.err{color:var(--err)}
+.space-line{font-size:11px;color:var(--mut);line-height:1.6;word-break:break-all;margin-top:2px}
+.space-line b{color:var(--fg);font-weight:600}
+.space-line .cur{color:var(--acc);font-weight:600}
+.actions{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
+.summary{padding:16px;margin-bottom:14px}
+.summary-hd{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.summary-title{font-weight:700;font-size:14px}
+.summary-meta{color:var(--mut);font-size:12px}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.summary-item{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+.summary-item .k{color:var(--mut);font-size:11px;margin-bottom:4px}
+.summary-item .v{font-size:18px;font-weight:700}
+.summary-item .v.ok{color:var(--ok)}.summary-item .v.warn{color:var(--warn)}.summary-item .v.err{color:var(--err)}
+.toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:10px;z-index:9999;max-width:360px}
+.toast{background:var(--card);border:1px solid var(--border);border-left:4px solid var(--acc);border-radius:var(--radius-md);padding:14px 18px;font-size:13px;box-shadow:var(--toast-shadow);transform:translateX(120%);opacity:0;transition:transform .3s cubic-bezier(.2,.9,.3,1.1),opacity .25s;cursor:pointer;word-break:break-all}
+.toast.show{transform:translateX(0);opacity:1}
+.toast.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+.toast.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.toast.err{border-left-color:var(--err);background:var(--err-soft)}
+.toast .t{font-weight:600;margin-bottom:3px}
+.toast .d{color:var(--mut);font-size:12px;line-height:1.45}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--on-acc);border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.loading{color:var(--mut);text-align:center;padding:40px;grid-column:1/-1}
+.modal-mask{position:fixed;inset:0;background:var(--scrim);display:none;align-items:center;justify-content:center;z-index:9000;padding:16px;backdrop-filter:blur(2px)}
+.modal-mask.show{display:flex}
+.modal{background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:var(--radius-lg);width:min(600px,100%);max-height:min(90vh,680px);display:flex;flex-direction:column;box-shadow:var(--modal-shadow)}
+.modal-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.modal-hd h2{font-size:15px;margin:0;color:var(--fg);font-weight:600}
+.modal-x{background:transparent;color:var(--mut);padding:4px 10px;font-size:18px;line-height:1}
+.modal-x:hover{color:var(--fg);background:var(--surface-muted)}
+.modal-bd{padding:16px;overflow:auto}
+.modal-bd .hint{color:var(--mut);font-size:12px;margin:0 0 10px;line-height:1.5}
+.modal-bd .hint code{background:var(--code-bg);color:var(--code-fg);padding:1px 5px;border-radius:4px;font-size:11px}
+.modal-bd label{display:block;font-size:12px;color:var(--mut);margin:12px 0 6px}
+.modal-bd input,.modal-bd textarea{width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--fg);font-family:inherit;font-size:13px;outline:none}
+.modal-bd textarea{min-height:140px;font:12px/1.45 ui-monospace,monospace;resize:vertical}
+.modal-bd input:focus,.modal-bd textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-ring)}
+.modal-bd input::placeholder,.modal-bd textarea::placeholder{color:var(--placeholder)}
+.modal-ft{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--border);background:var(--surface);border-radius:0 0 var(--radius-lg) var(--radius-lg)}
+.modal-ft button.sec{background:var(--btn-sec);color:var(--fg)}
+.modal-ft button.sec:hover{background:var(--btn-sec-hover)}
+.model-list{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto;border:1px dashed var(--border);border-radius:8px;padding:6px}
+.model-item{display:block;width:100%;text-align:left;background:var(--btn-sec);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:13px;cursor:pointer;word-break:break-all}
+.model-item:hover{background:var(--btn-sec-hover);border-color:var(--acc)}
+.model-item:disabled{opacity:.5;cursor:default}
+.model-item .code{font-family:ui-monospace,monospace;font-size:12px}
+.model-item .disp{color:var(--mut);font-size:11px;margin-top:2px}
+.result{margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;display:none;line-height:1.5;word-break:break-all}
+.result.show{display:block}
+.result.ok{border-color:var(--ok-border);background:var(--ok-soft)}
+.result.err{border-color:var(--err-border);background:var(--err-soft)}
+.result .t{font-weight:600;margin-bottom:4px}
 </style>
+<script>
+/* 早期主题同步（body 绘制前执行）：嵌入时镜像 CPA 父级 data-theme，
+   独立打开回退系统偏好。DOM 上的 data-theme 是唯一事实来源。 */
+(function(){
+  var ATTR="data-theme";
+  function embedded(){try{return window.self!==window.top}catch(e){return false}}
+  function apply(t){
+    var el=document.documentElement;
+    if(t==="white"||t==="dark")el.setAttribute(ATTR,t);
+    else el.removeAttribute(ATTR);
+  }
+  function parentTheme(){
+    if(!embedded())return null;
+    try{
+      var raw=window.parent.document.documentElement.getAttribute(ATTR);
+      if(raw==="white"||raw==="dark")return raw;
+      return "light";
+    }catch(e){return null}
+  }
+  function systemTheme(){
+    try{return window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}catch(e){return "light"}
+  }
+  function sync(){apply(parentTheme()||systemTheme())}
+  sync();
+  window.__ntThemeSync=function(){
+    sync();
+    if(!embedded()){
+      try{
+        var mq=window.matchMedia("(prefers-color-scheme: dark)");
+        var on=function(){sync()};
+        if(mq.addEventListener)mq.addEventListener("change",on);
+        else if(mq.addListener)mq.addListener(on);
+      }catch(e){}
+      return;
+    }
+    try{
+      var parentEl=window.parent.document.documentElement;
+      new MutationObserver(sync).observe(parentEl,{attributes:true,attributeFilter:[ATTR]});
+      window.addEventListener("storage",function(e){if(e.key==="cli-proxy-theme")sync()});
+    }catch(e){}
+  };
+})();
+</script>
 </head>
 <body>
+<div class="wrap">
+  <h1>Notion AI 账号面板</h1>
+  <div class="sub">多工作空间额度 · 订阅积分 · 账号池与阶梯冷却故障转移</div>
 
-<h1>Notion Provider</h1>
-<div class="sub">把 Notion AI 的模型能力接入 CPA。非官方逆向实现，仅建议自用。</div>
-
-<div class="panel" id="authBox" style="display:none;border-color:rgba(210,153,34,.5)">
-  <h2>管理密钥</h2>
-  <div class="hint" style="margin:0 0 10px">数据接口需要 management key。从 CPA 主面板嵌入时会自动获取；独立打开时请在此填写（只存 sessionStorage，不落盘）。</div>
-  <div class="row">
-    <div class="grow">
-      <label for="keyInput">management key</label>
-      <input id="keyInput" type="password" autocomplete="off" placeholder="粘贴 CPA 的管理密钥">
+  <div id="authBox" class="card" style="display:none;margin-bottom:16px">
+    <div style="margin-bottom:8px;color:var(--mut)">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。</div>
+    <div style="display:flex;gap:8px">
+      <input id="keyInput" type="password" placeholder="management key" style="flex:1;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--fg);outline:none">
+      <button onclick="saveKey()">连接</button>
     </div>
-    <button id="keyBtn">保存并加载</button>
   </div>
+
+  <div class="bar">
+    <button id="importBtn" onclick="openImportModal()">导入账号</button>
+    <button class="sec" onclick="loadAll(this)">刷新</button>
+    <input id="searchInput" class="search" type="search" placeholder="搜索备注 / 账号 / 空间" oninput="onSearchChange(this.value)" autocomplete="off">
+    <button class="sec sort-btn" id="sortBtn" onclick="toggleSort()" title="按当前空间订阅额度排序">额度 ↓</button>
+  </div>
+
+  <div class="summary" id="summaryBox" style="display:none"></div>
+  <div id="grid" class="grid"><div class="loading">加载中…</div></div>
 </div>
 
-<div class="panel">
-  <h2>导入账号</h2>
-  <label for="cookie">Cookie header（浏览器开发者工具 → Network → 任意请求 → Request Headers → Cookie）</label>
-  <textarea id="cookie" placeholder="token_v2=...; notion_user_id=...; notion_browser_id=..."></textarea>
-  <div class="row" style="margin-top:10px">
-    <div class="grow">
+<div class="modal-mask" id="importModal" onclick="onMaskClick(event,'importModal')">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="importModalTitle">
+    <div class="modal-hd">
+      <h2 id="importModalTitle">导入 Notion 账号</h2>
+      <button type="button" class="modal-x" onclick="closeModal('importModal')" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint">在浏览器打开 Notion，开发者工具 → Network → 任意请求 → Request Headers 里的完整 <code>Cookie</code>。导入会先校验登录态与工作空间，成功才落盘。</p>
+      <label for="cookie">Cookie header</label>
+      <textarea id="cookie" placeholder="token_v2=...; notion_user_id=...; notion_browser_id=..."></textarea>
       <label for="label">备注名（可空）</label>
       <input id="label" placeholder="例如：主账号">
-    </div>
-    <div class="grow">
       <label for="spaceId">指定工作空间 id（可空，默认选额度最高的）</label>
       <input id="spaceId" placeholder="留空自动选择">
+      <p class="hint" style="margin-top:12px">Notion 把 AI 权限绑定到登录 IP，请在本机导出 Cookie。</p>
     </div>
-    <button id="importBtn">导入并探活</button>
+    <div class="modal-ft">
+      <button type="button" class="sec" onclick="closeModal('importModal')">取消</button>
+      <button type="button" id="importConfirmBtn" onclick="importAccount(this)">导入并探活</button>
+    </div>
   </div>
-  <div class="hint">导入会先校验登录态与工作空间，成功才落盘。Notion 把 AI 权限绑定到登录 IP，请在本机导出 Cookie。</div>
-  <div id="importLog" class="log" style="display:none"></div>
 </div>
 
-<div class="panel">
-  <h2>账号列表</h2>
-  <table>
-    <thead>
-      <tr>
-        <th style="width:22%">账号</th>
-        <th style="width:20%">工作空间</th>
-        <th style="width:22%">额度</th>
-        <th style="width:12%">状态</th>
-        <th>操作</th>
-      </tr>
-    </thead>
-    <tbody id="accounts">
-      <tr><td colspan="5" class="mono">加载中…</td></tr>
-    </tbody>
-  </table>
-  <div id="actionLog" class="log" style="display:none"></div>
+<div class="modal-mask" id="spaceModal" onclick="onMaskClick(event,'spaceModal')">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="spaceModalTitle">
+    <div class="modal-hd">
+      <h2 id="spaceModalTitle">切换工作空间</h2>
+      <button type="button" class="modal-x" onclick="closeModal('spaceModal')" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint">切换后旧会话线程会被整批清理，避免续写落到错误空间。</p>
+      <div class="model-list" id="spaceList"></div>
+      <div class="result" id="spaceResult"></div>
+    </div>
+    <div class="modal-ft">
+      <button type="button" class="sec" onclick="closeModal('spaceModal')">关闭</button>
+    </div>
+  </div>
 </div>
+
+<div class="modal-mask" id="testModal" onclick="onMaskClick(event,'testModal')">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="testModalTitle">
+    <div class="modal-hd">
+      <h2 id="testModalTitle">测试模型</h2>
+      <button type="button" class="modal-x" onclick="closeModal('testModal')" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint">选择要测试的模型。测试会走真实推理链路并发起一次最小请求。</p>
+      <div class="model-list" id="testModelList"><div class="loading">加载模型中…</div></div>
+      <div class="result" id="testResult"></div>
+    </div>
+    <div class="modal-ft">
+      <button type="button" class="sec" onclick="closeModal('testModal')">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="deleteModal" onclick="onMaskClick(event,'deleteModal')">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+    <div class="modal-hd">
+      <h2 id="deleteModalTitle">删除账号</h2>
+      <button type="button" class="modal-x" onclick="closeModal('deleteModal')" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint" id="deleteModalHint">确定要删除该账号吗？</p>
+      <p class="hint" style="color:var(--err)">此操作会永久删除该账号的凭据文件，且不可恢复。</p>
+    </div>
+    <div class="modal-ft">
+      <button type="button" class="sec" onclick="closeModal('deleteModal')">取消</button>
+      <button type="button" class="danger" id="deleteConfirmBtn" onclick="confirmDelete()">删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
 
 <script>
 // API 前缀必须与 plugin id 完全一致，否则管理路由 404。
@@ -135,46 +293,38 @@ const API = '/v0/management/plugins/notion-provider';
    1) CPA 主面板 localStorage "cli-proxy-auth"（XOR + base64，同源 iframe 嵌入）；
    2) ?key= URL 参数（读取后立即从地址栏抹掉，存入 sessionStorage）；
    3) 手工输入（仅存 sessionStorage，不持久化到磁盘）。
-   资源页 /v0/resource/... 免密钥放行，但数据接口仍校验 management key，
-   因此面板必须自己拿到密钥，不能指望浏览器自动带上。 */
+   资源页 /v0/resource/... 免密钥放行，但数据接口仍校验 management key。 */
 const ENC_PREFIX = 'enc::v1::';
 const SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
 const PANEL_STORE = 'cli-proxy-auth';
 const SS_KEY = 'notion-mgmt-key';
 
-// enc/dec 在编码后的 localStorage 值与明文之间转换。
-function enc(t) { return new TextEncoder().encode(t); }
-function dec(b) { return new TextDecoder().decode(b); }
-
-// keyBytes 派生 XOR 密钥：与 CPA 主面板同源同 UA 才解得开。
-function keyBytes() {
-  try { return enc(SECRET_SALT + '|' + window.location.host + '|' + navigator.userAgent); }
-  catch (e) { return enc(SECRET_SALT); }
+function _enc(t){ return new TextEncoder().encode(t); }
+function _dec(b){ return new TextDecoder().decode(b); }
+function keyBytes(){
+  try { return _enc(SECRET_SALT + '|' + window.location.host + '|' + navigator.userAgent); }
+  catch (e) { return _enc(SECRET_SALT); }
 }
-function xorBytes(d, k) {
+function xorBytes(d, k){
   const r = new Uint8Array(d.length);
   for (let i = 0; i < d.length; i++) r[i] = d[i] ^ k[i % k.length];
   return r;
 }
-function b64decode(s) {
+function b64decode(s){
   const bin = atob(s);
   const b = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
   return b;
 }
-
-// deobfuscate 解开主面板的 enc::v1:: 前缀；非该形态按明文返回。
-function deobfuscate(p) {
+function deobfuscate(p){
   if (!p || !p.startsWith(ENC_PREFIX)) return p;
-  try { return dec(xorBytes(b64decode(p.slice(ENC_PREFIX.length)), keyBytes())); }
+  try { return _dec(xorBytes(b64decode(p.slice(ENC_PREFIX.length)), keyBytes())); }
   catch (e) { return p; }
 }
-function isEmbedded() {
+function isEmbedded(){
   try { return window.self !== window.top; } catch (e) { return false; }
 }
-
-// readPanelKey 从主面板 localStorage 取密钥，仅在同源 iframe 嵌入时有意义。
-function readPanelKey() {
+function readPanelKey(){
   if (!isEmbedded()) return null;
   let raw;
   try { raw = localStorage.getItem(PANEL_STORE); } catch (e) { return null; }
@@ -185,9 +335,7 @@ function readPanelKey() {
     return typeof st.managementKey === 'string' && st.managementKey ? st.managementKey : null;
   } catch (e) { return null; }
 }
-
-// readUrlKey 读取 ?key= 并立即从地址栏抹掉，避免密钥留在历史记录里。
-function readUrlKey() {
+function readUrlKey(){
   const m = new URLSearchParams(window.location.search).get('key');
   if (m) {
     try {
@@ -198,44 +346,40 @@ function readUrlKey() {
   }
   return m;
 }
-function persistKey(k) {
+function persistKey(k){
   if (!k) return k;
   try { sessionStorage.setItem(SS_KEY, k); } catch (e) { /* 隐私模式忽略 */ }
   return k;
 }
-function getKey() {
+function getKey(){
   let stored = null;
   try { stored = sessionStorage.getItem(SS_KEY); } catch (e) { /* ignore */ }
   return stored || persistKey(readPanelKey()) || persistKey(readUrlKey());
 }
-function authHeaders() {
+function authHeaders(){
   const key = getKey();
   const h = { 'Content-Type': 'application/json' };
   if (key) h['Authorization'] = 'Bearer ' + key;
   return h;
 }
-
-// showAuth 展示密钥输入框。
-function showAuth() {
+function showAuth(){
   const box = document.getElementById('authBox');
   if (!box) return;
   box.style.display = 'block';
   const i = document.getElementById('keyInput');
   if (i) i.focus();
 }
-
-// saveKey 保存手填密钥并重新加载。
-function saveKey() {
+function saveKey(){
   const i = document.getElementById('keyInput');
   const v = i ? i.value.trim() : '';
   if (!v) return;
   try { sessionStorage.setItem(SS_KEY, v); } catch (e) { /* ignore */ }
   document.getElementById('authBox').style.display = 'none';
-  loadAccounts();
+  loadAll();
 }
 
 // request 统一封装管理接口调用；鉴权失败时弹出密钥输入框。
-async function request(path, options = {}) {
+async function request(path, options = {}){
   const resp = await fetch(API + path, {
     ...options,
     credentials: 'omit',
@@ -252,78 +396,233 @@ async function request(path, options = {}) {
   return data;
 }
 
-// log 在指定容器里追加一行。
-function log(el, message) {
-  el.style.display = 'block';
-  const time = new Date().toLocaleTimeString();
-  el.textContent = '[' + time + '] ' + message + '\n' + el.textContent;
+// toast 在右上角弹出通知；kind 取 ok / warn / err。
+function toast(title, kind = 'ok', detail = ''){
+  const box = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.innerHTML = '<div class="t"></div>' + (detail ? '<div class="d"></div>' : '');
+  el.querySelector('.t').textContent = title;
+  if (detail) el.querySelector('.d').textContent = detail;
+  box.appendChild(el);
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
+  const kill = () => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); };
+  el.onclick = kill;
+  setTimeout(kill, kind === 'err' ? 6000 : 4000);
+  while (box.children.length > 5) box.firstChild.remove();
 }
 
-// escapeHTML 防止账号名等用户输入被当成 HTML 注入。
-function escapeHTML(s) {
+// busy 在按钮上展示加载态并保留原文案。
+function busy(btn, on){
+  if (!btn) return;
+  if (on) {
+    btn.dataset.orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin"></span>处理中…';
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.orig) btn.innerHTML = btn.dataset.orig;
+  }
+}
+
+// esc 防止账号备注、空间名等用户输入被当成 HTML 注入。
+function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
 
-// renderSpaces 渲染账号下的工作空间与额度。
-function renderSpaces(spaces, current) {
-  if (!spaces || !spaces.length) return '<span class="mono">—</span>';
-  return '<div class="spaces">' + spaces.map(s => {
-    const active = s.id === current;
-    const premium = s.premium_credits || 0;
-    const plan = s.plan_type ? escapeHTML(s.plan_type) : '';
-    return '<div class="space-item">'
-      + (active ? '● ' : '○ ')
-      + '<b>' + escapeHTML(s.name) + '</b>'
-      + (plan ? ' ' + plan : '')
-      + ' · 订阅额度 ' + premium
-      + (s.basic_limit ? ' · 基础 ' + (s.basic_usage || 0) + '/' + s.basic_limit : '')
-      + '</div>';
-  }).join('') + '</div>';
+// fmtCST 统一按北京时间展示时间戳。
+function fmtCST(s){
+  if (!s) return '';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return String(s);
+  return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replaceAll('/', '-');
 }
 
-// loadAccounts 拉取并渲染账号列表。
-async function loadAccounts() {
-  const tbody = document.getElementById('accounts');
+function openModal(id){ const el = document.getElementById(id); if (el) el.classList.add('show'); }
+function closeModal(id){ const el = document.getElementById(id); if (el) el.classList.remove('show'); }
+function onMaskClick(event, id){ if (event.target === event.currentTarget) closeModal(id); }
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-mask.show').forEach(m => m.classList.remove('show'));
+});
+
+// activeSpace 取账号当前选中的工作空间对象。
+function activeSpace(a){
+  const list = a.spaces || [];
+  return list.find(s => s.id === a.space_id) || list[0] || null;
+}
+
+// premiumOf 取账号当前空间的订阅额度。
+function premiumOf(a){
+  const s = activeSpace(a);
+  return s ? (Number(s.premium_credits) || 0) : 0;
+}
+
+// basicHTML 渲染基础消息额度进度条（有真实上限，才适合做百分比）。
+function basicHTML(space){
+  if (!space) return '';
+  const limit = Number(space.basic_limit) || 0;
+  const used = Number(space.basic_usage) || 0;
+  const pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
+  let color = 'var(--ok)';
+  if (pct > 60) color = 'var(--warn)';
+  if (pct > 85) color = 'var(--err)';
+  const when = space.usage_checked_at ? ' · 快照 ' + esc(fmtCST(space.usage_checked_at)) : '';
+  return '<div class="pb">'
+    + '<div class="pb-label"><span>基础消息额度</span><span>' + used + ' / ' + limit + ' · ' + pct + '%</span></div>'
+    + '<div class="pb-track"><div class="pb-bar" style="width:' + pct + '%;background:' + color + '"></div></div>'
+    + '<div class="pb-meta">订阅额度 ' + (Number(space.premium_credits) || 0) + ' · 已用 ' + used + ' / 上限 ' + limit + when + '</div>'
+    + '</div>';
+}
+
+// spacesHTML 列出账号下全部工作空间，标出当前选中项。
+function spacesHTML(a){
+  const list = a.spaces || [];
+  if (!list.length) return '<div class="space-line">无工作空间信息</div>';
+  return list.map(s => {
+    const cur = s.id === a.space_id;
+    return '<div class="space-line">'
+      + (cur ? '<span class="cur">●</span> ' : '○ ')
+      + '<b>' + esc(s.name || s.id) + '</b>'
+      + (s.plan_type ? ' · ' + esc(s.plan_type) : '')
+      + ' · 订阅 ' + (Number(s.premium_credits) || 0)
+      + ' · 基础 ' + (Number(s.basic_usage) || 0) + '/' + (Number(s.basic_limit) || 0)
+      + '</div>';
+  }).join('');
+}
+
+// card 渲染一张账号卡片。
+function card(a){
+  const space = activeSpace(a);
+  const plan = space && space.plan_type ? esc(space.plan_type) : '';
+  const badges = (a.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge">启用中</span>')
+    + (plan ? '<span class="badge plan">' + plan + '</span>' : '')
+    + '<span class="badge space">' + (a.spaces || []).length + ' 空间</span>';
+  const toggleLabel = a.disabled ? '启用' : '禁用';
+  const updated = a.updated_at ? '<div class="uid">更新 ' + esc(fmtCST(a.updated_at)) + '</div>' : '';
+  return '<div class="card' + (a.disabled ? ' disabled' : '') + '" data-auth="' + esc(a.auth_id) + '">'
+    + '<h2><span class="name" title="' + esc(a.label) + '">' + esc(a.label || a.auth_id) + '</span>'
+    + '<span class="badges">' + badges
+    + '<button type="button" class="card-del" data-action="delete" title="删除账号" aria-label="删除账号">×</button>'
+    + '</span></h2>'
+    + '<div class="uid">' + esc(a.auth_id) + ' · ' + esc(a.user_id) + '</div>'
+    + updated
+    + basicHTML(space)
+    + '<div class="row"><span class="k">当前空间</span><span class="v" title="' + esc(a.space_name) + '">' + esc(a.space_name || '-') + '</span></div>'
+    + '<div class="row"><span class="k">订阅额度</span><span class="v ' + (premiumOf(a) > 0 ? 'ok' : 'warn') + '">' + premiumOf(a) + '</span></div>'
+    + spacesHTML(a)
+    + '<div class="actions">'
+    + '<button class="sec" data-action="test">测试</button>'
+    + '<button class="sec" data-action="spaces"' + ((a.spaces || []).length < 2 ? ' disabled' : '') + '>切换空间</button>'
+    + '<button class="sec" data-action="toggle" data-disabled="' + (a.disabled ? '1' : '0') + '">' + toggleLabel + '</button>'
+    + '</div>'
+    + '</div>';
+}
+
+// summaryHTML 渲染顶部汇总卡片。
+function summaryHTML(list){
+  const total = list.length;
+  const enabled = list.filter(a => !a.disabled).length;
+  const premium = list.filter(a => !a.disabled).reduce((sum, a) => sum + premiumOf(a), 0);
+  const spaces = list.reduce((sum, a) => sum + (a.spaces || []).length, 0);
+  return '<div class="summary-hd"><span class="summary-title">账号总览</span>'
+    + '<span class="summary-meta">共 ' + total + ' 个账号 · ' + spaces + ' 个工作空间</span></div>'
+    + '<div class="summary-grid">'
+    + '<div class="summary-item"><div class="k">启用中</div><div class="v ok">' + enabled + '</div></div>'
+    + '<div class="summary-item"><div class="k">已禁用</div><div class="v' + (total - enabled > 0 ? ' warn' : '') + '">' + (total - enabled) + '</div></div>'
+    + '<div class="summary-item"><div class="k">订阅额度合计</div><div class="v">' + premium + '</div></div>'
+    + '<div class="summary-item"><div class="k">工作空间</div><div class="v">' + spaces + '</div></div>'
+    + '</div>';
+}
+
+let lastAccounts = [];
+let currentSearch = '';
+let currentSort = 'desc';
+let pendingAuthId = '';
+let spaceAuthId = '';
+let testAuthId = '';
+
+function sortAccounts(list){
+  const copy = list.slice();
+  if (currentSort === 'asc') copy.sort((x, y) => premiumOf(x) - premiumOf(y));
+  else if (currentSort === 'desc') copy.sort((x, y) => premiumOf(y) - premiumOf(x));
+  return copy;
+}
+
+function visibleAccounts(){
+  const q = currentSearch.trim().toLowerCase();
+  const filtered = !q ? lastAccounts.slice() : lastAccounts.filter(a =>
+    String(a.label || '').toLowerCase().includes(q)
+    || String(a.auth_id || '').toLowerCase().includes(q)
+    || String(a.space_name || '').toLowerCase().includes(q)
+    || (a.spaces || []).some(s => String(s.name || '').toLowerCase().includes(q))
+  );
+  return sortAccounts(filtered);
+}
+
+function render(){
+  const grid = document.getElementById('grid');
+  const summary = document.getElementById('summaryBox');
+  if (!lastAccounts.length) {
+    summary.style.display = 'none';
+    grid.innerHTML = '<div class="loading">还没有账号，请先导入 Cookie。</div>';
+    return;
+  }
+  summary.style.display = 'block';
+  summary.innerHTML = summaryHTML(lastAccounts);
+  const list = visibleAccounts();
+  grid.innerHTML = list.length
+    ? list.map(card).join('')
+    : '<div class="loading">没有匹配的账号。</div>';
+}
+
+// loadAll 拉取账号列表并重绘。
+async function loadAll(btn){
+  if (btn) busy(btn, true);
   try {
     const data = await request('/accounts');
-    const list = data.accounts || [];
-    if (!list.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="mono">还没有账号，请先导入 Cookie。</td></tr>';
-      return;
-    }
-    tbody.innerHTML = list.map(a => {
-      const status = a.disabled
-        ? '<span class="tag">已禁用</span>'
-        : '<span class="tag ok">启用中</span>';
-      const model = a.spaces && a.spaces.length ? '' : '';
-      return '<tr>'
-        + '<td><div>' + escapeHTML(a.label) + '</div><div class="mono">' + escapeHTML(a.auth_id) + '</div><div class="mono">' + escapeHTML(a.user_id) + '</div>' + model + '</td>'
-        + '<td><div>' + escapeHTML(a.space_name) + '</div><div class="mono">' + escapeHTML(a.space_id) + '</div></td>'
-        + '<td>' + renderSpaces(a.spaces, a.space_id) + '</td>'
-        + '<td>' + status + '</td>'
-        + '<td>'
-        +   '<button class="ghost" data-action="test" data-id="' + escapeHTML(a.auth_id) + '">测试</button> '
-        +   '<button class="ghost" data-action="toggle" data-id="' + escapeHTML(a.auth_id) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' + (a.disabled ? '启用' : '禁用') + '</button> '
-        +   '<button class="danger" data-action="delete" data-id="' + escapeHTML(a.auth_id) + '">删除</button>'
-        + '</td>'
-        + '</tr>';
-    }).join('');
+    lastAccounts = data.accounts || [];
+    render();
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="5" class="mono">加载失败：' + escapeHTML(e.message) + '</td></tr>';
+    document.getElementById('grid').innerHTML = '<div class="loading">加载失败：' + esc(e.message) + '</div>';
+    toast('加载账号失败', 'err', e.message);
+  } finally {
+    if (btn) busy(btn, false);
   }
 }
 
-// importAccount 提交 Cookie 并探活。
-async function importAccount() {
-  const btn = document.getElementById('importBtn');
-  const logEl = document.getElementById('importLog');
-  const cookie = document.getElementById('cookie').value.trim();
-  if (!cookie) { log(logEl, '请先粘贴 Cookie'); return; }
+function onSearchChange(q){
+  currentSearch = String(q || '');
+  render();
+}
 
-  btn.disabled = true;
-  log(logEl, '正在解析并探活…');
+function toggleSort(){
+  currentSort = currentSort === 'desc' ? 'asc' : 'desc';
+  const btn = document.getElementById('sortBtn');
+  btn.textContent = currentSort === 'desc' ? '额度 ↓' : '额度 ↑';
+  btn.title = currentSort === 'desc' ? '当前：订阅额度从多到少' : '当前：订阅额度从少到多';
+  render();
+}
+
+function findAccount(authId){
+  return lastAccounts.find(a => a.auth_id === authId) || null;
+}
+
+// ---------- 导入 ----------
+function openImportModal(){
+  document.getElementById('cookie').value = '';
+  document.getElementById('label').value = '';
+  document.getElementById('spaceId').value = '';
+  openModal('importModal');
+  const t = document.getElementById('cookie');
+  if (t) t.focus();
+}
+
+async function importAccount(btn){
+  const cookie = document.getElementById('cookie').value.trim();
+  if (!cookie) { toast('请先粘贴 Cookie', 'warn'); return; }
+  busy(btn, true);
   try {
     const data = await request('/import', {
       method: 'POST',
@@ -333,59 +632,188 @@ async function importAccount() {
         space_id: document.getElementById('spaceId').value.trim(),
       }),
     });
-    log(logEl, '导入成功：' + data.space_name + ' (' + data.space_id + ')');
-    document.getElementById('cookie').value = '';
-    await loadAccounts();
+    closeModal('importModal');
+    toast('导入成功', 'ok', (data.space_name || data.space_id || '') + ' · ' + (data.auth_id || ''));
+    await loadAll();
   } catch (e) {
-    log(logEl, '导入失败：' + e.message);
+    toast('导入失败', 'err', e.message);
   } finally {
-    btn.disabled = false;
+    busy(btn, false);
   }
 }
 
-// runAction 处理表格里的操作按钮。
-async function runAction(action, authId, disabled) {
-  const logEl = document.getElementById('actionLog');
+// ---------- 删除 ----------
+function openDeleteModal(authId){
+  const a = findAccount(authId);
+  pendingAuthId = authId;
+  document.getElementById('deleteModalHint').textContent = '确定要删除账号「' + ((a && a.label) || authId) + '」吗？';
+  openModal('deleteModal');
+}
+
+async function confirmDelete(){
+  const btn = document.getElementById('deleteConfirmBtn');
+  const authId = pendingAuthId;
+  if (!authId) return;
+  busy(btn, true);
   try {
-    if (action === 'delete') {
-      if (!confirm('确定删除账号 ' + authId + '？')) return;
-      await request('/delete', { method: 'POST', body: JSON.stringify({ auth_id: authId }) });
-      log(logEl, '已删除：' + authId);
-    } else if (action === 'toggle') {
-      const path = disabled ? '/enable' : '/disable';
-      await request(path, { method: 'POST', body: JSON.stringify({ auth_id: authId }) });
-      log(logEl, (disabled ? '已启用：' : '已禁用：') + authId);
-    } else if (action === 'test') {
-      log(logEl, '探活中：' + authId + ' …');
-      const data = await request('/test-active', {
-        method: 'POST',
-        body: JSON.stringify({ auth_id: authId }),
-      });
-      if (data.ok) {
-        log(logEl, '探活成功 ' + authId + '：' + data.elapsed + ' · 回复「' + (data.reply || '') + '」· tokens ' + (data.in_tokens || 0) + '/' + (data.out_tokens || 0));
-      } else {
-        log(logEl, '探活失败 ' + authId + '：' + (data.error || '未知错误'));
-      }
-    }
-    await loadAccounts();
+    await request('/delete', { method: 'POST', body: JSON.stringify({ auth_id: authId }) });
+    closeModal('deleteModal');
+    toast('已删除账号', 'ok', authId);
+    await loadAll();
   } catch (e) {
-    log(logEl, '操作失败：' + e.message);
+    toast('删除失败', 'err', e.message);
+  } finally {
+    busy(btn, false);
+    pendingAuthId = '';
   }
 }
 
-document.getElementById('importBtn').addEventListener('click', importAccount);
-document.getElementById('keyBtn').addEventListener('click', saveKey);
-document.getElementById('keyInput').addEventListener('keydown', (e) => {
+// ---------- 启停 ----------
+async function toggleAccount(btn, authId, disabled){
+  busy(btn, true);
+  try {
+    await request(disabled ? '/enable' : '/disable', {
+      method: 'POST',
+      body: JSON.stringify({ auth_id: authId }),
+    });
+    toast(disabled ? '已启用账号' : '已禁用账号', 'ok', authId);
+    await loadAll();
+  } catch (e) {
+    toast('操作失败', 'err', e.message);
+    busy(btn, false);
+  }
+}
+
+// ---------- 切换工作空间 ----------
+function openSpaceModal(authId){
+  const a = findAccount(authId);
+  if (!a) return;
+  spaceAuthId = authId;
+  const result = document.getElementById('spaceResult');
+  result.className = 'result';
+  result.innerHTML = '';
+  const list = document.getElementById('spaceList');
+  const spaces = a.spaces || [];
+  list.innerHTML = spaces.length
+    ? spaces.map(s => {
+        const cur = s.id === a.space_id;
+        return '<button type="button" class="model-item" data-space="' + esc(s.id) + '"' + (cur ? ' disabled' : '') + '>'
+          + '<div>' + esc(s.name || s.id) + (cur ? ' · 当前' : '') + '</div>'
+          + '<div class="disp">订阅 ' + (Number(s.premium_credits) || 0)
+          + ' · 基础 ' + (Number(s.basic_usage) || 0) + '/' + (Number(s.basic_limit) || 0) + '</div>'
+          + '</button>';
+      }).join('')
+    : '<div class="loading">该账号没有可选工作空间。</div>';
+  openModal('spaceModal');
+}
+
+async function switchSpace(btn, spaceId){
+  if (!spaceAuthId) return;
+  busy(btn, true);
+  const result = document.getElementById('spaceResult');
+  try {
+    const data = await request('/set-space', {
+      method: 'POST',
+      body: JSON.stringify({ auth_id: spaceAuthId, space_id: spaceId }),
+    });
+    result.className = 'result show ok';
+    result.innerHTML = '<div class="t">已切换到 ' + esc(data.space_name || spaceId) + '</div>';
+    toast('已切换工作空间', 'ok', data.space_name || spaceId);
+    await loadAll();
+  } catch (e) {
+    result.className = 'result show err';
+    result.innerHTML = '<div class="t">切换失败</div>' + esc(e.message);
+    busy(btn, false);
+  }
+}
+
+// ---------- 测试模型 ----------
+async function openTestModal(authId){
+  testAuthId = authId;
+  const result = document.getElementById('testResult');
+  result.className = 'result';
+  result.innerHTML = '';
+  const list = document.getElementById('testModelList');
+  list.innerHTML = '<div class="loading">加载模型中…</div>';
+  openModal('testModal');
+  try {
+    const data = await request('/models?auth_id=' + encodeURIComponent(authId));
+    const models = data.models || [];
+    list.innerHTML = models.length
+      ? models.map(m => '<button type="button" class="model-item" data-model="' + esc(m.code) + '">'
+          + '<div class="code">' + esc(m.display || m.code) + '</div>'
+          + (m.display && m.display !== m.code ? '<div class="disp">' + esc(m.code) + '</div>' : '')
+          + '</button>').join('')
+      : '<div class="loading">该账号没有可见模型。</div>';
+  } catch (e) {
+    list.innerHTML = '<div class="loading">模型加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+async function runTest(btn, model){
+  if (!testAuthId) return;
+  busy(btn, true);
+  const result = document.getElementById('testResult');
+  result.className = 'result show';
+  result.innerHTML = '<div class="t">测试中…</div>';
+  try {
+    const data = await request('/test-active', {
+      method: 'POST',
+      body: JSON.stringify({ auth_id: testAuthId, model }),
+    });
+    if (data.ok) {
+      result.className = 'result show ok';
+      result.innerHTML = '<div class="t">测试通过 · ' + esc(model) + '</div>'
+        + '耗时 ' + esc(data.elapsed || '-')
+        + ' · 回复「' + esc(data.reply || '') + '」'
+        + ' · tokens ' + (data.in_tokens || 0) + '/' + (data.out_tokens || 0);
+      toast('测试通过', 'ok', model + ' · ' + (data.elapsed || ''));
+    } else {
+      result.className = 'result show err';
+      result.innerHTML = '<div class="t">测试失败 · ' + esc(model) + '</div>' + esc(data.error || '未知错误');
+      toast('测试失败', 'err', data.error || model);
+    }
+  } catch (e) {
+    result.className = 'result show err';
+    result.innerHTML = '<div class="t">测试失败</div>' + esc(e.message);
+    toast('测试失败', 'err', e.message);
+  } finally {
+    busy(btn, false);
+  }
+}
+
+// ---------- 事件绑定 ----------
+document.getElementById('grid').addEventListener('click', event => {
+  const btn = event.target.closest('button[data-action]');
+  if (!btn) return;
+  const cardEl = btn.closest('[data-auth]');
+  if (!cardEl) return;
+  const authId = cardEl.dataset.auth;
+  const action = btn.dataset.action;
+  if (action === 'delete') openDeleteModal(authId);
+  else if (action === 'toggle') toggleAccount(btn, authId, btn.dataset.disabled === '1');
+  else if (action === 'spaces') openSpaceModal(authId);
+  else if (action === 'test') openTestModal(authId);
+});
+
+document.getElementById('spaceList').addEventListener('click', event => {
+  const btn = event.target.closest('button[data-space]');
+  if (!btn) return;
+  switchSpace(btn, btn.dataset.space);
+});
+
+document.getElementById('testModelList').addEventListener('click', event => {
+  const btn = event.target.closest('button[data-model]');
+  if (!btn) return;
+  runTest(btn, btn.dataset.model);
+});
+
+document.getElementById('keyInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') saveKey();
 });
 
-document.getElementById('accounts').addEventListener('click', (event) => {
-  const btn = event.target.closest('button[data-action]');
-  if (!btn) return;
-  runAction(btn.dataset.action, btn.dataset.id, btn.dataset.disabled === '1');
-});
-
-loadAccounts();
+window.__ntThemeSync();
+loadAll();
 </script>
 </body>
 </html>
