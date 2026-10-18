@@ -424,9 +424,7 @@ function refreshStateHTML(a){
 function card(a){
   const plan=(a.plan||"unknown").toLowerCase();
   const cr=a.credits;
-  // 耗尽判定：上游 quota.exceeded 是权威信号，免费版账号没有额度包时
-  // total_used/total_size 恒为 0，仅靠数值会被误判成「未知」。
-  const exhausted=!!a.exhausted||(!!cr&&(cr.exceeded===true||((cr.total_remain||0)===0&&((cr.total_used||0)>0||(cr.total_size||0)>0||(cr.packages&&cr.packages.length)))));
+  const exhausted=isAccountExhausted(a);
   const lowCredits=!exhausted && (!!a.low_credits || (!!cr && (cr.total_remain||0) > 0 && (cr.total_remain||0) < 20));
   const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(20)，已暂停路由，防止推理中途断开">低额保护</span>`:"";
   const dailyCooling=!!a.daily_cooling;
