@@ -203,6 +203,9 @@ func runRenewTick(deps renewDeps) int {
 
 			res, errRenew := deps.renew(acc)
 			if errRenew != nil {
+				// 上游明确判定会话过期时落失效标记，面板才能如实显示
+				// 「待重新授权」，而不是继续显示可用。
+				markSessionInvalid(acc, errRenew.Error())
 				if deps.logf != nil {
 					deps.logf("warn", "定时续期失败", map[string]any{
 						"auth_id": acc.AuthID,

@@ -289,12 +289,23 @@ func handleListAccounts() ([]byte, error) {
 
 // authStateOf 判定账号的登录态状态。
 //
-// 依据账号文件中的会话主 Cookie 快照：有快照看快照，没有则从 CookieHeader
+// 依赖账号文件中的会话主 Cookie 快照：有快照看快照，没有则从 CookieHeader
 // 重建（首次授权后尚未滚动写回的账号）。任一会话 Cookie 存在且未过期即 ok。
+//
+// 优先采信上游的明确判定：续期返回「会话过期」时 AuthInvalid 会被置位，
+// 此时即便本地 Cookie 看起来仍在也必须报 expired——扣子的会话 Cookie
+// 不带 Expires，只按本地过期时间判活会让失效账号永远显示「可用」
+// （2026-10-19 多账号实测：两个账号上游已拒绝，面板仍全部显示可用）。
 // [参数] sa: 账号结构。
 // [返回] "ok" 或 "expired"。
-// 最近修改时间：2026-10-18；改动原因：新增，登录态失效状态上报。
+// 最近修改时间：2026-10-19；改动原因：上游明确失效优先于本地 Cookie 判活。
 func authStateOf(sa *StoredAuth) string {
+	if sa == nil {
+		return "expired"
+	}
+	if sa.AuthInvalid {
+		return "expired"
+	}
 	store := newCookieStore()
 	if len(sa.Cookies) > 0 {
 		store.restore(sa.Cookies)

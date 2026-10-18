@@ -44,6 +44,12 @@ type StoredAuth struct {
 	// 两者分开记录，面板据此区分「刚登录」与「靠续期维持」的账号。
 	LoginAt     string `json:"login_at,omitempty"`
 	LastRenewAt string `json:"last_renew_at,omitempty"`
+	// AuthInvalid 表示上游已明确判定该账号会话失效（如续期返回「会话过期」）。
+	//
+	// 不能只靠 Cookie 的 Expires 判活：扣子的会话 Cookie 不下发 Expires，
+	// 本地看起来永不过期，但上游早已作废（2026-10-19 多账号实测）。
+	// 该标记只由「上游明确拒绝」写入，重新授权或续期成功即清除。
+	AuthInvalid bool   `json:"auth_invalid,omitempty"`
 	Label       string `json:"label"`
 	Disabled    bool   `json:"disabled"`
 	CreatedAt   string `json:"created_at"`

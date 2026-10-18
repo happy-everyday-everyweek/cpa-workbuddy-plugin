@@ -796,3 +796,118 @@ func TestNormalizeMgmtSubPath(t *testing.T) {
 		}
 	}
 }
+
+// TestAuthStateOf_RespectsUpstreamInvalid 验证上游失效优先于本地 Cookie。
+//
+// 生产实测（2026-10-19）：三账号中两个已被上游判定失效（续期返回
+// 「会话过期，请重新登录」、积分端点返回 700012006），但面板仍全部显示
+// 「可用」——扣子的会话 Cookie 不带 Expires，本地判活永远通过。
+// 这里锁定契约：上游明确判定失效后，状态必须报 expired。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失效状态误报回归。
+func TestAuthStateOf_RespectsUpstreamInvalid(t *testing.T) {
+	sa := &StoredAuth{
+		AuthID:       "coze-invalid",
+		CookieHeader: "sessionid=still-looks-alive; sid_tt=x",
+	}
+	if got := authStateOf(sa); got != "ok" {
+		t.Fatalf("本地 Cookie 存在时应判 ok，实际 %q", got)
+	}
+
+	sa.AuthInvalid = true
+	if got := authStateOf(sa); got != "expired" {
+		t.Fatalf("上游已判失效时必须报 expired，实际 %q", got)
+	}
+}
+
+// TestIsSessionExpiredError 验证失效判定只认上游会话类错误。
+//
+// 误判的代价是让用户去重新授权一个本来可用的账号，
+// 所以超时、限流、5xx 这类瞬态错误必须排除在外。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失效判定边界。
+func TestIsSessionExpiredError(t *testing.T) {
+	expiredCases := []string{
+		"续期失败（第一步）：会话过期，请重新登录",
+		"积分端点返回 code=700012006 msg=",
+		"登录认证失败",
+		"Login verification is invalid",
+	}
+	for _, reason := range expiredCases {
+		if !isSessionExpiredError(reason) {
+			t.Errorf("%q 应判为会话失效", reason)
+		}
+	}
+
+	transientCases := []string{
+		"",
+		"积分请求失败：context deadline exceeded",
+		"令牌端点返回 HTTP 502：bad gateway",
+		"续期失败（第一步）：请求过于频繁",
+	}
+	for _, reason := range transientCases {
+		if isSessionExpiredError(reason) {
+			t.Errorf("%q 属瞬态错误，不得判为会话失效", reason)
+		}
+	}
+}
+
+// TestMarkSessionInvalidPersists 验证失效标记真实落盘。
+//
+// 只在内存里置位会在插件热重载后丢失，面板又会回到「可用」。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失效状态持久化。
+func TestMarkSessionInvalidPersists(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	filePath := dir + "/coze-mark.json"
+	seeded := &StoredAuth{AuthID: "coze-mark", CookieHeader: "sessionid=x"}
+	if errWrite := writeAuthFileDirect(filePath, seeded); errWrite != nil {
+		t.Fatalf("准备账号文件失败：%v", errWrite)
+	}
+	sa, errRead := readAuthFile(filePath)
+	if errRead != nil {
+		t.Fatalf("读取账号失败：%v", errRead)
+	}
+
+	markSessionInvalid(sa, "续期失败（第一步）：会话过期，请重新登录")
+
+	reloaded, errReload := readAuthFile(filePath)
+	if errReload != nil {
+		t.Fatalf("重读账号失败：%v", errReload)
+	}
+	if !reloaded.AuthInvalid {
+		t.Fatal("失效标记必须持久化")
+	}
+	if got := authStateOf(reloaded); got != "expired" {
+		t.Fatalf("落盘后状态应为 expired，实际 %q", got)
+	}
+
+	// 瞬态错误不得写标记。
+	otherPath := dir + "/coze-transient.json"
+	other := &StoredAuth{AuthID: "coze-transient", CookieHeader: "sessionid=y"}
+	if errWrite := writeAuthFileDirect(otherPath, other); errWrite != nil {
+		t.Fatalf("准备第二个账号失败：%v", errWrite)
+	}
+	otherLoaded, _ := readAuthFile(otherPath)
+	markSessionInvalid(otherLoaded, "积分请求失败：context deadline exceeded")
+	if otherLoaded.AuthInvalid {
+		t.Fatal("瞬态错误不得标记账号失效")
+	}
+
+	// 续期成功应清除标记。
+	invalid := &StoredAuth{AuthID: "coze-mark", AuthInvalid: true, CookieHeader: "sessionid=x"}
+	invalid.PhysicalPath = filePath
+	invalid.LoadedDigest = fileDigest(filePath)
+	if errApply := applyRenewal(invalid, &renewResult{Renewed: true, CookieHeader: "sessionid=new"}); errApply != nil {
+		t.Fatalf("续期落盘失败：%v", errApply)
+	}
+	if invalid.AuthInvalid {
+		t.Fatal("续期成功后必须清除失效标记")
+	}
+}

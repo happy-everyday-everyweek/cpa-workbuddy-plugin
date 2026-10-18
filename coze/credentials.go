@@ -416,12 +416,54 @@ func applyRenewal(sa *StoredAuth, res *renewResult) error {
 	sa.Cookies = res.Cookies
 	sa.LastRenewAt = time.Now().Format(time.RFC3339)
 	sa.UpdatedAt = sa.LastRenewAt
+	// 续期成功即证明会话有效，清掉此前可能留下的上游失效标记。
+	sa.AuthInvalid = false
 	if errWrite := writeAuthFileDirect(sa.PhysicalPath, sa); errWrite != nil {
 		return errWrite
 	}
 	// 写入成功后刷新基准，使同一进程内的后续轮次以新内容为起点。
 	sa.LoadedDigest = fileDigest(sa.PhysicalPath)
 	return nil
+}
+
+// markSessionInvalid 记录「上游明确判定会话失效」。
+//
+// 只在错误文案来自上游会话判定时调用：网络抖动、限流等瞬态失败不能
+// 把账号标成失效，否则面板会误报，用户会去重新授权一个本来可用的账号。
+// [参数] sa: 账号；reason: 上游错误文案。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失效状态落盘。
+func markSessionInvalid(sa *StoredAuth, reason string) {
+	if sa == nil || sa.PhysicalPath == "" || !isSessionExpiredError(reason) {
+		return
+	}
+	if accountReplaced(sa) {
+		return
+	}
+	sa.AuthInvalid = true
+	sa.UpdatedAt = time.Now().Format(time.RFC3339)
+	if errWrite := writeAuthFileDirect(sa.PhysicalPath, sa); errWrite != nil {
+		return
+	}
+	sa.LoadedDigest = fileDigest(sa.PhysicalPath)
+}
+
+// isSessionExpiredError 判断错误是否表示上游判定会话已失效。
+//
+// 判据是上游固定文案「会话过期」/「登录认证失败」与扣子错误码 700012006；
+// 其余错误（超时、限流、5xx）都属瞬态，不得据此标记账号失效。
+// [参数] reason: 错误文案。
+// [返回] 属于会话失效时返回 true。
+// 最近修改时间：2026-10-19；改动原因：新增，失效判定唯一出口。
+func isSessionExpiredError(reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "会话过期") ||
+		strings.Contains(text, "登录认证失败") ||
+		strings.Contains(text, "login verification is invalid") ||
+		strings.Contains(text, "700012006")
 }
 
 // accountReplaced 判断账号文件在读取之后是否被外部改写。
@@ -457,6 +499,9 @@ func renewAccountByID(authID string) (*renewResult, error) {
 		}
 		res, errRenew := renewSession(sa)
 		if errRenew != nil {
+			// 上游明确说会话过期时留下标记：否则面板会一直显示「可用」，
+			// 用户看不出这个账号已经需要重新授权。
+			markSessionInvalid(sa, errRenew.Error())
 			return nil, errRenew
 		}
 		if errApply := applyRenewal(sa, res); errApply != nil {
