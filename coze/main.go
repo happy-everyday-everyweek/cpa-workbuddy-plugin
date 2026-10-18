@@ -65,7 +65,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.2.2"
+	version      = "0.3.0"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -243,12 +243,11 @@ type registrationCapability struct {
 // cozeRegistration 返回插件注册元数据与能力声明。
 //
 // 声明 model_provider 以对外暴露扣子模型目录（对话 / 生图 / 生视频等），
-// 但不声明 executor —— 对话链路（CYCLE-01）尚未实现，提前声明会让宿主
-// 把推理请求路由进来并全部失败。模型目录与推理能力是两件事：
-// 前者只影响模型选择器，后者才决定请求去向。
+// 并声明 executor 以承接推理请求（CYCLE-01 已打通真流式）。
+// 模型目录与推理能力是两件事：前者只影响模型选择器，后者才决定请求去向。
 // [参数] 无。
 // [返回] 注册结构。
-// 最近修改时间：2026-10-18；改动原因：新增模型目录能力，仍不声明 executor。
+// 最近修改时间：2026-10-18；改动原因：CYCLE-01 打通对话链路，开启 executor 能力。
 func cozeRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
@@ -264,12 +263,15 @@ func cozeRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelProvider: true,
-			AuthProvider:  true,
-			Executor:      false,
-			Scheduler:     false,
-			ManagementAPI: true,
-			UsagePlugin:   false,
+			ModelProvider:         true,
+			AuthProvider:          true,
+			Executor:              true,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorInputFormats:  []string{"openai"},
+			ExecutorOutputFormats: []string{"openai"},
+			Scheduler:             false,
+			ManagementAPI:         true,
+			UsagePlugin:           false,
 		},
 	}
 }
@@ -306,6 +308,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 	case pluginabi.MethodModelForAuth:
 		return modelForAuth(request)
+
+	case pluginabi.MethodExecutorIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerName})
+
+	case pluginabi.MethodExecutorExecute:
+		return handleExecExecute(request)
+
+	case pluginabi.MethodExecutorExecuteStream:
+		return handleExecStream(request)
+
+	case pluginabi.MethodExecutorCountTokens:
+		// 扣子没有独立的 token 计数端点；返回 0 让宿主跳过预估，
+		// 而不是伪造一个看似合理的数字误导用量统计。
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
 
 	case pluginabi.MethodManagementRegister:
 		var regReq pluginapi.ManagementRegistrationRequest

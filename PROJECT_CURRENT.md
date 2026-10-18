@@ -107,13 +107,13 @@
 
 - 会话（2026-10-15，已压缩）：**zcode-provider 0.1.30 面板额度改用 `billing/balance` 取真实用量**：根因是 `billing/current` 只返回授予量、无已用/剩余，且面板进度条硬编码 100%；改走 balance（强制设备三头 `X-Platform`/`X-Device-Mid`/`X-ZCode-App-Version`）+ `friendlyClaimError` 文案友好化；发布链 `a49101a`→`1b80e6f`(assets)→`6fd166d`(registry)，生产热重载零重启，`/credits` 返回 `source=balance has_usage=True` 且用量真实。Bug 文档 `doc/4-bugs/2026-10-15_023000_zcode面板额度永远显示满额根因诊断.md`。
 
-- 会话（2026-10-14/15，已压缩）：**zcode-provider 默认中国区 + 面板内无感验证领取额度（0.1.28 → 0.1.29）**：逆向 asar 证实官方用标准阿里云无感验证 SDK，插件可自主领取；0.1.28 加中国区默认、`fetchClaimablePlanID` 动态解析 planId、`zcodeDeviceMid`、`X-Device-Mid`；0.1.29 修 `captchaVerifyParam` 仅 76 字符缺陷（根因：`initAliyunCaptcha` 未传 `prefix`/`region` 且只设 SDK 不读的全局名），修复后 280 字符含 `securityToken`，`/claim` 由 captcha 层 `captcha_required` 进到业务层 `no permission`。发布链 `89837d9`/`c757927` 两次闭环，生产热重载零重启。**未覆盖**：上游对全部账号 `billing/preview` 返回 `plans:[]`，完整激活未实证（上游活动态，非插件缺陷）。
+- 会话（2026-10-14/15，已压缩）：**zcode-provider 默认中国区 + 面板内无感验证领取额度（0.1.28→0.1.29）**：0.1.28 加中国区默认与动态 planId；0.1.29 修 `captchaVerifyParam` 仅 76 字符缺陷（未传 `prefix`/`region`），修复后 280 字符含 `securityToken`。**未覆盖**：上游对全部账号 `billing/preview` 返回 `plans:[]`，完整激活未实证（上游活动态）。
 
-- 会话（2026-10-14，已压缩）：**zcode-provider 支持 bigmodel（中国区）OAuth 授权，0.1.25~0.1.27 三连发**：`provider=bigmodel` 完全复用既有 CLI 轮询链路（仅 provider 参数 / authorize 域名 / 回调路径不同，属参数化非重写）；CYCLE-1 `c84088f` 加 `ProviderFamily` 字段与全链参数化，CYCLE-2 `0e88c4c` 加面板下拉与归属徽标。三版闭环：0.1.25 中国区（`797d807`）→ 0.1.26 修非法 provider 静默回退（`cbbca35`）→ 0.1.27 修 bigmodel 推理 401（`open.bigmodel.cn/api/anthropic` 不接受 ZCode JWT，start-plan 两站共用 `zcode.z.ai`，`c19493b`）。GAP-004/005/006 全解除；`quota.go` 无需 family 分支（实测额度端点两家共用）。上游 `zcode.z.ai` 对生产 IP 有时段性 WAF（405/3012）与限流（429/3009），zai 账号同样受影响，属外部因素。
+- 会话（2026-10-14，已压缩）：**zcode-provider 支持 bigmodel（中国区）OAuth，0.1.25~0.1.27**：复用既有 CLI 轮询链路（仅 provider/域名/回调路径参数化）；0.1.26 修非法 provider 静默回退，0.1.27 修 bigmodel 推理 401（`open.bigmodel.cn/api/anthropic` 不接受 ZCode JWT）。上游对生产 IP 有时段性 WAF/限流，属外部因素。
 
-- 会话（2026-10-14，已压缩）：**四插件定时探活降频至 4 小时并修正失败账号节流缺陷，全链路发布生产**：`defaultActivePingInterval` 30 分钟 → 4 小时（workbuddy / workbuddy-ai / traework / zcode）；**真实缺陷**：`recordActivePing` 原仅在探活成功时刷新节流时间戳，失败账号不计时 → 每个 watchdog tick 被反复全量重测，反而比健康账号更耗配额，改为「无论成败都先刷新」；四插件各补 `TestDoActivePingFailureStillThrottles`。提交链 `22bf7fe` → 各插件 assets/registry → `368a63e`(prune 5 旧版)；远端各 7/7 ALL PASS；生产四插件热重载 `restart_required=false`、零容器重启、`.so` 与 zip 逐字节一致、accounts/panel 全 200。CI 教训：flaky `Test (token-usage-tracker)` 与 darwin checkout 卡死各需单插件重发；须取消冗余 push run 释放 Runner。
+- 会话（2026-10-14，已压缩）：**四插件定时探活降频至 4 小时并修失败账号节流缺陷**：**真实缺陷**：`recordActivePing` 原仅成功时刷新时间戳，失败账号不计时 → 每个 tick 被反复重测，比健康账号更耗配额；改为「无论成败都先刷新」。四插件各补回归用例，全链路发布生产、零容器重启。
 
-- 会话（2026-10-14，已压缩）：**zcode-provider 0.1.22 领取指引**：纠正「激活开通」错误承诺，改为如实 Start Plan 领取指引（`guideModal`），提交链 `9655225`→`d859616`(assets)→`2d6d7f8`(registry)→`0cd3060`(prune 0.1.21)；根因实证：额度领取须官方客户端内手动完成（claim 接口强制阿里云人机验证头，无头一律 `400 3007`），`authorize` 层不做 redirect_uri 白名单（三臂 307 通过）。
+- 会话（2026-10-14，已压缩）：**zcode-provider 0.1.22 领取指引**：改为如实 Start Plan 指引（`guideModal`）；根因：额度领取须官方客户端手动完成（claim 强制阿里云人机验证头，无头一律 `400 3007`）。
 
 - 当前会话（2026-10-15）：**copilot-provider 0.1.1：宿主 OAuth 弹窗改开插件桥接页展示设备码，全链路发布生产**：
   - 需求背景：用户在管理台点「登录」后，GitHub 授权页 8 个空白框需手输设备码，但宿主 OAuth 弹窗**不显示设备码**（附截图）。根因：宿主 `ServePluginAuthURL`（`auth_files_oauth_callback.go:218`）把插件 start 响应的 `Metadata` 只写进宿主 session store、**不回传前端**，硬编码返回 `{status,url,state}`；宿主内置 provider 是把 `user_code` 放响应顶层才显示，插件无法照做。用户采纳「选项 B：桥接页」方案。

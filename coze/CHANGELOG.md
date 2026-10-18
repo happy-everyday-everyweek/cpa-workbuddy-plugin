@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.0 (2026-10-18)
+
+### 新增
+
+- **对话链路打通（CYCLE-01 / TASK-004）：声明 executor 能力，支持真流式**。
+  此前插件只暴露模型目录、不声明 executor，推理请求不会路由进来。
+  现在完整链路为：`claw/info` 取 `claw_id` → `session/get_main` 取主会话 →
+  `get_frontier_key` 取 WS 凭证 → 建立 frontier WebSocket →
+  `message/chat` 异步提交 → 从 WS 收增量 → 转 `chat.completion.chunk`。
+- **`frontier_frame.go`：protobuf 帧编解码**。上游帧是 12 字段 protobuf
+  （`SeqID`/`LogID`/`service`/`method`/`headers`/`payloadEncoding`/
+  `payloadType`/`payload`/`LogIDNew`/`serverTiming`/`msgID`/`frameType`），
+  没有 `.proto` 可用，字段号由客户端 SDK 反编译并用真实帧校准。
+  解码按 tag 分派并跳过未知字段，上游加字段不会让链路当天断掉。
+- **`frontier.go`：WebSocket 客户端**。连接参数 `aid=751148`、`fpid=1289`、
+  `xsack=0`、子协议 `pbbp2`；10 秒文本心跳 `hi`；读超时兜底；
+  指数退避重连（1s 起、上限 30s，连上即重置）。
+- **`claw.go`：claw HTTP 协议层**。四个端点统一错误判定
+  （HTTP 200 + `code` 表达业务结果，只看状态码会把失败判成成功）。
+- **`convert.go` / `executor.go`：OpenAI 协议转换与执行器**。
+  多轮 messages 折叠成单条文本；增量逐帧下发（不合并）；按
+  `turn_id + seq_num + phase` 去重；`event_final` 收尾；
+  首字超时降级到 `message/list` 轮询兜底。
+
+### 修复
+
+- **重连延迟**：初版心跳协程只在 ticker 触发时检查状态，服务端断开后
+  要空等一个完整心跳周期（10 秒）才重连。改为读循环结束时立即取消
+  心跳协程，重连不再有额外延迟。
+- **增量被合并**：初版按「累积正文差值」下发，两帧到达间隔小于轮询
+  间隔时会被合并成一大块，客户端表现为「卡一下然后蹦出一大段」。
+  改为维护待下发队列，每个上游帧独立 emit 一次。
+
+### 说明
+
+- **模型选择不由插件控制**：`message/chat` 不接受模型参数，实际模型由
+  扣子侧配置决定（页面右下角选择器）。请求里的 `model` 只用于响应回显。
+- **多轮上下文是有损的**：claw 只接受单条文本，OpenAI 的 system / 历史
+  轮次会被折叠成「角色: 内容」逐行拼接，角色边界不作为独立字段传给上游。
+- **`message/list` 只作兜底**：它返回已落库的完整消息（实测约 4 秒延迟），
+  没有增量语义；只在 WS 首字超时（90 秒）时启用。
+
 ## 0.2.2 (2026-10-18)
 
 ### 修复
