@@ -290,9 +290,16 @@ func pruneExpiredLoginSessionsLocked() {
 //
 // ID 必须与宿主文件扫描派生的 ID 同形（相对 auth 目录的文件名，含 .json）：
 // 宿主有两条注册路径，不一致会让同一个物理文件被注册成两条账号记录。
+//
+// metadata 里必须带 refresh_interval_seconds：宿主自动刷新循环的
+// nextRefreshCheckAt 在 NextRefreshAfter 为零时会依次回退到
+// refresh_interval_seconds 与 ProviderRefreshLead，而扣子不在宿主的
+// refreshLeadFactories 注册表里（只内置 codex/claude/antigravity/kimi/xai）。
+// 缺这个键时账号永远排不进刷新队列，续期只能靠用户手动点按钮
+// （2026-10-18 生产实测：24 小时内 0 条 auto-refresh 日志）。
 // [参数] sa: 账号。
 // [返回] AuthData。
-// 最近修改时间：2026-10-18；改动原因：新增，宿主注册结构。
+// 最近修改时间：2026-10-18；改动原因：新增，宿主注册结构；补刷新间隔驱动定时续期。
 func authDataForLogin(sa *StoredAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
 	fileName := authFileNameOf(sa.AuthID)
@@ -303,10 +310,11 @@ func authDataForLogin(sa *StoredAuth) pluginapi.AuthData {
 		Label:       sa.Label,
 		StorageJSON: storage,
 		Metadata: map[string]any{
-			"type":        providerName,
-			"label":       sa.Label,
-			"screen_name": sa.ScreenName,
-			"mobile":      sa.Mobile,
+			"type":                     providerName,
+			"label":                    sa.Label,
+			"screen_name":              sa.ScreenName,
+			"mobile":                   sa.Mobile,
+			"refresh_interval_seconds": currentConfig().RenewIntervalSeconds,
 		},
 	}
 }

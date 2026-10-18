@@ -195,15 +195,7 @@ func testActiveResultMap(res testActiveResult) map[string]any {
 // [返回] {models:[...], source, notice}；缺少 auth_id 时返回 {error}。
 // 最近修改时间：2026-10-18；改动原因：新增，测试弹窗模型数据源。
 func handleModelsQuery(req pluginapi.ManagementRequest) map[string]any {
-	authID := ""
-	if vals := req.Query["auth_id"]; len(vals) > 0 {
-		authID = strings.TrimSpace(vals[0])
-	}
-	if authID == "" {
-		if vals := req.Query["auth_index"]; len(vals) > 0 {
-			authID = strings.TrimSpace(vals[0])
-		}
-	}
+	authID := queryAuthID(req)
 	if authID == "" {
 		return map[string]any{"error": "auth_id 不能为空"}
 	}
@@ -232,4 +224,82 @@ func handleModelsQuery(req pluginapi.ManagementRequest) map[string]any {
 		})
 	}
 	return map[string]any{"models": out, "source": source, "notice": notice}
+}
+
+// handleCreditsQuery 查询指定账号的积分余额与即将过期明细。
+//
+// force=true 时跳过缓存：面板「刷新」按钮需要拿到最新数字，
+// 而列表接口默认走 5 分钟缓存以避免频繁打上游。
+// [参数] req: 管理请求，query 参数 auth_id 指定账号，可选 force=1。
+// [返回] 积分摘要；失败时带 error 字段。
+// 最近修改时间：2026-10-18；改动原因：新增，面板积分查询入口。
+func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
+	authID := queryAuthID(req)
+	if authID == "" {
+		return map[string]any{"ok": false, "error": "auth_id 不能为空"}
+	}
+	sa, errFind := findAccountForTest(authID)
+	if errFind != nil {
+		return map[string]any{"ok": false, "error": errFind.Error()}
+	}
+	force := strings.TrimSpace(req.Query.Get("force")) == "1"
+	summary, errFetch := cachedCreditSummary(sa, force)
+	if errFetch != nil {
+		return map[string]any{"ok": false, "error": errFetch.Error()}
+	}
+	out := creditSummaryMap(summary)
+	out["ok"] = true
+	return out
+}
+
+// creditSummaryMap 把积分摘要转成响应载荷。
+// [参数] summary: 积分摘要。
+// [返回] 载荷 map。
+// 最近修改时间：2026-10-18；改动原因：新增，积分响应构造。
+func creditSummaryMap(summary *creditSummary) map[string]any {
+	if summary == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{
+		"total":      summary.Total,
+		"remain":     summary.Remain,
+		"expiring":   summary.ExpiringRemain,
+		"fetched_at": summary.FetchedAt,
+	}
+	if summary.ExpiringAt != "" {
+		out["expiring_at"] = summary.ExpiringAt
+	}
+	if summary.Error != "" {
+		out["error"] = summary.Error
+	}
+	if summary.DetailError != "" {
+		out["detail_error"] = summary.DetailError
+	}
+	if len(summary.Items) > 0 {
+		items := make([]map[string]any, 0, len(summary.Items))
+		for _, item := range summary.Items {
+			items = append(items, map[string]any{
+				"title":      item.Title,
+				"remaining":  item.Remaining,
+				"expired_at": item.ExpiredAt,
+			})
+		}
+		out["items"] = items
+	}
+	return out
+}
+
+// queryAuthID 从管理请求的 query 中提取账号标识。
+// [参数] req: 管理请求。
+// [返回] 账号标识；缺失时返回空串。
+// 最近修改时间：2026-10-18；改动原因：新增，多个查询路由共用取值逻辑。
+func queryAuthID(req pluginapi.ManagementRequest) string {
+	for _, key := range []string{"auth_id", "auth_index"} {
+		if vals := req.Query[key]; len(vals) > 0 {
+			if v := strings.TrimSpace(vals[0]); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }

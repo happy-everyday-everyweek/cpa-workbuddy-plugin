@@ -65,7 +65,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.2.0"
+	version      = "0.2.1"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -88,11 +88,11 @@ type Config struct {
 // defaultConfig 返回插件默认配置。
 // [参数] 无。
 // [返回] 带默认值的配置结构。
-// 最近修改时间：2026-10-18；改动原因：新增，扣子插件骨架默认配置。
+// 最近修改时间：2026-10-18；改动原因：新增，扣子插件骨架默认配置；续期巡检间隔对齐其他插件改 4 小时。
 func defaultConfig() Config {
 	return Config{
 		TimeoutSeconds:       30,
-		RenewIntervalSeconds: 6 * 3600,
+		RenewIntervalSeconds: 4 * 3600,
 	}
 }
 

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.1 (2026-10-18)
+
+### 新增
+
+- **积分余额与过期提醒**：账号卡展示可用积分、额度池、消耗进度条与即将过期
+  明细；汇总卡新增「可用积分」「即将过期」两格。数据来自
+  `GET /api/marketplace/trade/credit/balance`（余额）与
+  `.../balance/detail?account_type=2&display_status=2`（逐笔过期明细）。
+  实测生产账号：总额 3000 / 可用 3000 / 即将过期 1500，与官网订阅页一致。
+- **面板「刷新积分」按钮**：`GET /credits?auth_id=&force=1` 跳过 5 分钟缓存
+  强制查询，只重绘该卡片。
+
+### 修复
+
+- **续期此前不是自动的**：宿主自动刷新循环的 `nextRefreshCheckAt` 在
+  `NextRefreshAfter` 为零时会回退到 `refresh_interval_seconds` 与
+  `ProviderRefreshLead`，而扣子不在宿主内置的 refresh lead 注册表里
+  （只有 codex / claude / antigravity / kimi / xai）。插件从未下发该字段，
+  导致账号永远排不进刷新队列——生产实测 24 小时内 0 条 auto-refresh 日志，
+  三次续期全部来自手动点击。现于登录/刷新下发的 `AuthData.Metadata` 补
+  `refresh_interval_seconds`。
+- 默认续期巡检间隔由 6 小时改为 **4 小时**，与其它插件一致。
+
+### 说明
+
+- 积分查询失败时面板显示「—」与错误原因，不会把未知渲染成 0。
+- 明细接口失败只影响过期提示，余额照常展示。
+
 ## 0.2.0 (2026-10-18)
 
 ### 新增

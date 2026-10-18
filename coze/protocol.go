@@ -64,6 +64,33 @@ const (
 	// 每组带 default_model_name 与模型列表。生视频模型（Seedance 2.5/2.0、
 	// MiniMax H3）只在这里出现，model_list 的 video_generation 只有 1 条。
 	multimodalCatalogPath = "/api/coze_claw/resource/get_multimodal_model_catalog"
+
+	// creditBalancePath 是积分余额端点。
+	//
+	// 契约（2026-10-18 真实账号实测）：GET，无需任何 query 即返回
+	// {"data":{"items":[{"remaining":3000,"source":24,"total":3000}],
+	//   "total_balance":3000,"total_remain":3000}}。
+	// 带上 account_type 会返回 788770703（下游调用失败），因此**不要传参数**。
+	creditBalancePath = "/api/marketplace/trade/credit/balance"
+
+	// creditDetailPath 是积分逐笔明细端点（含过期时间）。
+	//
+	// 该端点必须带 account_type，且只有 account_type=2 有数据：
+	//   - 0 / 不传 → 788770202 Invalid parameter
+	//   - 1        → 成功但 items 为空（个人空间下无数据）
+	//   - 2        → 返回逐笔明细，每笔含 remaining / total / expired_at /
+	//                source / show_name / display_status
+	// display_status=2 表示「即将过期」，与面板「1,500 积分即将过期」对应。
+	creditDetailPath = "/api/marketplace/trade/credit/balance/detail"
+
+	// creditDetailAccountType 是明细端点唯一有数据的 account_type 取值。
+	creditDetailAccountType = "2"
+
+	// creditDetailDisplayExpiring 是「即将过期」的 display_status 取值。
+	creditDetailDisplayExpiring = "2"
+
+	// creditDetailPageSize 是明细单页条数。
+	creditDetailPageSize = "100"
 )
 
 // tokenBeatURL 返回令牌端点的完整 URL。
@@ -208,4 +235,61 @@ func (r *accountInfoResponse) mobile() string {
 	}
 	v, _ := r.Data["mobile"].(string)
 	return strings.TrimSpace(v)
+}
+
+// creditBalanceURL 返回积分余额端点的完整 URL。
+// [参数] 无。
+// [返回] 完整 URL。
+// 最近修改时间：2026-10-18；改动原因：新增，积分余额出口。
+func creditBalanceURL() string {
+	return cozeSiteHost + creditBalancePath
+}
+
+// creditDetailURL 返回积分明细端点的完整 URL（含 account_type=2）。
+//
+// account_type 直接拼进 URL：该端点只有 account_type=2 有数据，
+// 没有其它合法取值需要保留成参数。
+// [参数] 无。
+// [返回] 完整 URL。
+// 最近修改时间：2026-10-18；改动原因：新增，积分明细出口。
+func creditDetailURL() string {
+	return cozeSiteHost + creditDetailPath + "?account_type=" + creditDetailAccountType
+}
+
+// creditBalanceResponse 是积分余额端点响应。
+type creditBalanceResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		// TotalBalance 是额度池总量，TotalRemain 是当前可用余量。
+		TotalBalance int64 `json:"total_balance"`
+		TotalRemain  int64 `json:"total_remain"`
+		Items        []struct {
+			Remaining int64 `json:"remaining"`
+			Total     int64 `json:"total"`
+			Source    int64 `json:"source"`
+		} `json:"items"`
+	} `json:"data"`
+}
+
+// creditDetailResponse 是积分明细端点响应。
+type creditDetailResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		Items   []creditDetailItem `json:"items"`
+		HasMore bool               `json:"has_more"`
+	} `json:"data"`
+}
+
+// creditDetailItem 是单笔积分明细。
+type creditDetailItem struct {
+	ID            string `json:"id"`
+	Title         string `json:"title"`
+	ShowName      string `json:"show_name"`
+	Remaining     int64  `json:"remaining"`
+	Total         int64  `json:"total"`
+	Source        int64  `json:"source"`
+	ExpiredAt     int64  `json:"expired_at"`
+	DisplayStatus int    `json:"display_status"`
 }

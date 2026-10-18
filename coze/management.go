@@ -76,6 +76,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/renew", Description: "对指定账号执行一轮续期（body: {auth_id}）。"},
 			{Method: http.MethodGet, Path: base + "/models", Description: "列出指定账号可测试的模型（query: auth_id）。"},
 			{Method: http.MethodPost, Path: base + "/test-active", Description: "对单个账号发起一次登录态与模型可见性探活（body: {auth_id, model?}）。"},
+			{Method: http.MethodGet, Path: base + "/credits", Description: "查询指定账号积分余额与即将过期明细（query: auth_id）。"},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Coze", Description: "扣子 Provider 管理面板：授权登录、账号管理与续期。"},
@@ -179,6 +180,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 	case method == http.MethodPost && subPath == "/test-active":
 		return makeJSONResponse(handleTestActive(req))
 
+	case method == http.MethodGet && subPath == "/credits":
+		return makeJSONResponse(handleCreditsQuery(req))
+
 	default:
 		return makeHTTPResponse(http.StatusNotFound, []byte(`{"error":"not_found"}`))
 	}
@@ -231,21 +235,27 @@ type accountSummary struct {
 	LastRenewAt string `json:"last_renew_at,omitempty"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
+	// Credits 是积分摘要；查询失败时 Error 非空，面板据此显示「未知」。
+	Credits *creditSummary `json:"credits,omitempty"`
 }
 
 // handleListAccounts 返回全部扣子账号摘要。
+//
+// 积分并发查询：多账号下串行会让面板首屏等待 N 倍超时。单个账号积分失败
+// 不影响列表本身——积分是附加信息，不能因为上游抖动让整个面板报错。
 // [参数] 无。
 // [返回] 管理响应。
-// 最近修改时间：2026-10-18；改动原因：新增，账号列表。
+// 最近修改时间：2026-10-18；改动原因：新增，账号列表；并发补积分摘要。
 func handleListAccounts() ([]byte, error) {
 	accounts, errList := listAllAuthFiles()
 	if errList != nil {
 		return makeHTTPResponse(http.StatusInternalServerError, []byte(fmt.Sprintf(`{"error":%q}`, errList.Error())))
 	}
 
-	list := make([]accountSummary, 0, len(accounts))
-	for _, acc := range accounts {
-		list = append(list, accountSummary{
+	list := make([]accountSummary, len(accounts))
+	var wg sync.WaitGroup
+	for i, acc := range accounts {
+		list[i] = accountSummary{
 			AuthID:      acc.AuthID,
 			AuthIndex:   acc.AuthID,
 			Label:       acc.Label,
@@ -259,8 +269,20 @@ func handleListAccounts() ([]byte, error) {
 			LastRenewAt: acc.LastRenewAt,
 			CreatedAt:   acc.CreatedAt,
 			UpdatedAt:   acc.UpdatedAt,
-		})
+		}
+		wg.Add(1)
+		go func(slot int, sa *StoredAuth) {
+			defer wg.Done()
+			summary, errFetch := cachedCreditSummary(sa, false)
+			if errFetch != nil {
+				list[slot].Credits = &creditSummary{Error: errFetch.Error()}
+				return
+			}
+			list[slot].Credits = summary
+		}(i, acc)
 	}
+	wg.Wait()
+
 	body, _ := json.Marshal(map[string]any{"accounts": list, "count": len(list)})
 	return makeHTTPResponse(http.StatusOK, body)
 }
