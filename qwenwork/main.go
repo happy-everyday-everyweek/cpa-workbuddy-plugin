@@ -329,7 +329,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.2.3"
 
 func wbRegistration() registration {
 	return registration{
@@ -632,8 +632,10 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 剥离 provider 前缀；QwenWork 的模型 ID 与上游一致，无需再改写。
-	upstreamModel := cpaToUpstreamKey(stripProviderPrefix(req.Model))
+	// 剥离 provider 前缀后反解 oauth-model-alias：宿主只按别名做路由匹配，
+	// 传给执行器的仍是客户端原始模型名，而上游只认真实 ID——直接透传别名
+	// 会被上游判为 invalid_request（400，param=None）。
+	upstreamModel := upstreamModelFor(req.Model, req.AuthAttributes)
 	started := time.Now()
 	authUID := ""
 	if sa.Account.UID != "" {
@@ -861,6 +863,22 @@ func stripProviderPrefix(model string) string {
 	return model
 }
 
+// upstreamModelFor 把执行器收到的客户端模型名解析为上游真实模型 ID。
+//
+// 三步不可调换：先剥 provider 前缀（"qwenwork/x" → "x"），再反解
+// oauth-model-alias（别名 → 真实 ID），最后做模型键归一。宿主只按别名做
+// 路由匹配，传给执行器的仍是客户端原始名字，而上游只认真实 ID——漏掉中间
+// 这一步会把别名原样透传，被上游判为 invalid_request（400，param=None）。
+// 2026-10-18 生产实证：面板「测试」直接指定真实 ID 故成功，经 new-api 走
+// 别名则失败，两条路径的差异掩盖了该缺陷。
+//
+// [参数] model: 执行器请求里的客户端模型名；attrs: 宿主传入的 auth 属性。
+// [返回] 可直接发给上游的模型 ID。
+// 最近修改时间：2026-10-18 04:30:00；改动原因：补齐遗漏的别名反解。
+func upstreamModelFor(model string, attrs map[string]string) string {
+	return cpaToUpstreamKey(resolveUpstreamModel(stripProviderPrefix(model), attrs))
+}
+
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
 // ExecutorRequest plus the async stream id the host uses to receive chunks.
 type executorStreamRequest struct {
@@ -878,7 +896,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := cpaToUpstreamKey(stripProviderPrefix(req.Model))
+	// 与同步路径同构：先剥 provider 前缀，再反解 oauth-model-alias。
+	upstreamModel := upstreamModelFor(req.Model, req.AuthAttributes)
 	started := time.Now()
 	authUID := ""
 	if sa.Account.UID != "" {
