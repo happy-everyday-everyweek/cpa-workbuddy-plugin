@@ -682,6 +682,15 @@ func pumpClawStream(streamID string, sa *StoredAuth, model, prompt string) {
 		// 正文已泄漏时用 length 收尾：客户端保留已生成内容，
 		// 下游计费也能凭终态事件恢复（本仓库既有教训）。
 		finishReason = openAIFinishLength
+		// 必须留痕：空正文 + length 对下游表现为「成功但 0 输出」，
+		// 没有任何错误信息，只能靠这条日志区分是上游失败还是真没内容。
+		hostLogf("warn", "对话执行失败", map[string]any{
+			"model":       model,
+			"prompt_len":  len(prompt),
+			"reply_len":   len(reply),
+			"finish":      finishReason,
+			"error":       errRun.Error(),
+		})
 	}
 
 	// 用量挂在终止帧上：宿主与 new-api 都从这一帧取 token 数，
