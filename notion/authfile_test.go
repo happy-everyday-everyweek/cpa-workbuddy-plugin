@@ -3,6 +3,7 @@ package main
 // 本文件验证 Cookie 解析、账号落盘与工作空间选择。
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -252,5 +253,111 @@ func TestStaticModelListExcludesDisabled(t *testing.T) {
 		if !strings.HasPrefix(m.ID, "notion/") {
 			t.Fatalf("模型 ID 缺少前缀: %s", m.ID)
 		}
+	}
+}
+
+// TestAuthDataCarriesFullStorage 校验宿主认证数据带完整凭据。
+//
+// 宿主用 AuthData.StorageJSON 作为该账号的持久化存储；回传空值时
+// 宿主会以自己的空存储覆盖账号文件，Cookie 与空间列表整体丢失，
+// 后续所有推理都会变成「未找到可用账号」。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，凭据覆盖回归。
+func TestAuthDataCarriesFullStorage(t *testing.T) {
+	auth := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-storage",
+		CookieHeader: "token_v2=t; notion_user_id=u",
+		TokenV2:      "t",
+		UserID:       "u",
+		SpaceID:      "space-1",
+		SpaceName:    "space-1",
+		Spaces:       []NotionSpace{{ID: "space-1", PremiumCredits: 300}},
+	}
+
+	data := authDataForLogin(auth)
+	if len(data.StorageJSON) == 0 {
+		t.Fatal("AuthData.StorageJSON 为空，宿主会覆盖掉账号凭据")
+	}
+
+	var roundTrip StoredAuth
+	if errUnmarshal := json.Unmarshal(data.StorageJSON, &roundTrip); errUnmarshal != nil {
+		t.Fatalf("StorageJSON 不是合法账号结构：%v", errUnmarshal)
+	}
+	if roundTrip.CookieHeader == "" {
+		t.Fatal("StorageJSON 丢掉了 cookie_header")
+	}
+	if roundTrip.SpaceID != "space-1" {
+		t.Fatalf("StorageJSON 丢掉了 space_id：%q", roundTrip.SpaceID)
+	}
+	if len(roundTrip.Spaces) != 1 || roundTrip.Spaces[0].PremiumCredits != 300 {
+		t.Fatalf("StorageJSON 丢掉了工作空间额度：%+v", roundTrip.Spaces)
+	}
+}
+
+// TestResolveAuthStripsJSONSuffix 校验宿主下发的 .json 标识能匹配本地账号。
+//
+// 宿主按凭据文件相对路径派生 AuthID（形如 notion-xxx.json），
+// 本地账号标识不带扩展名，不剥离就永远取不到号。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，账号标识对齐回归。
+func TestResolveAuthStripsJSONSuffix(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	auth := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-suffix",
+		CookieHeader: "token_v2=t; notion_user_id=u",
+		TokenV2:      "t",
+		UserID:       "u",
+		SpaceID:      "space-1",
+		Label:        "后缀测试",
+	}
+	if errWrite := writeAuthFileDirect(filepath.Join(dir, auth.AuthID+notionAuthFileSuffix), auth); errWrite != nil {
+		t.Fatalf("落盘失败：%v", errWrite)
+	}
+
+	// 直接走本地池分支：storageJSON 为空，只能靠 AuthID 匹配。
+	got, errResolve := resolveAuth(nil, "notion-suffix.json")
+	if errResolve != nil {
+		t.Fatalf("带 .json 的宿主标识应能解析到本地账号：%v", errResolve)
+	}
+	if got.AuthID != "notion-suffix" {
+		t.Fatalf("解析到错误账号：%s", got.AuthID)
+	}
+}
+
+// TestResolveAuthSkipsDisabled 校验停用账号不会被选中。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，停用过滤回归。
+func TestResolveAuthSkipsDisabled(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	auth := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-off",
+		CookieHeader: "token_v2=t; notion_user_id=u",
+		TokenV2:      "t",
+		UserID:       "u",
+		SpaceID:      "space-1",
+		Disabled:     true,
+		Label:        "停用测试",
+	}
+	if errWrite := writeAuthFileDirect(filepath.Join(dir, auth.AuthID+notionAuthFileSuffix), auth); errWrite != nil {
+		t.Fatalf("落盘失败：%v", errWrite)
+	}
+
+	if _, errResolve := resolveAuth(nil, "notion-off"); errResolve == nil {
+		t.Fatal("停用账号不应被解析为可用")
 	}
 }

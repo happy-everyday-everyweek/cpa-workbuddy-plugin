@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.3 (2026-10-19)
+
+### 修复
+
+- **账号凭据被宿主覆盖，导致模型别名路由后一律报「未找到可用账号」**。
+  生产表现为 `gpt-6-luna`（别名指向 `notion/omodi`）与直连
+  `notion/omodi` 返回同一条 `auth_unavailable: ... 未找到可用账号`。
+  排查确认与模型别名机制无关：宿主
+  `OAuthModelAliasChannel` 对未知 provider 直接返回 provider 自身，
+  `notion-provider` 作为别名 channel 是被支持的。
+  真正原因是 `authDataForLogin` 只回传 `ID/Provider/Label/Disabled/ProxyURL/Metadata`
+  而没有 `StorageJSON`；宿主把 `AuthData.StorageJSON` 当作该账号的持久化存储
+  （`storageJSONFromAuth` 在 RawJSON 为空时回落 marshal `Metadata`），
+  于是用这份「精简认证数据」重写账号文件，磁盘上的
+  `cookie_header`、`token_v2`、`spaces` 全部丢失，只剩
+  `disabled/space_id/space_name/type/user_id`（生产实测 194 字节）。
+  修复为回传完整账号 JSON 作为 `StorageJSON`。
+
+### 修复（续）
+
+- **`resolveAuth` 匹配不到账号**。宿主的 `AuthID` 由凭据文件相对路径派生，
+  形如 `notion-xxx.json`；插件本地账号标识不带扩展名，两者直接比较永远不相等。
+  修复为比较前剥离 `.json` 后缀，并跳过停用账号。
+  同时当宿主下发的 `StorageJSON` 缺少 `AuthID` 时用 `AuthID` 回填。
+- **宿主账号索引不可用时账号列表为空**。`listHostAuthFiles` 在 RPC 失败、
+  响应非 OK、结果为空三种情况下回落到磁盘扫描，避免刚热重载时宿主索引
+  尚未重建导致推理链路误判无号可用。
+
+### 测试
+
+- `TestAuthDataCarriesFullStorage`：锁定 `StorageJSON` 必须能反序列化回
+  `cookie_header` / `space_id` / `spaces[].PremiumCredits`。
+- `TestResolveAuthStripsJSONSuffix`：锁定带 `.json` 后缀的宿主 `AuthID` 可匹配本地账号。
+- `TestResolveAuthSkipsDisabled`：锁定停用账号不可被解析。
+
 ## 0.1.2 (2026-10-19)
 
 ### 修复

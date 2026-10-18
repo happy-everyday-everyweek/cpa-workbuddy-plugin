@@ -126,13 +126,19 @@ func handleExecStream(raw []byte) ([]byte, error) {
 }
 
 // resolveAuth 从宿主载荷里取出账号。
+//
+// AuthID 由宿主按凭据文件相对路径派生，形如 `notion-xxx.json`；
+// 本地账号标识不带扩展名，因此比较前必须剥离，否则永远匹配不上。
 // [参数] storageJSON: 账号 JSON；authID: 账号标识。
 // [返回] 账号与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，账号解析入口。
+// 最近修改时间：2026-10-19；改动原因：剥离 .json 后缀并跳过停用账号，修复别名路由后取不到号。
 func resolveAuth(storageJSON []byte, authID string) (*StoredAuth, error) {
 	if len(storageJSON) > 0 {
 		var auth StoredAuth
 		if errUnmarshal := json.Unmarshal(storageJSON, &auth); errUnmarshal == nil && auth.CookieHeader != "" {
+			if auth.AuthID == "" {
+				auth.AuthID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
+			}
 			if auth.SpaceID == "" && len(auth.Spaces) > 0 {
 				auth.SpaceID = auth.Spaces[0].ID
 			}
@@ -143,9 +149,12 @@ func resolveAuth(storageJSON []byte, authID string) (*StoredAuth, error) {
 		}
 	}
 
-	authID = strings.TrimSpace(authID)
+	authID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
 	if authID != "" {
 		for _, auth := range listHostAuthFiles() {
+			if auth.Disabled {
+				continue
+			}
 			if auth.AuthID == authID {
 				return auth, nil
 			}

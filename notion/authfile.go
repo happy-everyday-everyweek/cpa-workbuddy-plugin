@@ -610,15 +610,22 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 }
 
 // authDataForLogin 把账号转换成宿主可识别的认证数据。
+//
+// StorageJSON 必须是完整凭据：宿主用它作为该账号的持久化存储，
+// 回传空值时宿主会以自己的空存储覆盖账号文件，Cookie 与空间列表
+// 会整体丢失，后续所有推理都变成「未找到可用账号」。
 // [参数] auth: 账号。
 // [返回] 宿主认证数据结构。
-// 最近修改时间：2026-10-18；改动原因：新增，宿主认证数据映射。
+// 最近修改时间：2026-10-19；改动原因：补 StorageJSON，修复宿主覆盖凭据导致账号失效。
 func authDataForLogin(auth *StoredAuth) pluginapi.AuthData {
+	storage, _ := json.Marshal(auth)
 	return pluginapi.AuthData{
-		ID:       auth.AuthID,
-		Provider: providerName,
-		Label:    auth.Label,
-		Disabled: auth.Disabled,
+		ID:          auth.AuthID,
+		Provider:    providerName,
+		Label:       auth.Label,
+		Disabled:    auth.Disabled,
+		ProxyURL:    auth.ProxyURL,
+		StorageJSON: storage,
 		Metadata: map[string]any{
 			"user_id":    auth.UserID,
 			"space_id":   auth.SpaceID,
@@ -627,24 +634,30 @@ func authDataForLogin(auth *StoredAuth) pluginapi.AuthData {
 	}
 }
 
-// listHostAuthFiles 从宿主获取账号索引。
+// listHostAuthFiles 从宿主获取账号索引，宿主不可用时回落到本地扫描。
+//
+// 宿主在部分调用路径下不会下发 StorageJSON，此时只能靠 AuthID 定位账号；
+// 若宿主 RPC 也不可用，必须回落到磁盘，否则一次失败就会把整池账号判成不可用。
 // [参数] 无。
-// [返回] 账号列表；宿主不可用时返回 nil。
-// 最近修改时间：2026-10-18；改动原因：新增，宿主账号来源。
+// [返回] 账号列表；宿主与磁盘都为空时返回 nil。
+// 最近修改时间：2026-10-19；改动原因：补本地回落，修复宿主列表不可用时取不到号。
 func listHostAuthFiles() []*StoredAuth {
 	raw, errCall := hostCall(pluginabi.MethodHostAuthList, nil)
 	if errCall != nil {
-		return nil
+		accounts, _ := listAllAuthFiles()
+		return accounts
 	}
 	var env envelope
 	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil || !env.OK {
-		return nil
+		accounts, _ := listAllAuthFiles()
+		return accounts
 	}
 	var resp struct {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
 	if errUnmarshal := json.Unmarshal(env.Result, &resp); errUnmarshal != nil {
-		return nil
+		accounts, _ := listAllAuthFiles()
+		return accounts
 	}
 
 	var out []*StoredAuth
@@ -658,6 +671,11 @@ func listHostAuthFiles() []*StoredAuth {
 		}
 		auth.Disabled = auth.Disabled || f.Disabled
 		out = append(out, auth)
+	}
+	// 宿主索引可能尚未重建（例如刚热重载），磁盘是最终事实来源。
+	if len(out) == 0 {
+		accounts, _ := listAllAuthFiles()
+		return accounts
 	}
 	return out
 }
