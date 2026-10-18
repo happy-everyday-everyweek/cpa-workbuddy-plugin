@@ -397,6 +397,33 @@ QwenWork 无对应语义，但实测四种常见 110 形态均不误伤，保留
 
 **生产账号**：安装后 `accounts:[]`（0 账号），需用户在面板走 Device Flow 登录后才会出现账号；本轮不代登录。
 
+**缺陷修复（2026-10-18，0.2.3）：执行器漏接 oauth-model-alias 反解**
+
+生产反馈「new-api 测试 `qwen3.8-max-preview` 失败，但 CPA 面板测试同模型成功」。根因：宿主对 `oauth-model-alias` 只做路由匹配，`ExecutorRequest.Model` 仍是客户端原始别名；执行器只做 `stripProviderPrefix` 就透传，上游只认真实 ID ⇒ 别名请求稳定 400 `invalid_request`（`param: "None"`）。面板测试走动态发现的真实 ID，故成功——两条路径模型名来源不同，掩盖了缺陷。
+
+单变量取证（同 `auth_index`）：真实 ID `qwen3.8-max-preview` 成功，三条别名 `qwen-3.8-max` / `qwen-3.8` / `qwen3.8-max` 全部 400；`reasoning_effort` 四档（无/xhigh/high/max）全部 200，已排除。
+
+修复：新增 `upstreamModelFor`，固定「剥 provider 前缀 → 反解别名 → 键归一」，同步与流式两条路径统一调用。**变异反证**：把函数体退回「只剥前缀」→ `TestUpstreamModelFor_ExecutorPath` 6 个子用例精确 FAIL；还原后全绿。详见 `doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`。
+
+**教训**：`resolveUpstreamModel` 在 `models.go` 早已实现但**只被测试调用**——这是克隆遗留的高危信号（`grep funcName` 后调用点只在 `_test.go`）。首次变异测试仍全绿也印证：只测纯函数不覆盖接线时，保护是假阳性的。
+
+**缺陷修复续（2026-10-18，0.2.4~0.2.6）：四层缺陷串联，逐层暴露**
+
+| 版本 | 缺陷 | 症状 |
+|---|---|---|
+| 0.2.3 | 执行器不做别名反解 | 别名原样透传 |
+| 0.2.4 | `ExecutorModelScope=OAuth` 致宿主跳过 `StaticModels`、别名缓存恒空 | 反解拿不到数据 |
+| 0.2.5 | **透传 body 未改写 `model`**（真正主因） | 别名随 Payload 发上游 |
+| 0.2.6 | 调度会话键被当作 MaaS `session_id` | `422 value is not a valid UUID` |
+
+**关键证据（0.2.5）**：生产日志 `model=qwen3.8-max-preview alias=qwen-3.8-max` 证明宿主**早已把 `ExecutorRequest.Model` 反解为真实 ID**，插件却把 `req.Payload`（客户端原文，model 仍是别名）直接透传。§2.1 中「宿主不做反解」的判断是错的。
+
+**生产验收（0.2.6，热重载零重启）**：`qwen3.8-max-preview` / `qwen-3.8-max` / `qwen-3.8` / `qwen3.8-max` 四条全部 **200**（修复前分别为 200/500/503/503）；流式路径带 `X-Session-ID` 头同样 200，SSE 正常 `[DONE]`，响应 `model` 字段为真实 ID。
+
+**安装坑**：`plugin-store install` 不带 `source` 参数会报 `direct plugin version "0.2.6" not found`（多源合并路径版本解析失败），必须带 `&source=source-636fa01121af`。
+
+完整根因链见 `doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`。
+
 ### CYCLE-03：额度与生命周期
 
 - `account-context` + `wallets` 额度查询
