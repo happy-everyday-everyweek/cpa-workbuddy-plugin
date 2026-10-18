@@ -40,7 +40,10 @@
   - **缺陷 3（0.3.2 → 0.3.3）：正文重复一遍**。0.3.2 部署后生产时序验收：总耗时从 92s 降到 17.71s、29 个正文帧在 5.02–17.70s 陆续到达（间隔约 0.3s），真流式恢复。但发现末帧 578 字**恰好等于前文拼接**，全文 1156 字重复输出两遍。**根因**：`content.message_data.reply.content` 在 `event_delta` 是增量、在 `event_final` 是**累积全文**，`parseFrontierMessage` 一视同仁当 delta 追加。修复：解析完 `content_v2` 拿到 phase 后，`event_final` 清空 `Delta` 只留 `Snapshot`。回归 `TestParseFinalFrameDoesNotDuplicate` + `TestParseDeltaFrameKeepsDelta`（变异移除清空逻辑精确 FAIL）。
   - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
   - **缺陷 4（0.3.3 → 0.3.4）：多轮对话空正文**。生产验收：单 user 正常（65 字），带 `assistant` 历史的多轮请求 0 字、`finish=stop`。**根因**：`runStream` 用固定 300ms 猜 WS 是否连上再发 chat；网络慢时 chat 抢跑，快速回复（多轮约 2 秒结束）的 `event_delta` 在连接就绪前推完，只收到重放的 `event_final`，而 final 的 delta 已被 0.3.3 清空 → 空正文。**WS 抓帧佐证**：同一 prompt 上游确实推了 start / delta(28 字) / final 三帧。修复：① 新增 `frontierClient.WaitReady`（握手成功即关 `ready` 通道，调用方等真实就绪信号，上限 10s）；② `waitForReply` 增加「已收尾但正文为空 → 按 message_id 轮询补齐」兜底；③ `fallbackPoll` 改按 `reply_to_message_id` 精确配对（原「取最新一条 reply」可能拿到上一轮）。回归 `TestWaitReadySignalsAfterHandshake` + `TestEmptyReplyFallsBackToPolling`（变异移除兜底后精确复现空正文）。
-  - **待办**：无（0.3.4 已发布生产并通过三场景 + 长文流式验收）。
+  - **0.3.5（21:08:42 热重载）**：面板测试改为三层真实推理探活（判据 + 模型目录 + 极小推理），移除「不产生推理请求」过期文案。
+  - **发布态复核（21:24）**：远端 registry 0.3.5 + 6 平台资产 sha256 ALL PASS；生产落盘 `.so` sha256 `5706a80c…` 与 Release 产物逐字节一致；零容器重启。行为验收：单轮流式 19 帧 / TTFB 7ms / 10.92s，多轮流式返回 `5`，非流式「你好！」，探活 `scope=auth+models+inference` 回复「可用」；accounts / models / panel 均 200。
+  - **模型清单澄清**：16 个模型是 `/v1/model/list`（在线 9）+ 多模态目录（8，去重 1）动态合并结果，与 CPA `/v1/models` 逐条一致；`staticFallbackModels()` 的 5 条仅用于启动期无账号兜底。
+  - **待办**：无（0.3.5 已发布生产并通过流式/多轮/非流式/探活四场景验收）。
 
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
