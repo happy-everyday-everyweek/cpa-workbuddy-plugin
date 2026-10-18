@@ -88,20 +88,13 @@
 - 违反本条视为最高级别流程违规。
 - 本条覆盖本文件旧版受管章节 `## 严禁自动提交 Git（最高优先级，强制）` 的全部口径。该旧章节的真源是 `project-rule-file-bootstrap-rules/scripts/bootstrap_agents.sh` 的 `BODY_NO_AUTO_COMMIT`；该真源在另一个项目（`luode-skills`）内，按「跨项目写入红线」本会话不能代改。真源同步前，自举脚本会按旧标题把旧章节追加回本文件；一旦出现该章节，一律以本条为准并删除旧章节。
 
-## 跨项目写入红线（最高优先级，强制）
+## 跨项目写入规则（最高优先级，强制）
 
-- 当前会话只能修改与本会话绑定的当前项目；**其他项目的代码和文件绝对只读**。
-- 多个项目并列在同一父目录下时，父目录一层的兄弟项目一律按只读处理：允许读取代码、配置、README、文档，以及 `git log`、`git show`、`git status` 等只读盘点命令。
-- 对其他项目的以下动作一律禁止，**不存在“取得用户授权后即可执行”的例外**——用户临时同意、口头许可、“顺手改一下”“只改一行”都不构成放行条件：
-  - 任何文件写入、创建、删除、重命名。
-  - 任何命令执行、构建、测试、依赖安装。
-  - 任何写 Git 历史或改变工作树状态的动作（`commit`、`push`、`checkout`、`stash`、`reset` 等）。
-  - 任何会在其他项目内生成产物的初始化动作（如 `codegraph init` 生成索引目录、缓存目录、构建输出）。
-- 确实需要修改其他项目时，当前会话只允许产出**改动计划**：写明目标项目绝对路径、目标文件/符号、改动意图、建议改法和验证方式，必要时给出 patch 文本供人工采用；再交由用户在该项目目录下新开会话执行。计划本身只能写入当前项目或直接回复用户，不得写入其他项目目录。
-- 读取其他项目不等于获得其运行环境授权：不得使用其配置连接数据库、缓存、消息队列或上下游服务，也不得启动其服务来补证据；本地连接红线仍以当前项目的 `local` 配置为准。
-- 定位其他项目的发现顺序与只读边界细则见 `implementation-planning-rules/references/sibling-project-discovery.md`；Bug 跨项目对照排查见 `bug-intake-rules`，跨项目 CodeGraph 查询见 `codegraph-analysis-rules`。
-- 本条为项目级重申，确保重启会话 / 无全局上下文时本规则仍在项目内生效。
-- 违反本条视为最高级别流程违规。
+- 默认情况下，当前会话聚焦处理与本会话绑定的当前项目；未获授权的其他兄弟项目代码和文件保持只读。
+- **用户授权例外（生效条件）**：当用户在当前轮明确给出授权（如“授权当前会话处理 F:\xxx 项目”、“允许修改某兄弟项目”等明确许可）时，允许在当前会话中对该目标项目执行文件修改、代码编写、构建与测试验证。
+- 未经用户当轮明确授权的其他兄弟项目，一律继续严格保持只读，禁止私自跨目录改动。
+- 跨项目执行代码修改时，同样遵守基础代码核查门禁与项目既有编码风格，不扩大改动范围，不引入无关变动。
+- 本条为项目级最新基准，覆盖历史版本中绝对禁止跨项目写入的死板条款。
 
 ## Skill 命中强制规则
 
@@ -319,7 +312,7 @@
 - push 必须带：`GIT_TERMINAL_PROMPT=0 GIT_ASKPASS='C:\Users\luode\.github\git-askpass.sh' git -c credential.helper= push https://...`；askpass 用完即删；Windows 路径必须用 `C:\...` 形式（Git 不认 `/c/`）。
 - 并行工作区安全发布：`git add` 必须显式列文件（禁 `git add <dir>`），staged 后 `git diff --cached --name-only | grep` 反向确认无外来文件混入。
 - 资产下载：`scripts/download-release-assets.py`（urllib 直连 releases/download + sha256 自校验）；registry 校验 `scripts/validate-registry.py`。
-- 发布后清理（每次发布闭环后必做）：`release-assets/` 受 git 跟踪且被 registry raw URL 直接引用，只保留 registry 当前版本目录，历史版本用 `scripts/prune-release-assets.py` 删除（`git rm` 后提交推送）；本地未跟踪缓存 `.workbuddy/release-assets/` 直接删。详见项目 skill `project-cpa-workbuddy-plugin-release-asset-prune-rules`。
+- 资产托管（2026-10-18 起）：二进制发布到 GitHub Release，registry 的 `direct` URL 指向 `releases/download/<id>-v<version>/<zip>`；`release-assets/` 已退出 git 跟踪（`.gitignore` 忽略），只是本地缓存，可随时删除。一次发布只有 2 次推送（代码 + registry）。`scripts/prune-release-assets.py` 与项目 skill `project-cpa-workbuddy-plugin-release-asset-prune-rules` 已退役。
 - **生产容器重启红线（非必要不重启，强制）**：**非必要不要重启生产 cpa 容器**（`cli-proxy-api`）。插件的新增 / 更新 / 安装一律走 `plugin-store install`（管理 API）热重载生效——该路径默认返回 `restart_required:false`，**插件的更新安装一般不需要重启容器**；`docker cp` 新 `.so`、`PUT /v0/management/plugins/<p>/config` 写同内容都不触发加载，重启也不是更"干净"的生效方式。重启会中断在线流量并触发 60–80 秒冷启动（9 插件 + 模型刷新），属高成本、高影响操作：只有热重载经证据确认未生效（`install` 后 `docker logs cli-proxy-api | grep "hot reloaded"` 无该插件记录）或生产配置损坏恢复等**必要场景**，且已取得用户明确确认时才执行；否则把重启时机交用户决定，不得把"重启宿主"当作发布收尾的默认动作。完整规则见项目 skill `project-cpa-workbuddy-plugin-release-rules`（Step 13 / 踩坑 48）与 `project-cpa-workbuddy-plugin-host-config-safety-rules`（配置写入红线）。
 - **生产配置存储红线（不手工改数据库表，强制）**：生产 CPA 的插件配置由 `plugin-store install` 一条命令自动维护——CPA 自动把该插件的 `version` + 7 平台 `artifacts` 写入 `config_store` 表（MySQL 容器 `mysql` → 库 `cli_proxy_api` → 表 `config_store` → 单条 `id='config'` 的 `content`），随后逐字节原样落盘 spool `config.yaml` 并热重载，**零人工介入，任何人、任何步骤都不需要直接读写该表**。**⛔ 禁止**为了「确认 / 修改插件配置」而 `select content from cli_proxy_api.config_store` 再把内容写回：读出的 content 经 JSON 二次序列化写回会让真实换行退化为字面 `\n`、整篇塌缩单行，YAML 首字符 `#` 被判为注释 → 解析为空配置 → `remote-management.secret-key` / `port` 全丢 → `/v0` `/v8` 管理路由全 404、端口漂移、外网 502（**2026-10-11 两次生产事故成因**）。非插件配置走 `PUT /v8/management/config`；数据库表**只读不写**（`select` 可以，读完绝不写回）。损坏铁证：原反斜杠被再转义一层（`\"` → `\\"`）；自检 `select (length(content)-length(replace(content, char(10), ''))) from cli_proxy_api.config_store where id='config';` 正常应为数十量级，**=1 即已损坏**。完整规则见项目 skill `project-cpa-workbuddy-plugin-release-rules`（Step 13 / 踩坑 54）与 `project-cpa-workbuddy-plugin-host-config-safety-rules`。
 
@@ -339,7 +332,7 @@
 ### 关键设计决策
 
 - 数据库/配置一律逻辑引用（无物理外键）。
-- failover：1/3/10 分钟阶梯退避；429/402/5xx/传输错误（status==0）计入，业务 400 不计；cooldown 期间跳过该账号。
+- failover：阶梯冷却 30s×连续失败次数、上限 10 分钟（cap 20 档），一次成功即清零回落；429/402/5xx/传输错误（status==0）计入，业务 400 不计；软失败（429 无额度标记 / 软限流文案 / 零字节断流）与硬失败共用同一计数阶梯；Qoder 系排队帧 `isQueueFrame` 保持「不计数不冷却」红线；cooldown 期间跳过该账号。
 - 40x 换号重试（0.9.9+）：401/403/404/405 计入账号级故障，`retry_on_4xx` 预算默认 3（0-5）；**缺省键保持当前值**（kill switch 安全：无关 reconfigure 不得重置 `retry_on_4xx: 0`）。
 - 路由（0.12.0 起）：移除三池（priority/default/fallback），只留保号池（watchdog 积分阈值自动归池，默认 10m 刷新、阈值 50）；存量 auth 文件 `pool`/`priority` 字段忽略式读取不清理。
 - 版本三轨（qoderwork）：main.go 0.8.2 / VERSION 0.4.1 / registry 0.2.x 历史双轨，发版以 registry 为准。

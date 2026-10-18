@@ -188,14 +188,13 @@ cpa-workbuddy-plugin/
 ├── copilot/                    # 插件 8：GitHub Copilot Provider（设备码登录 / 内部令牌保活 / 指纹模拟）
 ├── token-usage-tracker/        # 插件 9：统一 Token 用量看板（共享 NDJSON / 明细表 / 维度分析）
 ├── registry.json               # 插件商店自定义源元数据（schema v2，direct install，包含 sha256 与 size）
-├── release-assets/             # 各版本 6 平台架构 zip 与 checksums 产物（发布后仅保留各插件最新版）
+├── release-assets/             # 本地资产缓存（.gitignore 忽略；二进制托管在 GitHub Release）
 ├── assets/                     # 共享资源（官方高清图标 icons/ 等）
 ├── scripts/                    # 运维与发布脚本
 │   ├── cgo-shim-build.py       # 本地跨平台 cgo 验证 shim（Windows 无 C 工具链专用验证工具）
-│   ├── download-release-assets.py # 从 GitHub Release 自动下载 8 资产入库
-│   ├── publish-assets.py       # 扫描 release-assets 并更新回填 registry.json
+│   ├── download-release-assets.py # 从 GitHub Release 下载 7 资产到本地缓存并校验
+│   ├── publish-assets.py       # 扫描 release-assets 并回填 registry.json（URL 指向 Release）
 │   ├── validate-registry.py    # registry.json 格式与 SHA-256 完整性自检
-│   ├── prune-release-assets.py # 发布后清理脚本（安全清理历史版本资产）
 │   └── qoder_cn_pat_login.py   # QoderWork CN PAT 辅助获取脚本
 ├── doc/                        # 研发全链路文档库
 │   ├── 1-架构/                 # 总架构设计、目录树与主要业务链路说明
