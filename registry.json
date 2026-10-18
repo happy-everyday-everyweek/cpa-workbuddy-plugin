@@ -771,6 +771,70 @@
           }
         ]
       }
+    },
+    {
+      "id": "notion-provider",
+      "name": "Notion AI Provider",
+      "description": "Notion AI account provider for CLIProxyAPI: browser-Cookie import with multi-workspace discovery, OpenAI-compatible chat executor over the reverse-engineered transcript patch stream, multi-account pool with laddered cooldown failover, thread reuse, rolling session-Cookie write-back, and a dedicated management panel.",
+      "author": "luode0320",
+      "version": "0.1.0",
+      "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
+      "logo": "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/assets/icons/Notion.png",
+      "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/notion",
+      "license": "MIT",
+      "tags": [
+        "Provider",
+        "Notion",
+        "AI",
+        "Management"
+      ],
+      "install": {
+        "type": "direct",
+        "artifacts": [
+          {
+            "goos": "darwin",
+            "goarch": "amd64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_darwin_amd64.zip",
+            "sha256": "d7449e4115e428f88a3fe87723f30c8974009864f64a1bf53a25876005da0b92",
+            "size": 3722844
+          },
+          {
+            "goos": "darwin",
+            "goarch": "arm64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_darwin_arm64.zip",
+            "sha256": "c63fd76005ee488e26912b9c4fea4e1276e56f8bf235c527a09a5524447ddb46",
+            "size": 3432721
+          },
+          {
+            "goos": "linux",
+            "goarch": "amd64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_linux_amd64.zip",
+            "sha256": "e5a4506a80336efa8d9aabc45da676eca8f57c42fa24e63ba27e3a516c765742",
+            "size": 3905616
+          },
+          {
+            "goos": "linux",
+            "goarch": "arm64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_linux_arm64.zip",
+            "sha256": "568c7290db74729b71bb2f4e9a47bb7d727703c3372c14a944a72c6bde67d119",
+            "size": 3550087
+          },
+          {
+            "goos": "windows",
+            "goarch": "amd64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_windows_amd64.zip",
+            "sha256": "66513d68c2664c01024d5279259e5dff14003ecf37ee99092db29e8afa4ca882",
+            "size": 3804705
+          },
+          {
+            "goos": "windows",
+            "goarch": "arm64",
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/notion-provider-v0.1.0/notion-provider_0.1.0_windows_arm64.zip",
+            "sha256": "7a9c432dff28f80d760f763d164b8c3c1b7500da79fd96db609a197df012e6d0",
+            "size": 3500279
+          }
+        ]
+      }
     }
   ]
 }
