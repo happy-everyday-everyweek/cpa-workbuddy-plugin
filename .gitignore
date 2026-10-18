@@ -20,3 +20,17 @@ tmp_ws_probe
 # AI-host tool data dirs (CodeGraph DB / Codex plan projections)
 .codegraph/
 .zcode/
+
+# local-only credentials & probe scratch (never committed)
+.local_cookie.txt
+doubao/.local_cookie.txt
+.tmp-cookie-copy/
+tmp_collect_cookie.py
+tmp_extract_cookie.py
+tmp_probe_*.py
+
+# qwenwork login probe scratch (credentials never committed)
+.qwenwork-probe/
+
+# local release asset cache (binaries are published to GitHub Releases)
+release-assets/

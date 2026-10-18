@@ -2,14 +2,20 @@
 """Publish helper: sync release-assets/<plugin>-<version>/ + registry.json.
 
 Usage:
-    python publish-assets.py token-usage-tracker 0.1.2 [--assets-dir release-assets]
+    python publish-assets.py <plugin> <version> [--assets-dir release-assets]
+    python publish-assets.py --all-current
 
 Steps:
   1. scan release-assets/<id>-<version>/ for <id>_<version>_<goos>_<goarch>.zip + checksums.txt
   2. verify all 6 platforms present
   3. update registry.json: version + install.artifacts[*].{url,sha256,size}
-     (URLs keep the raw.githubusercontent.com/main/release-assets/... layout)
+     (URLs point at the GitHub Release download endpoint)
   4. validate with scripts/validate-registry.py
+
+`--all-current` rewrites every plugin in registry.json to its own current
+version without touching version fields; sha256 comes from the Release
+checksums.txt and size from the Release asset metadata, so no zip downloads
+are needed.
 """
 from __future__ import annotations
 
@@ -19,6 +25,10 @@ import json
 import pathlib
 import re
 import sys
+import urllib.request
+
+REPO = "luode0320/cpa-workbuddy-plugin"
+RELEASE_BASE = f"https://github.com/{REPO}/releases/download"
 
 PLATFORMS = [
     "darwin_amd64",
@@ -29,8 +39,6 @@ PLATFORMS = [
     "windows_arm64",
 ]
 
-RAW_BASE = "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/release-assets"
-
 
 def sha256_of(path: pathlib.Path) -> str:
     h = hashlib.sha256()
@@ -40,12 +48,100 @@ def sha256_of(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 
+def release_url(plugin: str, version: str, name: str) -> str:
+    return f"{RELEASE_BASE}/{plugin}-v{version}/{name}"
+
+
+def fetch(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "cpa-publish-assets"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
+
+
+def release_metadata(plugin: str, version: str) -> tuple[dict[str, str], dict[str, int]]:
+    """Return ({zip name: sha256}, {asset name: size}) straight from the Release."""
+    tag = f"{plugin}-v{version}"
+    checksums: dict[str, str] = {}
+    body = fetch(f"{RELEASE_BASE}/{tag}/checksums.txt").decode("utf-8")
+    for line in body.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            checksums[parts[1]] = parts[0]
+
+    api = f"https://api.github.com/repos/{REPO}/releases/tags/{tag}"
+    data = json.loads(fetch(api))
+    sizes = {a["name"]: int(a["size"]) for a in data.get("assets", [])}
+    return checksums, sizes
+
+
+def rewrite_all_current() -> int:
+    reg = pathlib.Path("registry.json")
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    plugins = data.get("plugins") or []
+    if not plugins:
+        raise SystemExit("registry.json has no plugins")
+
+    failures: list[str] = []
+    for entry in plugins:
+        plugin = entry["id"]
+        version = str(entry.get("version") or "").strip()
+        install = entry.setdefault("install", {"type": "direct"})
+        install["type"] = "direct"
+        arts = install.get("artifacts")
+        if not isinstance(arts, list):
+            arts = []
+            install["artifacts"] = arts
+
+        # The platform set is owned by registry.json, never by the Release asset
+        # list: several Releases still carry a retired freebsd_amd64 zip.
+        wanted = {f"{a['goos']}_{a['goarch']}" for a in arts}
+        if wanted != set(PLATFORMS):
+            failures.append(f"{plugin}: registry platforms {sorted(wanted)} != {PLATFORMS}")
+            continue
+
+        try:
+            checksums, sizes = release_metadata(plugin, version)
+        except Exception as exc:  # noqa: BLE001 - report and keep going
+            failures.append(f"{plugin}: release metadata failed: {exc}")
+            continue
+
+        for art in arts:
+            t = f"{art['goos']}_{art['goarch']}"
+            name = f"{plugin}_{version}_{t}.zip"
+            sha = checksums.get(name)
+            size = sizes.get(name)
+            if not sha or size is None:
+                failures.append(f"{plugin}: release asset missing {name}")
+                continue
+            art["url"] = release_url(plugin, version, name)
+            art["sha256"] = sha
+            art["size"] = size
+        print(f"{plugin} {version}: {len(arts)} artifacts -> Release URLs")
+
+    if failures:
+        for f in failures:
+            print(f"ERROR {f}", file=sys.stderr)
+        return 1
+
+    reg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"rewrote {len(plugins)} plugins to Release URLs")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("plugin")
-    ap.add_argument("version")
+    ap.add_argument("plugin", nargs="?")
+    ap.add_argument("version", nargs="?")
     ap.add_argument("--assets-dir", default="release-assets")
+    ap.add_argument("--all-current", action="store_true")
     args = ap.parse_args()
+
+    if args.all_current:
+        if args.plugin or args.version:
+            raise SystemExit("--all-current takes no plugin/version")
+        return rewrite_all_current()
+    if not args.plugin or not args.version:
+        raise SystemExit("usage: publish-assets.py <plugin> <version> | --all-current")
 
     plugin, version = args.plugin, args.version
     ver_re = re.compile(r"^[0-9][0-9A-Za-z.+-]*$")
@@ -110,7 +206,7 @@ def main() -> int:
         if art is None:
             art = {"goos": goos, "goarch": goarch, "url": "", "sha256": "", "size": 0}
             arts.append(art)
-        art["url"] = f"{RAW_BASE}/{plugin}-{version}/{z.name}"
+        art["url"] = release_url(plugin, version, z.name)
         art["sha256"] = sha256_of(z)
         art["size"] = z.stat().st_size
         seen.add(t)
