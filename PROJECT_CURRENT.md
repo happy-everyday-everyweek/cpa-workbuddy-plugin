@@ -32,7 +32,19 @@
 
 ## 活动会话进展摘要
 
-- 当前会话（2026-10-18）：**coze-provider 0.2.2 定时续期改由插件自建定时器执行**：
+- 当前会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
+  - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
+  - **实现（5 个新文件，约 1600 行）**：`frontier_frame.go`（12 字段 protobuf 手写编解码，按 tag 分派+跳过未知字段）、`frontier.go`（WS 客户端：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`、10s `hi` 心跳、读超时、指数退避重连）、`claw.go`（claw/info→get_main→chat→message/list→get_frontier_key，统一 `code` 业务判定）、`convert.go`（OpenAI messages 折叠、chunk/completion 构造）、`executor.go`（流式/非流式入口、`turn_id+seq_num+phase` 去重、`event_final` 收尾、首字超时降级轮询）。
+  - **main.go**：声明 `Executor:true` + `ExecutorModelScopeBoth` + `openai` 输入输出；新增 4 个 executor 方法分发。
+  - **实现中修复的两个真实缺陷**：① 心跳协程只在 ticker 触发时检查状态，服务端断开后要空等 10 秒才重连 → 改为读循环结束即取消心跳协程；② 增量按「累积差值」下发，两帧间隔小于轮询间隔时被合并成一大块（客户端「卡一下蹦一大段」）→ 改为 `pending` 队列逐帧 emit。
+  - **验证**：cgo-shim build/vet/test 全绿（9.4s）；新增 46 个用例（含 2 个 live test）；3 次变异反证均被精确捕获（解码器不写 service → 3 FAIL；去掉 service 过滤 → 1 FAIL；不投递 pending → 3 FAIL）；关键用例用 2026-10-18 抓到的真实帧 hex 而非自造样本。
+  - **清理死代码**：`upstreamModelName`（message/chat 不接受模型参数）、`frontierFrameTypeBusiness`、`frontierFrameTypeCursor`。
+  - **未验证（诚实标注）**：真实账号端到端——本地 `coze-7a7b35ecc5d043a8.json` 的 Cookie 仅 38 字节且已失效（`code=700012006`），按 AGENTS.md 本地连接红线未取生产凭据；`TestLiveClawStream` 已就绪，用户提供 `COZE_LIVE_COOKIE` 即可验收。**未发布**：未 bump registry、未 dispatch CI、未做生产热重载。
+  - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
+
+- 前序会话（2026-10-18，已压缩）：**coze CYCLE-01 协议取证：抓到真流式帧，TASK-004 阻断解除**：浏览器内给 `WebSocket.prototype.send` 打补丁捕获页面真实 WS 实例，抓到 100 帧业务数据（44 条 reply 增量）。关键实测：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`（`connection-params` 的 `aid=578287`/`service=33555616` 是另一条通道，用错只收心跳）；claw 业务 `service=33555657`；protobuf 12 字段；阶段机 `event_start`→`event_delta`→`event_final`；`content.message_data.reply.content` 是 delta、`content_v2.session.final` 是累积快照（实测 10 个 delta 拼接 371 字符 == final 371）；去重键 `turn_id+seq_num+phase`。文档见 `doc/5-tests/2026-10-18_164500_Coze对话链路协议补全.md` §4.6。
+
+- 前序会话（2026-10-18）：**coze-provider 0.2.2 定时续期改由插件自建定时器执行**：
   - 需求：用户问「续期是自动的吗?」，随后要求「定时 4 小时补 `refresh_interval_seconds`，续期，和其他插件的定时一样」，并要求面板展示积分余额。
   - **根因（宿主源码取证）**：`refresh_interval_seconds` 只决定宿主「何时把账号排进刷新队列」；`auto_refresh_loop.handleDueAuth` 在 `exec == nil` 时只做 `l.upsert(authID, now.Add(interval))` 空转重排，**不调用 `auth.refresh`**。`RegisterExecutors` 只注册声明 executor 的插件，coze 声明 `Executor:false`，因此宿主的 4 小时排期对本插件永不产生续期。生产证据：24h 内 0 条 auto-refresh 日志，3 次续期全是手动点击。
   - **实现**：新增 `coze/renew_loop.go`（默认 4 小时遍历启用账号执行 `renewSession` + `applyRenewal`；热重载后立即跑首轮；`reconfigure` 即时重排；`Shutdown` 关闭停止信号；并发上限 4；经宿主 `host.log` 留痕）。`main.go` 在 `cliproxy_plugin_init` 启动、`Shutdown` 停止。
@@ -59,6 +71,8 @@
   - 文档：实施总览 § CYCLE-02 执行结果、`doc/4-bugs/2026-10-18_054500_qwenwork执行器漏接oauth-model-alias反解致别名请求400根因诊断.md`、`doc/5-tests/2026-10-18_021000_*`、`doc/6-review/2026-10-18_021000_*`（STYLE: PASS）。
   - **额度耗尽修复（0.2.7，2026-10-18）**：用户指出面板账号「可用积分」永久卡「加载中…」且无 0 积分耗尽表现。根因两层：① 上游 `quota.exceeded=true` 未写入快照，免费版账号 `total_used/total_size` 恒 0 ⇒ 确定耗尽被判成「未知」；② 四处代码按「0 积分仍可用免费模型」设计，但生产实测该账号对 `qwen3.8-max-preview`/`flash`/`plus`/`glm-5.2` **全部 429 `balance_insufficient`**——QwenWork 无免费模型。修复：`creditsSummary` 加 `Exceeded`、解析抽 `buildCreditsSummary`；新增 `isCreditsLowOrExhausted` 统一调度/换号/可路由排除；新增 `disableAuth`（`disabled`+`exhausted_disable`，恢复自动启用，`manual_disable` 永不自动改）；面板 `isAccountExhausted` 单一入口 + 「已耗尽 · 余0」。`lifecycle_auto` 默认关闭（写 disabled 需开启），路由排除与面板展示无条件生效。
   - **0.2.7 发布与生产验收**：CI `39114864713` 全绿 → `f1fa228`(registry) → 生产 install `restart_required:false`、`hot reloaded active_version=0.2.7 retired_version=0.2.6`、容器 Up 2 days 零重启；落盘 `.so` sha256 `235a3720…96258` 与 zip 逐字节一致；`/accounts` 返回该账号 `exhausted=true exceeded=true`；面板资源含 `isAccountExhausted`×7 与「已耗尽 · 余0」；推理 `qwen3.8-max-preview`/`qwen-3.8-max` 均 200（调度正确跳过耗尽账号）。
+  - **0 计费修复（0.2.8，2026-10-18）**：用户报 new-api 侧大量 `$0` 记录 + 104.93s 首字。根因：上游把计费 usage 挂在 `delta:{}` 且无 `finish_reason` 的终止 chunk 顶层，`cleanChunkJSON` 的「全空 delta 整帧丢弃」规则把它当噪声吞掉 ⇒ 下游拿不到 token 数。直连上游实测 `usage_frames=1`，抓 CPA 输出流确认末帧只有 `finish_reason:stop` + `[DONE]`（`include_usage:true` 也拿不到），锁定丢弃点在插件侧。修复：顶层存在 `usage` 时保留整帧（仍清空 `tool_calls`/`function_call` 噪声），异步与同步两条流式路径共用同一函数。**104.93s 经实测为 38.8 万 token 预填充耗时**（feed 216 条中 TTFT 前二均对应 `input=388,677`），非插件开销；同会话输入涨到 31 万后单轮 TTFT 稳定 7~12s。附带修复：`lifecycle_auto` 被写进 `config_yaml` 子键导致插件读不到（改用 `PATCH /v0/management/plugins/<id>/config` 写顶层），以及 `refresh_runner.doFetchOne` 缺生命周期对账导致开关打开后耗尽账号仍不停用（补 `reconcileOneAccount(..., false)`）。
+  - **0.2.8 发布与生产验收**：CI `39118226004` 全绿 → `920aa5c`(registry，6 平台远端全 200 且体积全等) → 生产 install `restart_required:false`、`hot reloaded active_version=0.2.8 retired_version=0.2.7`、容器 Up 2 days 零重启；落盘 `.so` sha256 `1d1ab751…d45f87c` 与 zip 逐字节一致；生产流式响应含 usage 帧（`total_tokens:87`，修复前 0 个）；new-api 18:16:29 起连续 3 条计费正常（`prompt_tokens=349312/quota=17475`），此前同会话连续 8 条为 0；耗尽账号 `disabled=True exhausted=True`。文档：`doc/4-bugs/2026-10-18_183000_qwenwork流式usage终止帧被丢弃致new-api全量零计费根因诊断.md`。
 - 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：Device Flow + PKCE（`gateway.qwenwork.cn`）换宿主 JWT → `POST /api/desktop-sessions`（**201 非 200**）签发 `sk-mm-v1.*` 短票据（TTL 2h）→ 裸 Bearer 打 `{base_url}/v1/chat/completions`；MaaS 无 `/v1/models`，目录在 `GET /api/desktop/chat-modes`。推理走**请求体透传**（仅强制 `stream=true` + `max_tokens` 自适应），管理路由收敛 13 条。发布链 `a9585c7` → CI `39050879075` → `91e050e` → `14bc392`(6 平台) → `3568d37`(registry)；图标改用仓库内 `assets/icons/QwenWork.png`（原外链 404）。
 - 当前会话（2026-10-18）：**发布矩阵下线 freebsd-amd64，平台数 7 → 6**：
   - 需求背景：用户反馈「7 平台产物里有一个平台之前构建时出过问题，能否缩减」，并裁定「只砍 freebsd-amd64」。
@@ -78,21 +92,9 @@
   - 文档：`doc/4-bugs/2026-10-17_202500_qoderwork流式中途断流不换号且24h冷却未落盘根因诊断.md`、`doc/3-实施/2026-10-17_203500_qoder三插件流式断流换号与冷却落盘修复实施总览.md`（§14 记录执行结果与偏差）。
 - 上一会话（2026-10-15）：**跨插件同步第二轮复检（只读审计）**：以 md5 对比 + 机制分布 grep + 版本矩阵复核对 9 插件做跨维度审计，原批次 A~D 全部闭环；新登记 G1（zcode `handleSchedulerPick` 越界，因调度器在任者是 copilot 而潜伏）、G2（http_status 推广）、G3（copilot 用量上报）、G4（token-usage 补 traework 映射）。文档同步两份实施总览。
 
-- 当前会话（2026-10-15）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20），全链路发布生产**：
-  - 根因：模板 `baseprompt.json` 的 agent 上下文（主因）+ 插件重建 messages 只搬 `role`/`content`、丢掉 `assistant.tool_calls` 与 `tool.tool_call_id`（放大器）。
-  - **方案 A**：`openAIMessage` 补 `ToolCalls`/`ToolCallID`/`Name` + **自定义 `UnmarshalJSON` 同步解析**（陷阱：带自定义 UnmarshalJSON 时加字段必须同步赋值，否则恒空）+ `buildQoderBody` 按非零值保留三者；双插件同构。发布链 `f74a5e8`→`6d32f84`(14/14)→`d9e8592`→`5124003`，热重载零重启，远端 14/14 ALL PASS。
-  - **⚠️ 判别力边界**：单工具任务 PAIRED/BROKEN 均收敛 6/6（无判别力）；探索型任务均不收敛（各 3/3 发 tool_calls）⇒ 修的是结构丢失，**不承诺消除探索型持续工具调用**。
-  - 未决：方案 B 待评估；`chat_context.text` 是否致每轮从头探测（需裸直连）；上游是否真消费 `messages[].tool_calls`。
+- 会话（2026-10-15，已压缩）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20）**：根因是模板 baseprompt 的 agent 上下文 + 插件重建 messages 丢掉 `tool_calls`/`tool_call_id`；方案 A 补三字段并同步自定义 `UnmarshalJSON`（陷阱：加字段必须同步解析否则恒空）。**判别力边界**：单工具任务 6/6 无判别力，探索型任务不收敛 ⇒ 只修结构丢失，不承诺消除持续工具调用。发布链 `f74a5e8`→`6d32f84`→`d9e8592`→`5124003`，热重载零重启，远端 14/14 ALL PASS。
 
-- 上一会话（2026-10-15）：**五插件签到节奏统一为每 4 小时，四插件全链路发布生产（qoderwork 0.9.38 / qoder-ai 0.1.18 / workbuddy 0.15.10 / traework 0.2.13）**：
-  - 需求背景：用户裁定「把所有支持签到的插件改成每 4 小时尝试签到一次」。**关键事实**：5 个签到插件中 workbuddy / workbuddy-ai / traework 后端本就已是每 4 小时六槽，只有 qoderwork / qoder-ai 在 2026-10-12 被收敛为 `[10,22]`；zcode / cursor 不支持签到。
-  - **行为变更（qoder 两插件）**：① `checkinHours` 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]`；② **移除 `shouldRunCheckinNow` 门控**——该门控只在「签到表 ≠ 保活表」时才有意义，两表取值一致后 `nextCheckinTime` 并集恒等于签到表本身、门控退化为恒真死代码，删除后与 workbuddy 系 `schedulerLoop` 同构；③ 面板 `schedule` 与文案同步六槽。
-  - **文案漂移修正（workbuddy / traework）**：`panel.html` 与 README/architecture 长期错标 `09:00/21:00`（后端实为六槽），修正为 `00/04/08/12/16/20`；`panel.html` 经 `go:embed` 进二进制，必须发版才生效。
-  - **发布闭环**：提交 `91ca440`(feat 33 文件含实施/测试/6-review 文档) → 四插件 dispatch CI（`38623746537`/`38623755098`/`38623764859` success）→ `cf40437`(32 assets) → `97db81e`(registry) → `8c2ea35`(prune 4 旧版)。
-  - **CI 处置**：qoderwork 首个 run `38623737653` 因既有 flaky 测试 `Test (token-usage-tracker)` 失败致 Release skipped → 单插件重发 `38626694582` success（踩坑 45/55 复现，并取消冗余 push run 释放 Runner）。
-  - **生产验收**：四插件 `plugin-store install` 均 `restart_required=false`、日志确认 `plugin hot reloaded`（04:02，active=目标版 retired=旧版），**零容器重启**（容器 Up 26h），落盘 `.so` sha256 与本地 zip 逐字节一致（`eb5fed79…`/`18abd6e0…`/`e7eb3c16…`/`7a4a623f…`）；accounts/panel 全 200，新文案 `00/04/08/12/16/20` 就位、旧文案残留全为 0。远端 28/28 artifacts sha256+size ALL PASS、无旧版残留。
-  - 门禁：四插件**隔离 worktree**（`git worktree add --detach HEAD` + 仅复制本轮文件，模拟 CI 构建对象，因工作树含 20 个并行会话文件）cgo-shim build/vet/test 全绿；哨兵变异精确 FAIL 后恢复全绿；面板内联 JS `node --check` + vm/DOM 桩回归全 PASS；`POLLUTION: PASS`；`STYLE: PASS`。提交全程按路径限定（踩坑 57），并行会话 20 个文件完好未混入。
-  - 文档：`doc/3-实施/2026-10-15_031646_全插件签到节奏统一为每4小时实施总览.md`、`doc/5-tests/2026-10-15_031646_*`、`doc/6-review/2026-10-15_031646_*`。
+- 上一会话（2026-10-15）：**五插件签到节奏统一为每 4 小时，四插件全链路发布生产**：workbuddy/workbuddy-ai/traework 后端本就六槽；qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效的 `shouldRunCheckinNow` 门控（两表取值一致后恒真）；同步修正 workbuddy/traework 面板与文档长期错标的 `09:00/21:00`。发布链 `91ca440`→CI→`cf40437`(32 assets)→`97db81e`(registry)→`8c2ea35`(prune)。生产四插件热重载零重启，`.so` 与 zip 逐字节一致，远端 28/28 ALL PASS。
 
 - 上一会话（2026-10-15）：**zcode-provider 面板额度改为逐模型独立进度条并移除冗余信息（0.1.31），全链路发布生产**：
   - 需求背景：用户反馈截图显示一个账号的 GLM-5.3 / GLM-5.3-Flash 仍共用**一条**汇总进度条，看不出各模型各自消耗；并要求移除「过期」等与额度判断无关的信息。
