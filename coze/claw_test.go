@@ -224,6 +224,78 @@ func TestFindReplyForSkipsMalformedContent(t *testing.T) {
 	}
 }
 
+// TestListMessagesParsesFiles 验证图片附件被解析进 clawMessage.Files。
+//
+// 生图结果的图片不在 Content 里（那里只有 `[图片](computer://...)` 占位符），
+// 而是挂在消息的 files 数组上；不解析这个数组，图片就被整个丢弃。
+// 样本取自 2026-10-18 真实账号响应，签名参数已替换为 REDACTED。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片附件字段契约。
+func TestListMessagesParsesFiles(t *testing.T) {
+	imageInner := `{"id":"m-img","message_type":"reply",` +
+		`"message_data":{"reply":{"content":"[图片](computer://%2Fx.jpg)","reply_to_message_id":"mid-img","stream":false}}}`
+	imageEscaped, _ := json.Marshal(imageInner)
+
+	textInner := `{"id":"m-text","message_type":"reply",` +
+		`"message_data":{"reply":{"content":"收到","reply_to_message_id":"mid-text","stream":false}}}`
+	textEscaped, _ := json.Marshal(textInner)
+
+	body := `{"code":0,"data":{"messages":[` +
+		`{"id":"m-img","source":2,"message_type":"reply","content":` + string(imageEscaped) + `,"files":[` +
+		`{"file_name":"/Coze/Drive/扣子/image/generate_ae34.jpg",` +
+		`"file_uri":"3735_0-drive/2372/image/generate_ae34.jpg",` +
+		`"file_url":"https://static.coze.site/a.jpg?sign=REDACTED",` +
+		`"thumb_url":"https://static.coze.site/a.jpg?sign=REDACTED&x-tos-process=image%2Fformat%2Cwebp",` +
+		`"is_reference":0}]},` +
+		`{"id":"m-null","source":2,"message_type":"reply","content":` + string(textEscaped) + `,"files":null},` +
+		`{"id":"m-empty","source":2,"message_type":"reply","content":` + string(textEscaped) + `,"files":[]}` +
+		`]}}`
+
+	doer := &fakeDoer{handler: func(req *http.Request, _ []byte) (*http.Response, error) {
+		return jsonResponse(200, body), nil
+	}}
+
+	client := newTestClawClient(doer)
+	messages, err := client.listMessages("s1")
+	if err != nil {
+		t.Fatalf("拉取消息失败: %v", err)
+	}
+	if len(messages) != 3 {
+		t.Fatalf("消息数 = %d，期望 3", len(messages))
+	}
+
+	// 图片消息：逐个字段断言，避免字段名写错却因零值静默通过。
+	img := messages[0]
+	if len(img.Files) != 1 {
+		t.Fatalf("图片消息 files 数 = %d，期望 1", len(img.Files))
+	}
+	file := img.Files[0]
+	if file.FileName != "/Coze/Drive/扣子/image/generate_ae34.jpg" {
+		t.Errorf("file_name = %q", file.FileName)
+	}
+	if file.FileURI != "3735_0-drive/2372/image/generate_ae34.jpg" {
+		t.Errorf("file_uri = %q", file.FileURI)
+	}
+	if !strings.HasPrefix(file.FileURL, "https://static.coze.site/a.jpg?sign=") {
+		t.Errorf("file_url = %q", file.FileURL)
+	}
+	if !strings.Contains(file.ThumbURL, "x-tos-process=image") {
+		t.Errorf("thumb_url = %q", file.ThumbURL)
+	}
+	if file.IsReference != 0 {
+		t.Errorf("is_reference = %d，期望 0", file.IsReference)
+	}
+
+	// 纯文本消息：null 与空数组都必须解析成「没有附件」，不能 panic。
+	if messages[1].Files != nil {
+		t.Errorf("files:null 应解析为 nil，实际 %#v", messages[1].Files)
+	}
+	if len(messages[2].Files) != 0 {
+		t.Errorf("files:[] 长度 = %d，期望 0", len(messages[2].Files))
+	}
+}
+
 // TestFetchFrontierKey 验证 WS 凭证提取。
 // [参数] t: 测试上下文。
 // [返回] 无。

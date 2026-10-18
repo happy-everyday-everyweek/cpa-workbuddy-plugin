@@ -74,6 +74,11 @@ type replyCollector struct {
 	// 都独立下发一次，而不是被下一次轮询合并成一大块
 	// ——后者会让客户端看到「卡一下然后蹦出一大段」。
 	pending []string
+	// images 是本轮回复里出现的图片地址。
+	//
+	// 生图结果原子出现（约 18 秒才落库），没有中间态可流，
+	// 因此单独收集、在正文结束后一次性补发。
+	images []string
 	// notify 用于唤醒等待方。
 	notify chan struct{}
 }
@@ -123,12 +128,17 @@ func (c *replyCollector) accept(msg *frontierMessage) bool {
 		c.snapshot = msg.Snapshot
 		changed = true
 	}
+	// 图片与正文增量分开收集：它们不走 pending 队列，
+	// 而是攒到收尾时一次性下发（实测生图结果原子出现，无中间态）。
+	if len(msg.Images) > 0 {
+		c.addImagesLocked(msg.Images)
+		changed = true
+	}
 	if msg.isFinal() {
 		c.finished = true
 		changed = true
 	}
 	c.mu.Unlock()
-
 	if changed {
 		select {
 		case c.notify <- struct{}{}:
@@ -136,6 +146,32 @@ func (c *replyCollector) accept(msg *frontierMessage) bool {
 		}
 	}
 	return changed
+}
+
+// addImagesLocked 去重追加图片地址。
+//
+// 调用方必须已持有 c.mu：accept 在同一临界区内完成收集，
+// 避免为一次追加再走一次加解锁。
+// [参数] urls: 待追加地址（空串与重复项被忽略）。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片收集。
+func (c *replyCollector) addImagesLocked(urls []string) {
+	c.images = appendUniqueAll(c.images, urls...)
+}
+
+// imagesSnapshot 返回本轮已收集的图片地址副本。
+// [参数] 无。
+// [返回] 图片地址列表（调用方可安全遍历）。
+// 最近修改时间：2026-10-18；改动原因：新增，收尾下发读取。
+func (c *replyCollector) imagesSnapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.images) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.images))
+	copy(out, c.images)
+	return out
 }
 
 // drainPending 取出所有尚未下发的增量片段。
@@ -234,9 +270,30 @@ func (e *cozeExecutor) prepare() (string, *frontierKeyResponse, error) {
 // [返回] 完整正文与错误。
 // 最近修改时间：2026-10-18；改动原因：新增，流式执行主流程。
 func (e *cozeExecutor) runStream(ctx context.Context, prompt string, emit func(string) error) (string, error) {
+	content, images, errRun := e.runConversation(ctx, prompt, emit)
+
+	// 图片在正文之后一次性补发：实测生图结果原子出现（约 18 秒才落库），
+	// 没有中间态可流；放在收尾前发出，客户端就能在正文结束后立即看到图。
+	if markdown := buildImageMarkdown(images); markdown != "" {
+		if errEmit := emit(markdown); errEmit != nil && errRun == nil {
+			errRun = errEmit
+		}
+	}
+	return content, errRun
+}
+
+// runConversation 执行一轮对话，返回正文与本轮出现的图片地址。
+//
+// 图片只返回不发射：流式与非流式的交付位置不同（前者收尾补一帧，
+// 后者拼进响应体），由调用方决定怎么给。返回图片列表而不是拼好的
+// markdown，是为了让非流式路径不必再从回调里反解字符串。
+// [参数] ctx: 生命周期；prompt: 折叠后的用户文本；emit: 正文增量回调。
+// [返回] 完整正文、图片地址列表与错误。
+// 最近修改时间：2026-10-18；改动原因：抽出共用执行体，修复非流式正文重复。
+func (e *cozeExecutor) runConversation(ctx context.Context, prompt string, emit func(string) error) (string, []string, error) {
 	sessionID, key, errPrepare := e.prepare()
 	if errPrepare != nil {
-		return "", errPrepare
+		return "", nil, errPrepare
 	}
 
 	collector := newReplyCollector()
@@ -271,16 +328,18 @@ func (e *cozeExecutor) runStream(ctx context.Context, prompt string, emit func(s
 	cancelReady()
 	if errReady != nil {
 		client.Close()
-		return "", fmt.Errorf("frontier 连接未就绪：%w", errReady)
+		return "", nil, fmt.Errorf("frontier 连接未就绪：%w", errReady)
 	}
 
 	messageID, errChat := e.client.sendChat(sessionID, prompt)
 	if errChat != nil {
-		return "", errChat
+		return "", nil, errChat
 	}
 
+	// 图片来自 WS 实时与 message/list 兜底两条路径，都汇到同一个 collector；
+	// 取快照必须在这之后，否则兜底补进来的图会漏。
 	content, errWait := e.waitForReply(ctx, collector, emit, messageID)
-	return content, errWait
+	return content, collector.imagesSnapshot(), errWait
 }
 
 // waitForReply 等待回复完成，并把增量实时交给 emit。
@@ -378,14 +437,22 @@ func (e *cozeExecutor) fallbackPoll(ctx context.Context, collector *replyCollect
 
 		messages, errList := e.client.listMessages(sessionID)
 		if errList == nil {
-			reply, found := findReplyFor(messages, userMessageID)
-			if found && reply.MessageData.Reply.Content != "" {
-				collector.accept(&frontierMessage{
-					ID:       reply.ID,
-					Phase:    "event_final",
-					Snapshot: reply.MessageData.Reply.Content,
-				})
-				return nil
+			// 用整条消息而不是只取内层 payload：图片附件在消息外层的
+			// Files 上，只看 payload 会漏图（生图回复的正文只是占位符）。
+			message, found := findReplyMessageFor(messages, userMessageID)
+			if found {
+				var payload clawReplyPayload
+				if errUnmarshal := json.Unmarshal([]byte(message.Content), &payload); errUnmarshal == nil {
+					if payload.MessageData.Reply.Content != "" || len(message.Files) > 0 {
+						collector.accept(&frontierMessage{
+							ID:       payload.ID,
+							Phase:    "event_final",
+							Snapshot: payload.MessageData.Reply.Content,
+							Images:   clawFileURLs(message.Files),
+						})
+						return nil
+					}
+				}
 			}
 		}
 
@@ -399,11 +466,24 @@ func (e *cozeExecutor) fallbackPoll(ctx context.Context, collector *replyCollect
 }
 
 // execute 执行一次非流式对话。
+//
+// 非流式没有下游可以逐步收帧，图片只能拼进返回正文；
+// 正文取 runConversation 的返回值，不能把 emit 收到的增量再拼一次，
+// 否则响应里会出现两份正文。
 // [参数] ctx: 生命周期；prompt: 折叠后的文本。
-// [返回] 完整正文与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，非流式执行。
+// [返回] 完整正文（含图片 markdown）与错误。
+// 最近修改时间：2026-10-18；改动原因：非流式补齐图片下发，避免正文重复。
 func (e *cozeExecutor) execute(ctx context.Context, prompt string) (string, error) {
-	return e.runStream(ctx, prompt, func(string) error { return nil })
+	content, images, errRun := e.runConversation(ctx, prompt, func(string) error { return nil })
+	markdown := buildImageMarkdown(images)
+	switch {
+	case markdown == "":
+		return content, errRun
+	case content == "":
+		return markdown, errRun
+	default:
+		return content + "\n" + markdown, errRun
+	}
 }
 
 // handleExecExecute 处理非流式执行请求。

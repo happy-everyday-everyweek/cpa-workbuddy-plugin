@@ -571,3 +571,261 @@ func TestEmptyReplyFallsBackToPolling(t *testing.T) {
 		t.Errorf("正文 = %q，期望 轮询补回的正文", content)
 	}
 }
+
+// TestCollectorAddsImagesWithDedupe 验证图片收集与去重。
+//
+// 上游可能在 start 与 final 两帧重复给出同一张图；
+// 不去重会让客户端看到重复图片，也会让响应体无谓翻倍。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片去重契约。
+func TestCollectorAddsImagesWithDedupe(t *testing.T) {
+	collector := newReplyCollector()
+
+	collector.accept(&frontierMessage{Phase: "event_delta", TurnID: "t1", SeqNum: "1", Images: []string{"https://a/1.jpg"}})
+	collector.accept(&frontierMessage{Phase: "event_final", TurnID: "t1", SeqNum: "2", Images: []string{"https://a/1.jpg", "https://a/2.jpg"}})
+
+	images := collector.imagesSnapshot()
+	if len(images) != 2 {
+		t.Fatalf("图片数 = %d，期望 2（重复地址应被去掉）: %#v", len(images), images)
+	}
+	if images[0] != "https://a/1.jpg" || images[1] != "https://a/2.jpg" {
+		t.Errorf("图片顺序 = %#v，期望保持出现顺序", images)
+	}
+
+	// 快照必须是副本：调用方改动不能污染收集器内部状态。
+	images[0] = "tampered"
+	if collector.imagesSnapshot()[0] != "https://a/1.jpg" {
+		t.Error("imagesSnapshot 应返回副本")
+	}
+}
+
+// replyFrameWithImages 构造一条带图片的 reply 帧载荷。
+//
+// 结构按 2026-10-18 真实账号实测还原：图片在**载荷顶层 files**，
+// content_v2 里只有一个 text 分片，正文是 `[图片](computer:///...)` 占位符。
+// 早期版本把这个夹具写成 content_v2 的 image 分片，与真实上游不符，
+// 导致「WS 生图取不到图」的缺陷在单测里完全不可见（见测试文档 6.3 缺陷 A）。
+// [参数] phase: 阶段；seq: 序号；snapshot: 正文快照；imageURL: 图片地址。
+// [返回] 帧载荷 JSON。
+// 最近修改时间：2026-10-18；改动原因：改为真实上游形态，避免锁定不存在的契约。
+func replyFrameWithImages(phase, seq, snapshot, imageURL string) []byte {
+	snapshotJSON, _ := json.Marshal(snapshot)
+	content := `{"message_data":{"reply":{"content":"","reply_to_message_id":"mid-1","stream":true}},"turn_id":"t1"}`
+	contentV2 := `{"session":{"phase":"` + phase + `","seq_num":"` + seq + `","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"text","text":{"content":` + string(snapshotJSON) + `}}` +
+		`]}}}}`
+
+	payload := map[string]any{
+		"id":           "m1",
+		"session_id":   "s1",
+		"message_type": "reply",
+		"content":      content,
+		"content_v2":   contentV2,
+		"files": []map[string]any{{
+			"file_name":    "/Coze/Drive/扣子/image/generate_test.jpg",
+			"file_uri":     "3735510093922464_0-drive/2372/image/generate_test.jpg",
+			"file_url":     imageURL,
+			"thumb_url":    imageURL + "&thumb=1",
+			"is_reference": 0,
+		}},
+	}
+	raw, _ := json.Marshal(payload)
+	return raw
+}
+
+// TestRunStreamEmitsImageMarkdown 验证收尾时下发图片 markdown。
+//
+// 生图结果不在正文增量里；runStream 必须在正文之后、收尾之前
+// 把图片以 Markdown 形式交给 emit，否则客户端只看到占位文本。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片下发闭环。
+func TestRunStreamEmitsImageMarkdown(t *testing.T) {
+	frames := [][]byte{
+		replyFrameWithImages("event_delta", "8", "正在生成", "https://static.coze.site/a.jpg?sign=X"),
+		replyFrameWithImages("event_final", "9", "已生成", "https://static.coze.site/a.jpg?sign=X"),
+	}
+
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		for _, payload := range frames {
+			frame := encodeFrontierFrame(&frontierFrame{
+				Service:     frontierServiceClaw,
+				PayloadType: "message",
+				Payload:     payload,
+			})
+			_ = conn.WriteMessage(websocket.BinaryMessage, frame)
+			time.Sleep(60 * time.Millisecond)
+		}
+	})
+
+	exec := env.newExecutor()
+	exec.client.baseURL = cozeSiteHost
+	exec.frontierServerURL = env.ws.server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var emitted []string
+	content, err := exec.runStream(ctx, "画只猫", func(delta string) error {
+		emitted = append(emitted, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, "![image](https://static.coze.site/a.jpg?sign=X)") {
+		t.Fatalf("未下发图片 markdown，实际输出: %q", joined)
+	}
+	// 同一地址在 delta 与 final 各出现一次，只应下发一张。
+	if strings.Count(joined, "![image](") != 1 {
+		t.Errorf("图片重复下发: %q", joined)
+	}
+	// 图片段必须落在正文之后，客户端才能先看到文字再看到图。
+	if idx := strings.Index(joined, "![image]("); idx >= 0 && idx < strings.Index(joined, "已生成") {
+		t.Errorf("图片应位于正文之后，实际: %q", joined)
+	}
+	if content == "" {
+		t.Error("正文不应为空")
+	}
+}
+
+// TestExecuteDoesNotDuplicateContent 验证非流式正文不被拼接两遍。
+//
+// runStream 已把每个增量交给 emit，返回值又是同一份全文；
+// execute 若把 emit 收到的内容再拼一次，非流式响应就变成
+// 「正文 + 正文」，客户端看到重复答案。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，非流式正文去重守卫。
+func TestExecuteDoesNotDuplicateContent(t *testing.T) {
+	frames := [][]byte{
+		replyFrame("event_delta", "8", "第一段", ""),
+		replyFrame("event_delta", "9", "第二段", ""),
+		replyFrame("event_final", "10", "", "第一段第二段"),
+	}
+
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		for _, payload := range frames {
+			frame := encodeFrontierFrame(&frontierFrame{
+				Service:     frontierServiceClaw,
+				PayloadType: "message",
+				Payload:     payload,
+			})
+			_ = conn.WriteMessage(websocket.BinaryMessage, frame)
+			time.Sleep(60 * time.Millisecond)
+		}
+	})
+
+	exec := env.newExecutor()
+	exec.client.baseURL = cozeSiteHost
+	exec.frontierServerURL = env.ws.server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	content, err := exec.execute(ctx, "你好")
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if content != "第一段第二段" {
+		t.Fatalf("非流式正文 = %q，期望恰好一份全文", content)
+	}
+}
+
+// TestExecuteAppendsImageMarkdown 验证非流式也会带上图片 markdown。
+//
+// 非流式没有下游可以收尾补帧，图片只能拼进返回正文；
+// 缺了它，客户端不流式请求时就看不到生图结果。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，非流式图片闭环。
+func TestExecuteAppendsImageMarkdown(t *testing.T) {
+	imageURL := "https://static.coze.site/b.jpg?sign=Y"
+	frames := [][]byte{
+		replyFrameWithImages("event_delta", "8", "已生成", imageURL),
+		replyFrameWithImages("event_final", "9", "已生成", imageURL),
+	}
+
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		for _, payload := range frames {
+			frame := encodeFrontierFrame(&frontierFrame{
+				Service:     frontierServiceClaw,
+				PayloadType: "message",
+				Payload:     payload,
+			})
+			_ = conn.WriteMessage(websocket.BinaryMessage, frame)
+			time.Sleep(60 * time.Millisecond)
+		}
+	})
+
+	exec := env.newExecutor()
+	exec.client.baseURL = cozeSiteHost
+	exec.frontierServerURL = env.ws.server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	content, err := exec.execute(ctx, "画只猫")
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if content != "已生成\n![image]("+imageURL+")" {
+		t.Fatalf("非流式正文 = %q，期望正文后恰好跟一张图", content)
+	}
+}
+
+// TestFallbackPollCollectsImagesFromFiles 验证兜底轮询也能取到图片。
+//
+// WS 不推帧时走 message/list；图片挂在该接口返回消息的 files 数组上，
+// 若只解析内层 payload（正文是占位符）就永远补不出图。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，兜底图片路径。
+func TestFallbackPollCollectsImagesFromFiles(t *testing.T) {
+	replyContent := `{"id":"m1","message_data":{"reply":{"content":"[图片](computer://%2Fx.jpg)","reply_to_message_id":"mid-1","stream":false}}}`
+	escaped, _ := json.Marshal(replyContent)
+
+	env := newExecutorTestEnv(t, func(conn *websocket.Conn) {
+		// 不推任何业务帧：逼出首字超时后的轮询兜底。
+		time.Sleep(3 * time.Second)
+	})
+	env.doer.handler = func(req *http.Request, _ []byte) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, clawInfoPath):
+			return jsonResponse(200, `{"code":0,"data":{"user_claw_info":{"claw_id":"c1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawMainSessionPath):
+			return jsonResponse(200, `{"code":0,"data":{"session":{"id":"s1"}}}`), nil
+		case strings.HasSuffix(req.URL.Path, frontierKeyPath):
+			return jsonResponse(200, `{"code":0,"data":{"access_key":"k","device_id":"d"}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawChatPath):
+			return jsonResponse(200, `{"code":0,"data":{"message_id":"mid-1"}}`), nil
+		case strings.HasSuffix(req.URL.Path, clawMessageListPath):
+			body := `{"code":0,"data":{"messages":[{"id":"m1","message_type":"reply","content":` + string(escaped) +
+				`,"files":[{"file_name":"/Coze/Drive/扣子/image/x.jpg","file_url":"https://static.coze.site/x.jpg?sign=Z"}]}]}}`
+			return jsonResponse(200, body), nil
+		default:
+			return jsonResponse(404, `{}`), nil
+		}
+	}
+
+	exec := env.newExecutor()
+	exec.client.baseURL = cozeSiteHost
+	exec.frontierServerURL = env.ws.server.URL
+
+	collector := newReplyCollector()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := exec.fallbackPoll(ctx, collector, "mid-1"); err != nil {
+		t.Fatalf("兜底轮询失败: %v", err)
+	}
+
+	images := collector.imagesSnapshot()
+	if len(images) != 1 || images[0] != "https://static.coze.site/x.jpg?sign=Z" {
+		t.Fatalf("未从 files 取到图片，Images = %#v", images)
+	}
+}

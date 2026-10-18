@@ -112,19 +112,31 @@ type frontierMessage struct {
 	ReplyToMessageID string
 	// Stream 表示该帧是否仍处于流式过程中。
 	Stream bool
+	// Images 是本帧携带的图片地址（已去重）。
+	//
+	// 生图结果不在 Delta 里——上游只推一个 image 分片，正文仍是一段
+	// 占位文本。不收集它，用户就只看到「已生成图片」却拿不到图。
+	Images []string
 }
 
 // frontierRawMessage 是 WS 载荷的顶层结构。
 //
 // 用户消息与进度帧没有 message_type，只有 AI 回复有；
 // 因此 message_type 为空不代表解析失败。
+//
+// Files 是生图结果的真实来源（2026-10-18 真实账号实测）：
+// 生图回复的 event_final 帧里，content_v2 的 agent_message_event
+// 只有 text 分片（正文是 `[图片](computer:///...)` 占位符），
+// 图片地址在**顶层 files 数组**里，形状与 message/list 的 files 一致。
+// 只解析 content_v2 会永远取不到图。
 type frontierRawMessage struct {
-	ID          string `json:"id"`
-	SessionID   string `json:"session_id"`
-	ClawID      string `json:"claw_id"`
-	MessageType string `json:"message_type"`
-	Content     string `json:"content"`
-	ContentV2   string `json:"content_v2"`
+	ID          string     `json:"id"`
+	SessionID   string     `json:"session_id"`
+	ClawID      string     `json:"claw_id"`
+	MessageType string     `json:"message_type"`
+	Content     string     `json:"content"`
+	ContentV2   string     `json:"content_v2"`
+	Files       []clawFile `json:"files"`
 	Reference   struct {
 		ID string `json:"id"`
 	} `json:"reference_message"`
@@ -144,6 +156,31 @@ type frontierContentInner struct {
 	TurnID string `json:"turn_id"`
 }
 
+// frontierContentItem 是 content_v2 里单个内容分片。
+//
+// 类型化数组：type 决定哪个子对象有值。实测 text 分片结构为
+// {type:"text", text:{content}}；图片/文件分片按扣子前端校验器
+// （asar 模块 552061：`h=e=>o(e)&&u(e.uri)&&u(e.url)`）为 {uri, url}，
+// 且 image 与 file 共用同一形状，所以两者都解析。
+//
+// 这里刻意同时接受 image 与 file 两个分支：扣子把生图结果标成
+// image，把用户上传的参考图标成 file，但线上出现过两者混用；
+// 只要哪个分支带了非空 url 就收，避免「分片存在却被丢弃」。
+type frontierContentItem struct {
+	Type string `json:"type"`
+	Text struct {
+		Content string `json:"content"`
+	} `json:"text"`
+	Image struct {
+		URI string `json:"uri"`
+		URL string `json:"url"`
+	} `json:"image"`
+	File struct {
+		URI string `json:"uri"`
+		URL string `json:"url"`
+	} `json:"file"`
+}
+
 // frontierContentV2 是 content_v2 内层 JSON 的结构。
 type frontierContentV2 struct {
 	Session struct {
@@ -154,12 +191,7 @@ type frontierContentV2 struct {
 		Final   struct {
 			Type              string `json:"type"`
 			AgentMessageEvent struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text struct {
-						Content string `json:"content"`
-					} `json:"text"`
-				} `json:"content"`
+				Content []frontierContentItem `json:"content"`
 			} `json:"agent_message_event"`
 		} `json:"final"`
 	} `json:"session"`
@@ -529,8 +561,15 @@ func parseFrontierMessage(payload []byte) (*frontierMessage, bool) {
 				msg.TurnID = parsed.Session.TurnID
 			}
 			for _, item := range parsed.Session.Final.AgentMessageEvent.Content {
-				if item.Type == "text" {
+				switch item.Type {
+				case "text":
 					msg.Snapshot += item.Text.Content
+				case "image", "file":
+					// image 与 file 共用 {uri,url} 形状；只要 url 非空就收。
+					// uri 为空不算异常：它只是云盘内部标识，不影响下载。
+					if url := strings.TrimSpace(imageURLOf(item)); url != "" {
+						msg.Images = appendUnique(msg.Images, url)
+					}
 				}
 			}
 		}
@@ -541,7 +580,60 @@ func parseFrontierMessage(payload []byte) (*frontierMessage, bool) {
 		msg.Delta = ""
 	}
 
+	// 顶层 files 是生图结果的真实载体（2026-10-18 真实账号实测）：
+	// 生图回复的 event_final 帧里 content_v2 只有 text 分片（正文是
+	// `[图片](computer:///...)` 占位符），图片地址在顶层 files 数组。
+	// 与 message/list 的 files 同构，直接复用 clawFileURLs。
+	for _, url := range clawFileURLs(raw.Files) {
+		msg.Images = appendUnique(msg.Images, url)
+	}
+
 	return msg, true
+}
+
+// imageURLOf 取分片的可下载地址。
+//
+// image 与 file 两个分支形状相同，优先取 image；都为空时返回空串，
+// 由调用方跳过该分片——url 为空的分片无法给用户任何可用信息。
+// [参数] item: 单个内容分片。
+// [返回] 非空 URL 或空串。
+// 最近修改时间：2026-10-18；改动原因：新增，图片分片取址。
+func imageURLOf(item frontierContentItem) string {
+	if url := strings.TrimSpace(item.Image.URL); url != "" {
+		return url
+	}
+	return strings.TrimSpace(item.File.URL)
+}
+
+// appendUnique 在保持顺序的前提下去重追加。
+//
+// 上游可能在 start 与 final 两帧里重复给出同一张图；
+// 直接 append 会让客户端看到重复图片。
+// [参数] list: 已有列表；value: 待追加值。
+// [返回] 追加后的列表（value 为空或已存在时原样返回）。
+// 最近修改时间：2026-10-18；改动原因：新增，图片去重追加。
+func appendUnique(list []string, value string) []string {
+	if value == "" {
+		return list
+	}
+	for _, existing := range list {
+		if existing == value {
+			return list
+		}
+	}
+	return append(list, value)
+}
+
+// appendUniqueAll 逐个追加一组地址，语义与单个版本一致。
+// [参数] list: 已有列表；values: 待追加的多个值。
+// [返回] 追加后的列表。
+// 最近修改时间：2026-10-18；改动原因：新增，批量图片去重。
+func appendUniqueAll(list []string, values ...string) []string {
+	out := list
+	for _, value := range values {
+		out = appendUnique(out, value)
+	}
+	return out
 }
 
 // dedupeKey 生成去重键。

@@ -117,16 +117,37 @@ type clawChatResponse struct {
 	MessageID string `json:"message_id"`
 }
 
+// clawFile 是消息附带的文件（图片、文档等）。
+//
+// 生图结果的图片就放在回复消息的 Files 里：Content 只有
+// `[图片](computer://...)` 这种占位符，不能直接当 URL 用；
+// 真正的可取图地址是 FileURL（带 sign 的签名直链，实测有效期 30 天）。
+// 签名参数等价于临时凭据，日志与证据只记 FileName，不记完整 URL。
+type clawFile struct {
+	// FileName 是云盘内的绝对路径，如 /Coze/Drive/扣子/image/generate_xxx.jpg。
+	FileName string `json:"file_name"`
+	// FileURI 是云盘内部标识，不能直接访问。
+	FileURI string `json:"file_uri"`
+	// FileURL 是签名直链，可直接下载。
+	FileURL string `json:"file_url"`
+	// ThumbURL 是缩略图直链（webp），比原图小但经过格式转换。
+	ThumbURL string `json:"thumb_url"`
+	// IsReference 标记该文件是否为用户的参考图而非产出。
+	IsReference int `json:"is_reference"`
+}
+
 // clawMessage 是 message/list 返回的一条消息。
 //
 // 注意 Content 是**内层 JSON 字符串**：AI 回复的正文在
 // message_data.reply.content，用户消息的 Content 则是纯文本。
+// Files 只在带附件时非空；纯文本消息该字段为 null，解析后是 nil。
 type clawMessage struct {
-	ID          string `json:"id"`
-	Source      int    `json:"source"`
-	Content     string `json:"content"`
-	MessageType string `json:"message_type"`
-	CreateTime  string `json:"create_time"`
+	ID          string     `json:"id"`
+	Source      int        `json:"source"`
+	Content     string     `json:"content"`
+	MessageType string     `json:"message_type"`
+	CreateTime  string     `json:"create_time"`
+	Files       []clawFile `json:"files"`
 	Sender      struct {
 		UserType int    `json:"user_type"`
 		ClawID   string `json:"claw_id"`
@@ -415,4 +436,48 @@ func findReplyFor(messages []clawMessage, userMessageID string) (*clawReplyPaylo
 		}
 	}
 	return nil, false
+}
+
+// findReplyMessageFor 与 findReplyFor 语义相同，但同时返回整条消息。
+//
+// 兜底轮询必须拿到 Files 才能补出图片——findReplyFor 只返回内层 payload，
+// 附件在消息外层，用它的调用方会永远看不到图。
+// [参数] messages: 消息列表；userMessageID: 用户消息 ID。
+// [返回] 命中的整条消息与是否找到。
+// 最近修改时间：2026-10-18；改动原因：新增，兜底路径需要附件。
+func findReplyMessageFor(messages []clawMessage, userMessageID string) (*clawMessage, bool) {
+	for index := range messages {
+		msg := &messages[index]
+		if msg.MessageType != "reply" {
+			continue
+		}
+		var payload clawReplyPayload
+		if err := json.Unmarshal([]byte(msg.Content), &payload); err != nil {
+			continue
+		}
+		if payload.MessageData.Reply.ReplyToMessageID == userMessageID {
+			return msg, true
+		}
+	}
+	return nil, false
+}
+
+// clawFileURLs 提取附件里可下载的地址。
+//
+// 只要 FileURL：FileURI 是云盘内部标识不能直连，ThumbURL 是压缩过的
+// webp 缩略图，原图才是用户要的产物。
+// 接收切片而不是消息：WS 帧的顶层 files 与 message/list 的 files
+// 同构，调用方不必为了一组文件构造一条假消息。
+// [参数] files: 附件列表。
+// [返回] 地址列表（顺序与上游一致，已去重）。
+// 最近修改时间：2026-10-18；改动原因：新增，附件取址。
+func clawFileURLs(files []clawFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	var urls []string
+	for _, file := range files {
+		urls = appendUniqueAll(urls, strings.TrimSpace(file.FileURL))
+	}
+	return urls
 }

@@ -351,6 +351,147 @@ func TestParseFrontierMessageFinalSnapshot(t *testing.T) {
 	}
 }
 
+// TestParseFrontierMessageExtractsTopLevelFiles 验证顶层 files 里的图片被收取。
+//
+// 这是 2026-10-18 真实账号实测的生图返回形态：content_v2 的
+// agent_message_event 只有一个 text 分片（正文是 `[图片](computer:///...)`
+// 占位符），图片地址在**载荷顶层 files 数组**里，形状与 message/list 一致。
+// 只解析 content_v2 的 image/file 分片会永远取不到图。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，真实生图取址契约。
+func TestParseFrontierMessageExtractsTopLevelFiles(t *testing.T) {
+	contentV2 := `{"session":{"phase":"event_final","seq_num":"12","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"text","text":{"content":"[图片](computer:///Coze/Drive/扣子/image/generate_x.jpg)"}}` +
+		`]}}}}`
+	payload := `{"id":"m1","message_type":"reply","files":[` +
+		`{"file_name":"/Coze/Drive/扣子/image/generate_x.jpg",` +
+		`"file_uri":"3735510093922464_0-drive/2372/image/generate_x.jpg",` +
+		`"file_url":"https://static.coze.site/generate_x.jpg?sign=X",` +
+		`"thumb_url":"https://static.coze.site/generate_x.jpg?sign=T",` +
+		`"is_reference":0}],` +
+		`"content_v2":` + mustJSONString(t, contentV2) + `}`
+
+	msg, found := parseFrontierMessage([]byte(payload))
+	if !found {
+		t.Fatal("应当命中 reply")
+	}
+	if len(msg.Images) != 1 {
+		t.Fatalf("图片数 = %d，期望 1（来自顶层 files）", len(msg.Images))
+	}
+	if msg.Images[0] != "https://static.coze.site/generate_x.jpg?sign=X" {
+		t.Errorf("图片地址 = %q，应取 file_url 而不是 thumb_url", msg.Images[0])
+	}
+	// 正文里的 computer:// 占位符必须原样保留，不能被误当成图片地址。
+	if !strings.Contains(msg.Snapshot, "computer://") {
+		t.Errorf("正文占位符丢失：%q", msg.Snapshot)
+	}
+}
+
+// TestParseFrontierMessageImagesDedupeTopLevelAndContentV2 验证两条来源去重。
+//
+// 上游可能同时在 content_v2 分片与顶层 files 给出同一张图；
+// 两个分支都收会导致客户端看到重复图片。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，跨来源去重守卫。
+func TestParseFrontierMessageImagesDedupeTopLevelAndContentV2(t *testing.T) {
+	const imageURL = "https://static.coze.site/same.jpg?sign=S"
+	contentV2 := `{"session":{"phase":"event_final","seq_num":"12","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"image","image":{"uri":"u","url":"` + imageURL + `"}}` +
+		`]}}}}`
+	payload := `{"id":"m1","message_type":"reply","files":[` +
+		`{"file_name":"/Coze/Drive/x.jpg","file_url":"` + imageURL + `","is_reference":0}],` +
+		`"content_v2":` + mustJSONString(t, contentV2) + `}`
+
+	msg, found := parseFrontierMessage([]byte(payload))
+	if !found {
+		t.Fatal("应当命中 reply")
+	}
+	if len(msg.Images) != 1 {
+		t.Fatalf("图片数 = %d，跨来源同一地址应只保留一张", len(msg.Images))
+	}
+}
+
+// TestParseFrontierMessageExtractsImageFragments 验证图片分片被提取。
+//
+// 生图结果的图片以 image 分片出现在 final 的 content 数组里，
+// 结构为 {uri, url}；不解析它，用户只看到占位文本而拿不到图。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片分片契约。
+func TestParseFrontierMessageExtractsImageFragments(t *testing.T) {
+	contentV2 := `{"session":{"phase":"event_final","seq_num":"9","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"text","text":{"content":"已生成图片"}},` +
+		`{"type":"image","image":{"uri":"3735_0-drive/2372/image/a.jpg","url":"https://static.coze.site/a.jpg?sign=X"}}` +
+		`]}}}}`
+	payload := `{"id":"m1","message_type":"reply","content_v2":` + mustJSONString(t, contentV2) + `}`
+
+	msg, found := parseFrontierMessage([]byte(payload))
+	if !found {
+		t.Fatal("应当命中 reply")
+	}
+	if len(msg.Images) != 1 {
+		t.Fatalf("图片数 = %d，期望 1", len(msg.Images))
+	}
+	if msg.Images[0] != "https://static.coze.site/a.jpg?sign=X" {
+		t.Errorf("图片地址 = %q", msg.Images[0])
+	}
+	// 文本快照必须不受图片分片影响，否则正文会混入非文本内容。
+	if msg.Snapshot != "已生成图片" {
+		t.Errorf("snapshot = %q，图片分片不应进入正文", msg.Snapshot)
+	}
+}
+
+// TestParseFrontierMessageAcceptsFileFragment 验证 file 分片同样被收取。
+//
+// 扣子把用户上传的参考图标成 file、把生图产出标成 image，但两者
+// 共用 {uri, url} 形状；线上出现过混用，只认 image 会漏图。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，file 分片兼容。
+func TestParseFrontierMessageAcceptsFileFragment(t *testing.T) {
+	contentV2 := `{"session":{"phase":"event_final","seq_num":"10","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"file","file":{"uri":"u1","url":"https://static.coze.site/b.jpg?sign=Y"}}` +
+		`]}}}}`
+	payload := `{"id":"m1","message_type":"reply","content_v2":` + mustJSONString(t, contentV2) + `}`
+
+	msg, found := parseFrontierMessage([]byte(payload))
+	if !found {
+		t.Fatal("应当命中 reply")
+	}
+	if len(msg.Images) != 1 || msg.Images[0] != "https://static.coze.site/b.jpg?sign=Y" {
+		t.Errorf("file 分片未收取，Images = %#v", msg.Images)
+	}
+}
+
+// TestParseFrontierMessageSkipsEmptyImageURL 验证无 url 的分片被跳过。
+//
+// uri 是云盘内部标识，不能直接下载；只有 url 可用。
+// 空 url 的分片若被收进来，客户端会拿到一个空图片地址。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，空地址守卫。
+func TestParseFrontierMessageSkipsEmptyImageURL(t *testing.T) {
+	contentV2 := `{"session":{"phase":"event_final","seq_num":"11","turn_id":"t1","final":{` +
+		`"type":"agent.message","agent_message_event":{"content":[` +
+		`{"type":"image","image":{"uri":"only-uri","url":""}}` +
+		`]}}}}`
+	payload := `{"id":"m1","message_type":"reply","content_v2":` + mustJSONString(t, contentV2) + `}`
+
+	msg, found := parseFrontierMessage([]byte(payload))
+	if !found {
+		t.Fatal("应当命中 reply")
+	}
+	if len(msg.Images) != 0 {
+		t.Errorf("空 url 应被跳过，Images = %#v", msg.Images)
+	}
+}
+
 // TestDedupeKeyIncludesSeqNum 验证去重键含序号。
 //
 // 同一轮的 event_start 与首个 event_delta 共享 id，

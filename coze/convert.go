@@ -223,6 +223,35 @@ func buildCompletion(id, model, content string) ([]byte, error) {
 	return json.Marshal(response)
 }
 
+// buildImageMarkdown 把图片地址拼成 Markdown 图片段。
+//
+// 为什么用 Markdown 而不是自定义结构：宿主与下游客户端（Cherry Studio、
+// new-api 聊天页）都按 Markdown 渲染，图片语法是唯一被普遍支持的形态；
+// 返回 url 这种原始链接反而要客户端自己判断能否预览。
+// 每张图独占一行，避免多图挤在同一行导致排版错乱。
+// [参数] urls: 图片地址列表（顺序即展示顺序）。
+// [返回] 拼接结果；无图片时返回空串。
+// 最近修改时间：2026-10-18；改动原因：新增，图片下发格式。
+func buildImageMarkdown(urls []string) string {
+	if len(urls) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for _, url := range urls {
+		trimmed := strings.TrimSpace(url)
+		if trimmed == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
+		}
+		builder.WriteString("![image](")
+		builder.WriteString(trimmed)
+		builder.WriteString(")")
+	}
+	return builder.String()
+}
+
 // parseChatRequest 解析 OpenAI 聊天请求。
 // [参数] raw: 请求体。
 // [返回] 解析结果与错误。

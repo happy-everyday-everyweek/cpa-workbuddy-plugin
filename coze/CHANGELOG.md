@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0 (2026-10-19)
+
+### 新增
+
+- **对话内生图能力打通**。此前生图回复只能拿到 `[图片](computer:///...)` 占位
+  文本，图片本身被整条丢弃。现在图片会在正文之后以 Markdown 图片语法下发，
+  流式收尾补一帧、非流式拼入响应体，下游客户端可直接预览。
+  契约按 2026-10-18 真实账号实测确定：图片地址在消息的**顶层 `files` 数组**
+  （`file_url` 为 `static.coze.site` 签名直链，有效期 30 天），不在
+  `content_v2` 的内容分片里；生图约 18~25 秒原子出现，无中间态可流。
+- `clawFile` / `clawMessage.Files` 解析附件；`frontierRawMessage.Files`
+  收取 WS 帧顶层附件（`content_v2` 的 image/file 分片作为兼容路径保留）。
+- 兜底轮询改用 `findReplyMessageFor` 取整条消息，避免只看内层 payload 漏图。
+
+### 修复
+
+- **非流式正文重复**。`execute` 原先把 `runStream` 的 emit 增量与返回值各算一次，
+  响应体里出现两份正文。抽出共用执行体 `runConversation`，
+  正文只取返回值，图片由调用方决定交付方式。
+- 图片去重：同一地址在 `event_delta` 与 `event_final`（或 `files` 与
+  `content_v2` 分片）重复出现时只下发一张。
+
+### 测试
+
+- 新增 12 个用例覆盖附件解析、顶层 `files` 取址、跨来源去重、
+  空 url 守卫、收尾下发、非流式去重、兜底轮询取图。
+- 夹具 `replyFrameWithImages` 改为真实上游形态（图片在顶层 `files`）：
+  早期版本把它写成 `content_v2` 的 image 分片，导致「WS 取不到图」
+  的单测完全不可见；变异回旧实现后 3 个用例精确失败。
+- 新增 `live_image_test.go` / `live_download_test.go` / `live_seed_test.go`
+  真实链路探针，仅在设置 `COZE_LIVE_COOKIE` 时执行，签名参数全部脱敏。
+
 ## 0.3.6 (2026-10-18)
 
 ### 修复

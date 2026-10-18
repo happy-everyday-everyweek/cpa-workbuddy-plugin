@@ -208,3 +208,30 @@ func TestParseChatRequest(t *testing.T) {
 		t.Error("非法 JSON 应当报错")
 	}
 }
+
+// TestBuildImageMarkdown 验证图片段落拼接规则。
+//
+// 图片必须是 Markdown 语法：客户端与 new-api 聊天页都按 Markdown 渲染，
+// 裸 URL 不会自动变成可预览图片。多图必须各占一行，否则会挤成一串。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-18；改动原因：新增，图片下发格式契约。
+func TestBuildImageMarkdown(t *testing.T) {
+	if got := buildImageMarkdown(nil); got != "" {
+		t.Errorf("无图片应返回空串，实际 %q", got)
+	}
+	if got := buildImageMarkdown([]string{"  "}); got != "" {
+		t.Errorf("空白地址应被忽略，实际 %q", got)
+	}
+
+	single := buildImageMarkdown([]string{"https://a/1.jpg"})
+	if single != "![image](https://a/1.jpg)" {
+		t.Errorf("单图 = %q", single)
+	}
+
+	multi := buildImageMarkdown([]string{"https://a/1.jpg", "", "https://a/2.jpg"})
+	want := "![image](https://a/1.jpg)\n![image](https://a/2.jpg)"
+	if multi != want {
+		t.Errorf("多图 = %q，期望 %q", multi, want)
+	}
+}
