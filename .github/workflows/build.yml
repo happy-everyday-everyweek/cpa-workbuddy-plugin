@@ -58,7 +58,11 @@ on:
         default: ""
 
 concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
+  # Push runs cancel each other, but they must never cancel a dispatch/tag
+  # release: a mid-flight release cancelled by an unrelated push would leave a
+  # partially uploaded GitHub Release. Including the event and the target
+  # plugin keeps release groups isolated from ordinary branch pushes.
+  group: build-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.inputs.plugin }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
 permissions:
