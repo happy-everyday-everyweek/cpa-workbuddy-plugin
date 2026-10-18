@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -249,9 +251,12 @@ type importAccountRequest struct {
 }
 
 // handleImportAccount 导入一份 Cookie。
+//
+// 默认按工作空间拆分：一个账号下的商业版与免费版空间各自落盘为独立
+// 账号，额度、冷却与故障转移互不影响。指定 space_id 时只导入该空间。
 // [参数] body: 请求体。
 // [返回] 管理响应与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，面板导入入口。
+// 最近修改时间：2026-10-19；改动原因：返回按空间拆分后的账号列表。
 func handleImportAccount(body json.RawMessage) ([]byte, error) {
 	var req importAccountRequest
 	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
@@ -261,15 +266,23 @@ func handleImportAccount(body json.RawMessage) ([]byte, error) {
 		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "cookie 不能为空"}))
 	}
 
-	auth, errSave := saveCredentials(req.Cookie, req.Label, req.SpaceID)
+	accounts, errSave := saveCredentials(req.Cookie, req.Label, req.SpaceID)
 	if errSave != nil {
 		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": errSave.Error()}))
 	}
+
+	views := make([]map[string]any, 0, len(accounts))
+	for _, auth := range accounts {
+		views = append(views, map[string]any{
+			"auth_id":    auth.AuthID,
+			"label":      auth.Label,
+			"space_id":   auth.SpaceID,
+			"space_name": auth.SpaceName,
+		})
+	}
 	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
-		"auth_id":    auth.AuthID,
-		"space_id":   auth.SpaceID,
-		"space_name": auth.SpaceName,
-		"spaces":     auth.Spaces,
+		"accounts": views,
+		"count":    len(views),
 	}))
 }
 
@@ -321,10 +334,14 @@ type setSpaceRequest struct {
 	SpaceID string `json:"space_id"`
 }
 
-// handleSetSpace 切换账号使用的工作空间。
+// handleSetSpace 把账号移动到另一个工作空间。
+//
+// 账号已按空间拆分，标识由「用户 + 空间」派生，因此切换空间必须连同
+// 账号文件一起改名，否则会出现两个账号指向同一空间、并发消耗同一份额度。
+// 目标空间已有独立账号时直接拒绝，让用户在面板上删掉多余的那个。
 // [参数] body: 请求体。
 // [返回] 管理响应与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，多 workspace 切换。
+// 最近修改时间：2026-10-19；改动原因：按空间拆分后改为移动语义并防重复。
 func handleSetSpace(body json.RawMessage) ([]byte, error) {
 	var req setSpaceRequest
 	if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
@@ -346,12 +363,33 @@ func handleSetSpace(body json.RawMessage) ([]byte, error) {
 	if target == nil {
 		return makeHTTPResponse(http.StatusBadRequest, mustMarshal(map[string]string{"error": "该工作空间不在账号下"}))
 	}
+	if target.ID == auth.SpaceID {
+		return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
+			"space_id":   auth.SpaceID,
+			"space_name": auth.SpaceName,
+			"auth_id":    auth.AuthID,
+		}))
+	}
 
+	newID := authIDFor(&CookieIdentity{UserID: auth.UserID, TokenV2: auth.TokenV2}, target.ID)
+	if existing, errExisting := findAccount(newID); errExisting == nil && existing.AuthID != auth.AuthID {
+		return makeHTTPResponse(http.StatusConflict, mustMarshal(map[string]string{
+			"error": "该工作空间已是独立账号 " + existing.Label + "，无需移动；如需合并请先删除其中一个",
+		}))
+	}
+
+	oldPath := auth.PhysicalPath
+	auth.AuthID = newID
 	auth.SpaceID = target.ID
 	auth.SpaceName = target.Name
 	auth.UpdatedAt = time.Now().Format(time.RFC3339)
+	auth.PhysicalPath = filepath.Join(getAccountsDir(), newID+notionAuthFileSuffix)
 	if errWrite := writeAuthFileDirect(auth.PhysicalPath, auth); errWrite != nil {
 		return makeHTTPResponse(http.StatusInternalServerError, mustMarshal(map[string]string{"error": errWrite.Error()}))
+	}
+	// 新文件已就位，旧文件改名归档：留着会被当成第二个账号重复路由。
+	if oldPath != "" && oldPath != auth.PhysicalPath && isSafeNotionAuthPath(oldPath) {
+		_ = os.Rename(oldPath, oldPath+".migrated")
 	}
 	// 切空间后旧 thread 属于旧空间，必须整批清掉，否则续写会落到错误空间。
 	forgetSessionsForAuth(auth)
@@ -359,6 +397,7 @@ func handleSetSpace(body json.RawMessage) ([]byte, error) {
 	return makeHTTPResponse(http.StatusOK, mustMarshal(map[string]any{
 		"space_id":   auth.SpaceID,
 		"space_name": auth.SpaceName,
+		"auth_id":    auth.AuthID,
 	}))
 }
 
@@ -490,7 +529,7 @@ func handleUsageQuery(req pluginapi.ManagementRequest, query url.Values) map[str
 // [返回] 账号与错误。
 // 最近修改时间：2026-10-18；改动原因：新增，账号查找。
 func findAccount(authID string) (*StoredAuth, error) {
-	authID = strings.TrimSpace(authID)
+	authID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
 	accounts, _ := listAllAuthFiles()
 	for _, auth := range accounts {
 		if auth.AuthID == authID {

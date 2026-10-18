@@ -226,14 +226,46 @@ func splitCookiePair(part string) (string, string, bool) {
 	return strings.TrimSpace(part[:idx]), strings.TrimSpace(part[idx+1:]), true
 }
 
-// authIDFor 从身份字段派生稳定的账号标识。
-// [参数] identity: Cookie 身份。
+// authIDFor 从用户与工作空间派生稳定的账号标识。
+//
+// 只取用户与空间、不取 token：Notion 会滚动刷新 token_v2，若把 token
+// 放进哈希，每次轮换后重新导入都会生成一个新账号文件，同一空间被重复
+// 路由；而「同一用户 + 同一空间」才是稳定的账号身份。
+// 空间必须参与：AI 额度绑定在 workspace 上，商业版与免费版额度独立，
+// 标识含空间后一次导入才能把同一个账号拆成多个可独立路由的账号。
+// [参数] identity: Cookie 身份；spaceID: 目标工作空间。
 // [返回] 形如 notion-<前12位> 的账号标识。
-// 最近修改时间：2026-10-18；改动原因：新增，账号文件命名依据。
-func authIDFor(identity *CookieIdentity) string {
-	sum := sha256.Sum256([]byte(identity.UserID + "|" + identity.TokenV2))
+// 最近修改时间：2026-10-19；改动原因：改为用户 + 空间派生，支持按空间拆分账号。
+func authIDFor(identity *CookieIdentity, spaceID string) string {
+	sum := sha256.Sum256([]byte(identity.UserID + "|" + spaceID))
 	suffix := hex.EncodeToString(sum[:])[:12]
 	return notionAuthFilePrefix + suffix
+}
+
+// retireStaleAccounts 把同一用户下、不属于本次拆分结果的旧账号归档。
+//
+// 不能靠旧标识反查：旧标识含 token_v2，而这个值会被上游轮换，按它算出的
+// 文件名往往已经不存在。改为扫描账号目录，凡同一 UserID 且不在本次保留
+// 集合里的文件，都是拆分前的旧账号（或该空间已从账号下移除）。
+// 留着会被重复路由，同一份额度被并发消耗；改名成 .migrated 后缀既让扫描与
+// 宿主都不再识别，又保留原文件用于回溯，不删除用户数据。
+// [参数] identity: Cookie 身份；keepIDs: 本次拆分保留的账号标识集合。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，按用户扫描迁移旧账号。
+func retireStaleAccounts(identity *CookieIdentity, keepIDs map[string]bool) {
+	accounts, errList := listAllAuthFiles()
+	if errList != nil {
+		return
+	}
+	for _, account := range accounts {
+		if account.UserID != identity.UserID || keepIDs[account.AuthID] {
+			continue
+		}
+		if account.PhysicalPath == "" || !isSafeNotionAuthPath(account.PhysicalPath) {
+			continue
+		}
+		_ = os.Rename(account.PhysicalPath, account.PhysicalPath+".migrated")
+	}
 }
 
 // isNotionAuthFileName 判断文件名是否属于本插件。
@@ -443,12 +475,16 @@ func scopeForAuth(auth *StoredAuth, clientVersion string) requestScope {
 
 // saveCredentials 校验并落盘一份导入的登录态。
 //
-// 流程：解析 Cookie → 拉取 workspace 列表 → 记录额度 → 落盘。
+// 流程：解析 Cookie → 拉取 workspace 列表 → 刷新全部空间额度 → 按空间逐个落盘。
 // 探活失败时**不落盘**，避免把失效 Cookie 写成可用账号。
-// [参数] header: Cookie header；label: 备注名；spaceID: 指定 workspace（可空）。
-// [返回] 落盘后的账号与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，导入主链路。
-func saveCredentials(header, label, spaceID string) (*StoredAuth, error) {
+//
+// 为什么按空间拆分：Notion 的 AI 额度绑定在 workspace 上，同一账号的
+// 商业版与免费版额度互相独立。拆成多个账号后，额度耗尽、冷却与故障
+// 转移都只影响对应空间，不会互相拖累。
+// [参数] header: Cookie header；label: 备注名前缀；spaceID: 只导入指定空间（可空表示全部）。
+// [返回] 落盘的账号列表与错误。
+// 最近修改时间：2026-10-19；改动原因：按工作空间拆分账号。
+func saveCredentials(header, label, spaceID string) ([]*StoredAuth, error) {
 	identity, errParse := parseCookieIdentity(header)
 	if errParse != nil {
 		return nil, errParse
@@ -472,44 +508,78 @@ func saveCredentials(header, label, spaceID string) (*StoredAuth, error) {
 		return nil, fmt.Errorf("账号下没有可用工作空间")
 	}
 
-	chosen := pickSpace(spaces, firstNonEmpty(spaceID, cfg.SpaceID))
-	if chosen == nil {
-		return nil, fmt.Errorf("指定的工作空间 %s 不在账号下", firstNonEmpty(spaceID, cfg.SpaceID))
+	wanted := strings.TrimSpace(firstNonEmpty(spaceID, cfg.SpaceID))
+	targets := spaces
+	if wanted != "" {
+		chosen := pickSpace(spaces, wanted)
+		if chosen == nil {
+			return nil, fmt.Errorf("指定的工作空间 %s 不在账号下", wanted)
+		}
+		targets = []NotionSpace{*chosen}
 	}
 
 	// 额度快照单独拉取；失败不影响账号可用性，只是面板暂时看不到余额。
-	probeScope.SpaceID = chosen.ID
+	probeScope.SpaceID = targets[0].ID
 	enrichSpaceUsage(ctx, cl, probeScope, spaces)
 
-	authID := authIDFor(identity)
 	now := time.Now().Format(time.RFC3339)
-	if strings.TrimSpace(label) == "" {
-		label = fmt.Sprintf("Notion %s (%s)", chosen.Name, maskIdentifier(authID))
+	out := make([]*StoredAuth, 0, len(targets))
+	keptIDs := make(map[string]bool, len(targets))
+	for _, space := range targets {
+		authID := authIDFor(identity, space.ID)
+		keptIDs[authID] = true
+		auth := &StoredAuth{
+			Type:          providerName,
+			Provider:      providerName,
+			AuthID:        authID,
+			CookieHeader:  identity.CookieHeader,
+			TokenV2:       identity.TokenV2,
+			UserID:        identity.UserID,
+			SpaceID:       space.ID,
+			SpaceName:     space.Name,
+			Spaces:        spaces,
+			ClientVersion: cfg.ClientVersion,
+			BrowserID:     identity.BrowserID,
+			DeviceID:      identity.DeviceID,
+			Label:         accountLabel(label, space, authID),
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+
+		fullPath := filepath.Join(getAccountsDir(), authID+notionAuthFileSuffix)
+		if errWrite := writeAuthFileDirect(fullPath, auth); errWrite != nil {
+			return out, errWrite
+		}
+		out = append(out, auth)
 	}
 
-	auth := &StoredAuth{
-		Type:          providerName,
-		Provider:      providerName,
-		AuthID:        authID,
-		CookieHeader:  identity.CookieHeader,
-		TokenV2:       identity.TokenV2,
-		UserID:        identity.UserID,
-		SpaceID:       chosen.ID,
-		SpaceName:     chosen.Name,
-		Spaces:        spaces,
-		ClientVersion: cfg.ClientVersion,
-		BrowserID:     identity.BrowserID,
-		DeviceID:      identity.DeviceID,
-		Label:         label,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+	// 只有全量导入才归档旧账号：指定单个空间导入时，其它空间账号仍然有效，
+	// 归档它们会把用户的可用账号一起收掉。
+	if wanted == "" {
+		// 新账号已全部落盘，再归档旧账号，避免中途失败后既无新号也无旧号。
+		retireStaleAccounts(identity, keptIDs)
 	}
+	return out, nil
+}
 
-	fullPath := filepath.Join(getAccountsDir(), authID+notionAuthFileSuffix)
-	if errWrite := writeAuthFileDirect(fullPath, auth); errWrite != nil {
-		return nil, errWrite
+// accountLabel 生成账号展示名。
+//
+// 同一账号会拆成多个空间账号，备注名必须能区分空间，否则面板上一排
+// 同名卡片无法辨认。默认用「订阅 / 免费」标记套餐，用户指定前缀时
+// 前缀优先，标记仍然保留。
+// [参数] header: 用户输入的前缀；space: 目标空间；authID: 账号标识。
+// [返回] 展示名。
+// 最近修改时间：2026-10-19；改动原因：新增，拆分后的账号命名。
+func accountLabel(header string, space NotionSpace, authID string) string {
+	tier := "免费"
+	if space.PremiumCredits > 0 {
+		tier = "订阅"
 	}
-	return auth, nil
+	base := strings.TrimSpace(header)
+	if base == "" {
+		base = "Notion " + maskIdentifier(authID)
+	}
+	return base + " · " + tier
 }
 
 // pickSpace 在候选空间中选出目标空间。

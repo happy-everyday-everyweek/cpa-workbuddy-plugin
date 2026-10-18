@@ -217,34 +217,18 @@ button.danger:hover{background:var(--err);color:#fff}
     </div>
     <div class="modal-bd">
       <p class="hint">在浏览器打开 Notion，开发者工具 → Network → 任意请求 → Request Headers 里的完整 <code>Cookie</code>。导入会先校验登录态与工作空间，成功才落盘。</p>
+      <p class="hint">导入会把每个工作空间拆成独立账号（订阅 / 免费额度分开路由、独立冷却）；留空空间 id 表示全部导入。</p>
       <label for="cookie">Cookie header</label>
       <textarea id="cookie" placeholder="token_v2=...; notion_user_id=...; notion_browser_id=..."></textarea>
       <label for="label">备注名（可空）</label>
       <input id="label" placeholder="例如：主账号">
-      <label for="spaceId">指定工作空间 id（可空，默认选额度最高的）</label>
-      <input id="spaceId" placeholder="留空自动选择">
+      <label for="spaceId">只导入指定工作空间 id（可空，留空导入全部）</label>
+      <input id="spaceId" placeholder="留空 = 每个工作空间各建一个账号">
       <p class="hint" style="margin-top:12px">Notion 把 AI 权限绑定到登录 IP，请在本机导出 Cookie。</p>
     </div>
     <div class="modal-ft">
       <button type="button" class="sec" onclick="closeModal('importModal')">取消</button>
       <button type="button" id="importConfirmBtn" onclick="importAccount(this)">导入并探活</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-mask" id="spaceModal" onclick="onMaskClick(event,'spaceModal')">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="spaceModalTitle">
-    <div class="modal-hd">
-      <h2 id="spaceModalTitle">切换工作空间</h2>
-      <button type="button" class="modal-x" onclick="closeModal('spaceModal')" aria-label="关闭">×</button>
-    </div>
-    <div class="modal-bd">
-      <p class="hint">切换后旧会话线程会被整批清理，避免续写落到错误空间。</p>
-      <div class="model-list" id="spaceList"></div>
-      <div class="result" id="spaceResult"></div>
-    </div>
-    <div class="modal-ft">
-      <button type="button" class="sec" onclick="closeModal('spaceModal')">关闭</button>
     </div>
   </div>
 </div>
@@ -514,7 +498,6 @@ function card(a){
     + spacesHTML(a)
     + '<div class="actions">'
     + '<button class="sec" data-action="test">测试</button>'
-    + '<button class="sec" data-action="spaces"' + ((a.spaces || []).length < 2 ? ' disabled' : '') + '>切换空间</button>'
     + '<button class="sec" data-action="toggle" data-disabled="' + (a.disabled ? '1' : '0') + '">' + toggleLabel + '</button>'
     + '</div>'
     + '</div>';
@@ -540,7 +523,6 @@ let lastAccounts = [];
 let currentSearch = '';
 let currentSort = 'desc';
 let pendingAuthId = '';
-let spaceAuthId = '';
 let testAuthId = '';
 
 function sortAccounts(list){
@@ -633,7 +615,10 @@ async function importAccount(btn){
       }),
     });
     closeModal('importModal');
-    toast('导入成功', 'ok', (data.space_name || data.space_id || '') + ' · ' + (data.auth_id || ''));
+    const list = data.accounts || [];
+    toast('导入成功', 'ok', list.length
+      ? '已拆分为 ' + list.length + ' 个账号：' + list.map(a => a.label).join('、')
+      : '已完成');
     await loadAll();
   } catch (e) {
     toast('导入失败', 'err', e.message);
@@ -680,49 +665,6 @@ async function toggleAccount(btn, authId, disabled){
     await loadAll();
   } catch (e) {
     toast('操作失败', 'err', e.message);
-    busy(btn, false);
-  }
-}
-
-// ---------- 切换工作空间 ----------
-function openSpaceModal(authId){
-  const a = findAccount(authId);
-  if (!a) return;
-  spaceAuthId = authId;
-  const result = document.getElementById('spaceResult');
-  result.className = 'result';
-  result.innerHTML = '';
-  const list = document.getElementById('spaceList');
-  const spaces = a.spaces || [];
-  list.innerHTML = spaces.length
-    ? spaces.map(s => {
-        const cur = s.id === a.space_id;
-        return '<button type="button" class="model-item" data-space="' + esc(s.id) + '"' + (cur ? ' disabled' : '') + '>'
-          + '<div>' + esc(s.name || s.id) + (cur ? ' · 当前' : '') + '</div>'
-          + '<div class="disp">订阅 ' + (Number(s.premium_credits) || 0)
-          + ' · 基础 ' + (Number(s.basic_usage) || 0) + '/' + (Number(s.basic_limit) || 0) + '</div>'
-          + '</button>';
-      }).join('')
-    : '<div class="loading">该账号没有可选工作空间。</div>';
-  openModal('spaceModal');
-}
-
-async function switchSpace(btn, spaceId){
-  if (!spaceAuthId) return;
-  busy(btn, true);
-  const result = document.getElementById('spaceResult');
-  try {
-    const data = await request('/set-space', {
-      method: 'POST',
-      body: JSON.stringify({ auth_id: spaceAuthId, space_id: spaceId }),
-    });
-    result.className = 'result show ok';
-    result.innerHTML = '<div class="t">已切换到 ' + esc(data.space_name || spaceId) + '</div>';
-    toast('已切换工作空间', 'ok', data.space_name || spaceId);
-    await loadAll();
-  } catch (e) {
-    result.className = 'result show err';
-    result.innerHTML = '<div class="t">切换失败</div>' + esc(e.message);
     busy(btn, false);
   }
 }
@@ -792,14 +734,7 @@ document.getElementById('grid').addEventListener('click', event => {
   const action = btn.dataset.action;
   if (action === 'delete') openDeleteModal(authId);
   else if (action === 'toggle') toggleAccount(btn, authId, btn.dataset.disabled === '1');
-  else if (action === 'spaces') openSpaceModal(authId);
   else if (action === 'test') openTestModal(authId);
-});
-
-document.getElementById('spaceList').addEventListener('click', event => {
-  const btn = event.target.closest('button[data-space]');
-  if (!btn) return;
-  switchSpace(btn, btn.dataset.space);
 });
 
 document.getElementById('testModelList').addEventListener('click', event => {

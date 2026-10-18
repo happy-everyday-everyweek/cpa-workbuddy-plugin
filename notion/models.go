@@ -208,8 +208,10 @@ func authFromModelRequest(req *pluginapi.AuthModelRequest) *StoredAuth {
 		}
 	}
 	if strings.TrimSpace(req.AuthID) != "" {
+		// 宿主的 AuthID 带 .json 后缀，本地标识不带，比较前必须归一。
+		want := strings.TrimSuffix(strings.TrimSpace(req.AuthID), notionAuthFileSuffix)
 		for _, auth := range listHostAuthFiles() {
-			if auth.AuthID == req.AuthID {
+			if auth.AuthID == want {
 				return auth
 			}
 		}

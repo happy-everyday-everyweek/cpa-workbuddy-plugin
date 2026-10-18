@@ -88,10 +88,11 @@ func runInferenceWithFailover(ctx context.Context, auth *StoredAuth, chatReq *op
 
 // pickAccountExcluding 从本地账号池挑一个可用账号。
 //
-// 跳过已停用、跳过冷却中、跳过刚失败的账号；其余按列表顺序取第一个。
+// 跳过已停用、跳过凭据为空、跳过冷却中、跳过刚失败的账号；其余按列表顺序取第一个。
+// 凭据为空的账号常见于被宿主覆盖过的旧文件，选中它只会稳定报错。
 // [参数] exclude: 需要排除的账号标识（可为空）。
 // [返回] 选中的账号与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，本地池选号。
+// 最近修改时间：2026-10-19；改动原因：跳过空凭据账号。
 func pickAccountExcluding(exclude string) (*StoredAuth, error) {
 	accounts, errList := listAllAuthFiles()
 	if errList != nil {
@@ -100,7 +101,7 @@ func pickAccountExcluding(exclude string) (*StoredAuth, error) {
 
 	exclude = strings.TrimSpace(exclude)
 	for _, account := range accounts {
-		if account.Disabled || account.AuthID == exclude || isAccountCoolingDown(account.AuthID) {
+		if account.Disabled || account.CookieHeader == "" || account.AuthID == exclude || isAccountCoolingDown(account.AuthID) {
 			continue
 		}
 		return account, nil

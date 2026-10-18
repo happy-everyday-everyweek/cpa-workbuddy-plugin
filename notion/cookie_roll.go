@@ -82,6 +82,9 @@ func applySetCookies(auth *StoredAuth, resp *http.Response) {
 	if !changed {
 		return
 	}
+	// 拆分后同一会话会有多个空间账号文件，滚动前先记下旧 token，
+	// 写盘成功后用它识别哪些兄弟文件还是同一份旧凭据。
+	oldToken := current.TokenV2
 	current.CookieHeader = merged
 	if v, ok := updates["token_v2"]; ok {
 		current.TokenV2 = v
@@ -110,6 +113,55 @@ func applySetCookies(auth *StoredAuth, resp *http.Response) {
 	auth.DeviceID = current.DeviceID
 	auth.UpdatedAt = current.UpdatedAt
 	auth.LoadedDigest = current.LoadedDigest
+
+	// 同一账号已按空间拆成多个文件，它们共用一份 Cookie。只更新当前文件
+	// 会让其它空间副本停留在旧 token，那次请求之后就会 401。
+	propagateCookieToSiblings(current, auth.PhysicalPath, oldToken, updates)
+}
+
+// propagateCookieToSiblings 把滚动后的 Cookie 同步到同一账号的其他空间账号。
+//
+// 识别口径是「同 UserID 且 TokenV2 仍等于滚动前的旧值」：满足条件的文件
+// 一定还是同一份旧会话，可以安全覆盖；已经单独导入过新凭据的文件 token
+// 不同，会被跳过，不会盖掉用户刚导入的凭据。
+// [参数] source: 已更新的账号；skipPath: 已写盘的路径；oldToken: 滚动前的 token；updates: 本轮新值。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，拆分后多副本凭据同步。
+func propagateCookieToSiblings(source *StoredAuth, skipPath, oldToken string, updates map[string]string) {
+	if source == nil || source.UserID == "" {
+		return
+	}
+	accounts, errList := listAllAuthFiles()
+	if errList != nil {
+		return
+	}
+	for _, sibling := range accounts {
+		if sibling.PhysicalPath == "" || sibling.PhysicalPath == skipPath {
+			continue
+		}
+		if sibling.UserID != source.UserID || sibling.TokenV2 != oldToken {
+			continue
+		}
+		merged, changed := mergeCookieHeader(sibling.CookieHeader, updates)
+		if !changed {
+			continue
+		}
+		sibling.CookieHeader = merged
+		if v, ok := updates["token_v2"]; ok {
+			sibling.TokenV2 = v
+		}
+		if v, ok := updates["notion_user_id"]; ok {
+			sibling.UserID = v
+		}
+		if v, ok := updates["notion_browser_id"]; ok {
+			sibling.BrowserID = v
+		}
+		if v, ok := updates["device_id"]; ok {
+			sibling.DeviceID = v
+		}
+		sibling.UpdatedAt = source.UpdatedAt
+		_ = writeAuthFileDirect(sibling.PhysicalPath, sibling)
+	}
 }
 
 // mergeCookieHeader 把新值合并进单行 Cookie header。

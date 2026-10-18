@@ -151,3 +151,65 @@ func TestApplySetCookiesIgnoresDeletion(t *testing.T) {
 		t.Fatalf("删除指令不应改写 token：%s", auth.TokenV2)
 	}
 }
+
+// TestPropagateCookieToSiblings 校验滚动 Cookie 会同步到同账号的其他空间账号。
+//
+// 拆分后同一账号有多个空间文件，共用一份 Cookie；只更新当前文件会让
+// 其他空间停留在旧 token 并在下一次请求时 401。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，拆分后多副本同步回归。
+func TestPropagateCookieToSiblings(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	paid := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-paid",
+		CookieHeader: "token_v2=old; notion_user_id=u", TokenV2: "old",
+		UserID: "u", SpaceID: "space-paid",
+	}
+	free := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-free",
+		CookieHeader: "token_v2=old; notion_user_id=u", TokenV2: "old",
+		UserID: "u", SpaceID: "space-free",
+	}
+	// 另一个用户，不能被同步。
+	other := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-other",
+		CookieHeader: "token_v2=old; notion_user_id=other", TokenV2: "old",
+		UserID: "other", SpaceID: "space-paid",
+	}
+	for _, a := range []*StoredAuth{paid, free, other} {
+		if errWrite := writeAuthFileDirect(filepath.Join(dir, a.AuthID+notionAuthFileSuffix), a); errWrite != nil {
+			t.Fatalf("落盘失败：%v", errWrite)
+		}
+	}
+
+	// 模拟当前文件已滚动为 new。
+	paid.CookieHeader = "token_v2=new; notion_user_id=u"
+	paid.TokenV2 = "new"
+	if errWrite := writeAuthFileDirect(filepath.Join(dir, paid.AuthID+notionAuthFileSuffix), paid); errWrite != nil {
+		t.Fatalf("落盘失败：%v", errWrite)
+	}
+	propagateCookieToSiblings(paid, filepath.Join(dir, paid.AuthID+notionAuthFileSuffix), "old", map[string]string{"token_v2": "new"})
+
+	gotFree, errFree := readAuthFile(filepath.Join(dir, free.AuthID+notionAuthFileSuffix))
+	if errFree != nil {
+		t.Fatalf("读取免费空间账号失败：%v", errFree)
+	}
+	if gotFree.TokenV2 != "new" || !strings.Contains(gotFree.CookieHeader, "token_v2=new") {
+		t.Fatalf("兄弟账号未同步新 token：token=%s header=%s", gotFree.TokenV2, gotFree.CookieHeader)
+	}
+	if gotFree.SpaceID != "space-free" {
+		t.Fatalf("同步不应改写空间：%s", gotFree.SpaceID)
+	}
+
+	gotOther, errOther := readAuthFile(filepath.Join(dir, other.AuthID+notionAuthFileSuffix))
+	if errOther != nil {
+		t.Fatalf("读取其他用户账号失败：%v", errOther)
+	}
+	if gotOther.TokenV2 != "old" {
+		t.Fatalf("其他用户的账号不应被同步：%s", gotOther.TokenV2)
+	}
+}

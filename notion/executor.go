@@ -152,7 +152,9 @@ func resolveAuth(storageJSON []byte, authID string) (*StoredAuth, error) {
 	authID = strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix)
 	if authID != "" {
 		for _, auth := range listHostAuthFiles() {
-			if auth.Disabled {
+			// 凭据为空的账号（典型是被宿主覆盖过的旧文件）不能参与路由，
+			// 否则它会一直占位并让所有请求报同一个错。
+			if auth.Disabled || auth.CookieHeader == "" {
 				continue
 			}
 			if auth.AuthID == authID {

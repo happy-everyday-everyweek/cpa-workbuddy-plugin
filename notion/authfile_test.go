@@ -82,14 +82,14 @@ func TestParseCookieIdentity(t *testing.T) {
 	}
 }
 
-// TestAuthIDForStable 校验账号标识稳定且不泄露原始值。
+// TestAuthIDForStable 校验账号标识稳定、按空间区分且不泄露原始值。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-18；改动原因：新增，账号标识回归。
+// 最近修改时间：2026-10-19；改动原因：标识改为「用户 + 空间」，补空间区分与 token 轮换回归。
 func TestAuthIDForStable(t *testing.T) {
 	identity := &CookieIdentity{UserID: "user-abc", TokenV2: "secret-token"}
-	first := authIDFor(identity)
-	second := authIDFor(identity)
+	first := authIDFor(identity, "space-paid")
+	second := authIDFor(identity, "space-paid")
 
 	if first != second {
 		t.Fatalf("同一凭据产生不同标识: %s vs %s", first, second)
@@ -101,9 +101,16 @@ func TestAuthIDForStable(t *testing.T) {
 		t.Fatalf("标识泄露了原始凭据: %s", first)
 	}
 
-	other := authIDFor(&CookieIdentity{UserID: "user-abc", TokenV2: "other-token"})
-	if other == first {
-		t.Fatal("不同 token 应产生不同标识")
+	// 同一账号的不同空间必须得到不同标识，否则拆分后仍会互相覆盖。
+	if other := authIDFor(identity, "space-free"); other == first {
+		t.Fatal("不同空间应产生不同标识")
+	}
+
+	// token 会被上游轮换，轮换后同一空间的标识必须保持不变，
+	// 否则每次重新导入都会生成新账号文件，同一空间被重复路由。
+	rotated := &CookieIdentity{UserID: "user-abc", TokenV2: "rotated-token"}
+	if got := authIDFor(rotated, "space-paid"); got != first {
+		t.Fatalf("token 轮换改变了账号标识: %s vs %s", got, first)
 	}
 }
 
@@ -359,5 +366,136 @@ func TestResolveAuthSkipsDisabled(t *testing.T) {
 
 	if _, errResolve := resolveAuth(nil, "notion-off"); errResolve == nil {
 		t.Fatal("停用账号不应被解析为可用")
+	}
+}
+
+// TestResolveAuthDistinguishesSpaces 校验同一凭据的两个空间账号可被分别路由。
+//
+// 拆分后的账号共用同一份 Cookie，唯一区别是 SpaceID。若解析层丢掉空间，
+// 两个账号会拿同一个空间发请求，免费额度永远用不上。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，按空间拆分回归。
+func TestResolveAuthDistinguishesSpaces(t *testing.T) {
+	free := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-free",
+		CookieHeader: "token_v2=t; notion_user_id=u",
+		TokenV2:      "t",
+		UserID:       "u",
+		SpaceID:      "space-free",
+		SpaceName:    "Free",
+		Spaces: []NotionSpace{
+			{ID: "space-paid", Name: "Paid", PremiumCredits: 300},
+			{ID: "space-free", Name: "Free", BasicLimit: 50, BasicUsage: 5},
+		},
+	}
+	paid := *free
+	paid.AuthID = "notion-paid"
+	paid.SpaceID = "space-paid"
+	paid.SpaceName = "Paid"
+
+	rawFree, _ := json.Marshal(free)
+	rawPaid, _ := json.Marshal(&paid)
+
+	gotFree, errFree := resolveAuth(rawFree, free.AuthID)
+	if errFree != nil {
+		t.Fatalf("免费空间账号解析失败：%v", errFree)
+	}
+	gotPaid, errPaid := resolveAuth(rawPaid, paid.AuthID)
+	if errPaid != nil {
+		t.Fatalf("订阅空间账号解析失败：%v", errPaid)
+	}
+
+	// 关键断言：各自保留自己的空间，不能因为 Spaces[0] 是订阅空间而被改写。
+	if gotFree.SpaceID != "space-free" || gotPaid.SpaceID != "space-paid" {
+		t.Fatalf("空间被互相污染：free=%s paid=%s", gotFree.SpaceID, gotPaid.SpaceID)
+	}
+	if gotFree.AuthID != "notion-free" || gotPaid.AuthID != "notion-paid" {
+		t.Fatalf("账号标识被互相污染：free=%s paid=%s", gotFree.AuthID, gotPaid.AuthID)
+	}
+}
+
+// TestAccountLabelMarksTier 校验拆分后的账号备注名能区分套餐。
+//
+// 同一账号拆成多张卡片，若备注名相同，面板上无法辨认哪个是免费空间。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，拆分命名回归。
+func TestAccountLabelMarksTier(t *testing.T) {
+	paidSpace := NotionSpace{ID: "s1", PremiumCredits: 300}
+	freeSpace := NotionSpace{ID: "s2", PremiumCredits: 0}
+
+	if got := accountLabel("主账号", paidSpace, "notion-a"); got != "主账号 · 订阅" {
+		t.Fatalf("订阅空间备注名错误：%s", got)
+	}
+	if got := accountLabel("主账号", freeSpace, "notion-b"); got != "主账号 · 免费" {
+		t.Fatalf("免费空间备注名错误：%s", got)
+	}
+	if got := accountLabel("", freeSpace, "notion-abcdef123456"); !strings.Contains(got, "免费") {
+		t.Fatalf("空备注名也应带套餐标记：%s", got)
+	}
+}
+
+// TestRetireStaleAccountsArchivesSameUser 校验拆分后旧账号被归档而不是并行路由。
+//
+// 旧账号与新账号指向同一空间，留着会被重复路由、并发消耗同一份额度。
+// 归档必须是改名而不是删除，用户数据不能丢。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，旧账号迁移回归。
+func TestRetireStaleAccountsArchivesSameUser(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	legacy := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-legacy",
+		CookieHeader: "token_v2=old; notion_user_id=u",
+		TokenV2:      "old",
+		UserID:       "u",
+		SpaceID:      "space-paid",
+	}
+	kept := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-kept",
+		CookieHeader: "token_v2=old; notion_user_id=u",
+		TokenV2:      "old",
+		UserID:       "u",
+		SpaceID:      "space-paid",
+	}
+	other := &StoredAuth{
+		Type:         providerName,
+		Provider:     providerName,
+		AuthID:       "notion-other",
+		CookieHeader: "token_v2=x; notion_user_id=other-user",
+		TokenV2:      "x",
+		UserID:       "other-user",
+		SpaceID:      "space-paid",
+	}
+	for _, a := range []*StoredAuth{legacy, kept, other} {
+		path := filepath.Join(dir, a.AuthID+notionAuthFileSuffix)
+		if errWrite := writeAuthFileDirect(path, a); errWrite != nil {
+			t.Fatalf("落盘失败：%v", errWrite)
+		}
+	}
+
+	retireStaleAccounts(&CookieIdentity{UserID: "u"}, map[string]bool{"notion-kept": true})
+
+	if _, errStat := os.Stat(filepath.Join(dir, "notion-legacy.json")); errStat == nil {
+		t.Fatal("同用户的旧账号应被归档，否则会被重复路由")
+	}
+	if _, errStat := os.Stat(filepath.Join(dir, "notion-legacy.json.migrated")); errStat != nil {
+		t.Fatal("旧账号只应改名归档，不能删除用户数据")
+	}
+	if _, errStat := os.Stat(filepath.Join(dir, "notion-kept.json")); errStat != nil {
+		t.Fatal("本次拆分保留的账号不能被归档")
+	}
+	if _, errStat := os.Stat(filepath.Join(dir, "notion-other.json")); errStat != nil {
+		t.Fatal("其他用户的账号不能被归档")
 	}
 }
