@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -496,9 +497,12 @@ func handleModelsQuery(req pluginapi.ManagementRequest, query url.Values) map[st
 }
 
 // handleUsageQuery 返回账号各工作空间的额度。
+//
+// 面板的「刷新额度」按钮与页面启动时的自动补刷都走这里：每次都现场
+// 请求上游并把结果写回账号文件。
 // [参数] req: 管理请求；query: 查询参数。
 // [返回] 响应体。
-// 最近修改时间：2026-10-18；改动原因：新增，套餐与余额展示。
+// 最近修改时间：2026-10-19；改动原因：刷新结果落盘，修复刷新后仍显示旧快照。
 func handleUsageQuery(req pluginapi.ManagementRequest, query url.Values) map[string]any {
 	authID := query.Get("auth_id")
 	if authID == "" {
@@ -509,12 +513,13 @@ func handleUsageQuery(req pluginapi.ManagementRequest, query url.Values) map[str
 		return map[string]any{"error": errFind.Error()}
 	}
 
-	// 用实时值覆盖落盘快照：余额会随使用变化，快照只用于离线展示。
-	cfg := currentConfig()
-	cl := ensureHTTPClient(notionRequestTimeout())
-	ctx, cancel := context.WithTimeout(context.Background(), notionRequestTimeout())
-	defer cancel()
-	enrichSpaceUsage(ctx, cl, scopeForAuth(auth, cfg.ClientVersion), auth.Spaces)
+	if errRefresh := refreshUsageForAuth(auth); errRefresh != nil {
+		return map[string]any{
+			"auth_id": auth.AuthID,
+			"error":   errRefresh.Error(),
+			"spaces":  auth.Spaces,
+		}
+	}
 
 	return map[string]any{
 		"auth_id":    auth.AuthID,
@@ -522,6 +527,92 @@ func handleUsageQuery(req pluginapi.ManagementRequest, query url.Values) map[str
 		"space_name": auth.SpaceName,
 		"spaces":     auth.Spaces,
 	}
+}
+
+// usageHTTPClientFn 构造额度查询用的客户端，测试可注入替身。
+var usageHTTPClientFn = ensureHTTPClient
+
+// refreshUsageForAuth 实时拉取额度并写回账号文件。
+//
+// 两步必须绑在一起：只刷新不落盘时，面板下一次读 /accounts 又会退回
+// 导入时的旧快照，手动刷新看起来「没生效」。
+// [参数] auth: 目标账号。
+// [返回] 错误。
+// 最近修改时间：2026-10-19；改动原因：抽出额度刷新链路，补齐落盘。
+func refreshUsageForAuth(auth *StoredAuth) error {
+	if auth == nil {
+		return fmt.Errorf("账号为空")
+	}
+	// 用实时值覆盖落盘快照：余额会随使用变化，快照只用于离线展示。
+	cfg := currentConfig()
+	cl := usageHTTPClientFn(notionRequestTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), notionRequestTimeout())
+	defer cancel()
+	enrichSpaceUsage(ctx, cl, scopeForAuth(auth, cfg.ClientVersion), auth.Spaces)
+
+	if errPersist := persistUsageSnapshot(auth); errPersist != nil {
+		return fmt.Errorf("额度已刷新，但写回账号文件失败：%w", errPersist)
+	}
+	return nil
+}
+
+// persistUsageSnapshot 把刷新后的空间额度写回账号文件。
+//
+// 只更新 Spaces 与 UpdatedAt，其余字段原样保留；写盘复用带防覆盖校验的
+// 原子写入口，避免刷新额度时盖掉用户刚重新导入的凭据。
+// [参数] auth: 已就地更新额度的账号。
+// [返回] 写入错误。
+// 最近修改时间：2026-10-19；改动原因：新增，刷新额度后同步落盘。
+func persistUsageSnapshot(auth *StoredAuth) error {
+	if auth == nil || auth.PhysicalPath == "" {
+		return nil
+	}
+	// 多空间账号拆成多个文件：每个文件都保留完整空间列表，额度必须同步，
+	// 否则另一张卡片会一直显示旧数字。
+	for _, sibling := range siblingAuthFiles(auth) {
+		sibling.Spaces = auth.Spaces
+		sibling.UpdatedAt = time.Now().Format(time.RFC3339)
+		if errWrite := writeAuthFileDirect(sibling.PhysicalPath, sibling); errWrite != nil {
+			return errWrite
+		}
+	}
+	return nil
+}
+
+// siblingAuthFiles 返回与给定账号同属一份 Cookie 的全部账号文件。
+//
+// 识别口径是「同 UserID」：同一用户的不同空间共用一个登录态，额度快照
+// 结构一致。用户已单独重新导入、token 不同的文件也会被一起刷新——它的
+// 额度同样来自同一个上游账号，刷新不会改写凭据本身。
+// [参数] auth: 当前账号。
+// [返回] 包含当前账号在内的文件列表。
+// 最近修改时间：2026-10-19；改动原因：新增，拆分账号的额度同步。
+func siblingAuthFiles(auth *StoredAuth) []*StoredAuth {
+	if auth == nil {
+		return nil
+	}
+	accounts, errList := listAllAuthFiles()
+	if errList != nil {
+		return []*StoredAuth{auth}
+	}
+
+	out := make([]*StoredAuth, 0, 2)
+	for _, account := range accounts {
+		if account.PhysicalPath == "" {
+			continue
+		}
+		if account.PhysicalPath == auth.PhysicalPath {
+			out = append(out, account)
+			continue
+		}
+		if account.UserID != "" && account.UserID == auth.UserID {
+			out = append(out, account)
+		}
+	}
+	if len(out) == 0 {
+		return []*StoredAuth{auth}
+	}
+	return out
 }
 
 // findAccount 按标识查找账号。

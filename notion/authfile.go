@@ -66,9 +66,16 @@ type NotionSpace struct {
 	Name string `json:"name"`
 	// PlanType 是套餐类型（如 business / free）。
 	PlanType string `json:"plan_type,omitempty"`
-	// PremiumCredits 是订阅额度余额。
+	// PremiumCredits 是订阅额度剩余余额。
 	PremiumCredits int `json:"premium_credits"`
-	// BasicLimit 与 BasicUsage 是基础消息额度（疑似每月上限）。
+	// PremiumLimit 是本服务周期的订阅额度上限，来自 limits.purchased.totalLimit。
+	PremiumLimit int `json:"premium_limit,omitempty"`
+	// PremiumUsage 是本服务周期已用的订阅额度，由上限减余额推导。
+	PremiumUsage int `json:"premium_usage,omitempty"`
+	// BasicLimit 与 BasicUsage 是基础消息额度。
+	//
+	// 订阅空间由上游标记为不限额，这两个值仍会累计增长并超过上限，
+	// 因此不能用它算订阅空间的占用百分比。
 	BasicLimit int `json:"basic_limit"`
 	BasicUsage int `json:"basic_usage"`
 	// UsageCheckedAt 是额度快照时间。
@@ -571,8 +578,10 @@ func saveCredentials(header, label, spaceID string) ([]*StoredAuth, error) {
 // [返回] 展示名。
 // 最近修改时间：2026-10-19；改动原因：新增，拆分后的账号命名。
 func accountLabel(header string, space NotionSpace, authID string) string {
+	// 订阅空间用「上限」判定而不是余额：额度用尽后余额会变成 0，
+	// 若按余额判定，重新导入会把一张订阅卡错标成免费。
 	tier := "免费"
-	if space.PremiumCredits > 0 {
+	if space.PremiumLimit > 0 || space.PremiumCredits > 0 {
 		tier = "订阅"
 	}
 	base := strings.TrimSpace(header)
@@ -582,13 +591,30 @@ func accountLabel(header string, space NotionSpace, authID string) string {
 	return base + " · " + tier
 }
 
+// premiumCeiling 返回空间的订阅额度规模。
+//
+// 优先用本周期上限；旧账号文件没有 premium_limit 字段，回落到余额，
+// 避免升级后面板把所有订阅空间都算成 0。
+// [参数] space: 工作空间。
+// [返回] 订阅额度上限或余额。
+// 最近修改时间：2026-10-19；改动原因：新增，兼容旧快照的上限取值。
+func premiumCeiling(space *NotionSpace) int {
+	if space == nil {
+		return 0
+	}
+	if space.PremiumLimit > 0 {
+		return space.PremiumLimit
+	}
+	return space.PremiumCredits
+}
+
 // pickSpace 在候选空间中选出目标空间。
 //
-// 优先精确匹配指定 id；未指定时选额度最高的空间——商业版通常有
-// premium 余额，免费版为 0，这样默认就落在订阅空间上。
+// 优先精确匹配指定 id；未指定时选订阅额度最大的空间——商业版通常有
+// premium 上限，免费版为 0，这样默认就落在订阅空间上。
 // [参数] spaces: 候选空间；want: 期望 id。
 // [返回] 选中的空间；无匹配时返回 nil。
-// 最近修改时间：2026-10-18；改动原因：新增，多 workspace 选择策略。
+// 最近修改时间：2026-10-19；改动原因：改用上限比较，额度耗尽后仍能选中订阅空间。
 func pickSpace(spaces []NotionSpace, want string) *NotionSpace {
 	want = strings.TrimSpace(want)
 	if want != "" {
@@ -600,9 +626,11 @@ func pickSpace(spaces []NotionSpace, want string) *NotionSpace {
 		return nil
 	}
 
+	// 按上限比较而不是余额：订阅额度耗尽后余额归零，按余额挑空间
+	// 会误选到免费空间。
 	best := 0
 	for i := 1; i < len(spaces); i++ {
-		if spaces[i].PremiumCredits > spaces[best].PremiumCredits {
+		if premiumCeiling(&spaces[i]) > premiumCeiling(&spaces[best]) {
 			best = i
 		}
 	}

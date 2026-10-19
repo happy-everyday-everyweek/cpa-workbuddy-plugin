@@ -437,27 +437,83 @@ function activeSpace(a){
   return list.find(s => s.id === a.space_id) || list[0] || null;
 }
 
-// premiumOf 取账号当前空间的订阅额度。
+// premiumOf 取账号当前空间的订阅额度余额。
 function premiumOf(a){
   const s = activeSpace(a);
   return s ? (Number(s.premium_credits) || 0) : 0;
 }
 
-// basicHTML 渲染基础消息额度进度条（有真实上限，才适合做百分比）。
-function basicHTML(space){
-  if (!space) return '';
-  const limit = Number(space.basic_limit) || 0;
-  const used = Number(space.basic_usage) || 0;
+// premiumLimitOf 取账号当前空间的订阅额度上限。
+//
+// 旧快照没有 premium_limit 字段，回落到余额，避免升级后面板把订阅
+// 空间当成免费空间展示。
+function premiumLimitOf(a){
+  const s = activeSpace(a);
+  if (!s) return 0;
+  const limit = Number(s.premium_limit) || 0;
+  return limit > 0 ? limit : (Number(s.premium_credits) || 0);
+}
+
+// isSubscribed 判断空间是否走订阅额度。
+//
+// 判定用上限而不是余额：额度用尽后余额归零，按余额判定会把订阅空间
+// 误显示成免费额度。
+function isSubscribed(space){
+  if (!space) return false;
+  return (Number(space.premium_limit) || 0) > 0 || (Number(space.premium_credits) || 0) > 0;
+}
+
+// progressHTML 渲染一条额度进度条。
+function progressHTML(label, used, limit, meta){
   const pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
   let color = 'var(--ok)';
   if (pct > 60) color = 'var(--warn)';
   if (pct > 85) color = 'var(--err)';
-  const when = space.usage_checked_at ? ' · 快照 ' + esc(fmtCST(space.usage_checked_at)) : '';
   return '<div class="pb">'
-    + '<div class="pb-label"><span>基础消息额度</span><span>' + used + ' / ' + limit + ' · ' + pct + '%</span></div>'
+    + '<div class="pb-label"><span>' + esc(label) + '</span><span>' + used + ' / ' + limit + ' · ' + pct + '%</span></div>'
     + '<div class="pb-track"><div class="pb-bar" style="width:' + pct + '%;background:' + color + '"></div></div>'
-    + '<div class="pb-meta">订阅额度 ' + (Number(space.premium_credits) || 0) + ' · 已用 ' + used + ' / 上限 ' + limit + when + '</div>'
+    + '<div class="pb-meta">' + meta + '</div>'
     + '</div>';
+}
+
+// usageHTML 渲染额度进度条。
+//
+// 订阅空间与免费空间的额度口径不同，必须分开：
+// 订阅空间看 premiumCredits（上限 300，余额随使用递减）；免费空间看
+// basicCredits（50 条基础消息）。订阅空间的 basicCredits 是累计计数，
+// 会超过 spaceLimit（实测 152 / 50），拿它算百分比会显示成 100% 满额。
+function usageHTML(space){
+  if (!space) return '';
+  const when = space.usage_checked_at ? ' · 快照 ' + esc(fmtCST(space.usage_checked_at)) : '';
+
+  if (isSubscribed(space)) {
+    const limit = Number(space.premium_limit) || 0;
+    const balance = Number(space.premium_credits) || 0;
+    if (limit <= 0) {
+      return '<div class="pb">'
+        + '<div class="pb-label"><span>订阅额度</span><span>余额 ' + balance + '</span></div>'
+        + '<div class="pb-meta">上限未知，点击「刷新额度」重新获取' + when + '</div>'
+        + '</div>';
+    }
+    // 旧快照没有 premium_usage，用「上限 - 余额」现算。
+    const used = space.premium_usage == null ? Math.max(0, limit - balance) : Number(space.premium_usage) || 0;
+    return progressHTML('订阅额度', used, limit, '剩余 ' + balance + when);
+  }
+
+  const limit = Number(space.basic_limit) || 0;
+  const used = Number(space.basic_usage) || 0;
+  return progressHTML('基础消息额度', used, limit, '免费工作空间·50 条基础额度' + when);
+}
+
+// needsUsageRefresh 判断账号快照是否已过期（超过 4 小时）或缺少上限字段。
+function needsUsageRefresh(a){
+  const space = activeSpace(a);
+  if (!space) return false;
+  if (isSubscribed(space) && !(Number(space.premium_limit) > 0)) return true;
+  if (!space.usage_checked_at) return true;
+  const at = new Date(space.usage_checked_at).getTime();
+  if (isNaN(at)) return true;
+  return Date.now() - at >= USAGE_REFRESH_MS;
 }
 
 // spacesHTML 列出账号下全部工作空间，标出当前选中项。
@@ -485,6 +541,8 @@ function card(a){
     + '<span class="badge space">' + (a.spaces || []).length + ' 空间</span>';
   const toggleLabel = a.disabled ? '启用' : '禁用';
   const updated = a.updated_at ? '<div class="uid">更新 ' + esc(fmtCST(a.updated_at)) + '</div>' : '';
+  const balance = premiumOf(a);
+  const balanceLabel = isSubscribed(space) ? balance + ' / ' + premiumLimitOf(a) : '—';
   return '<div class="card' + (a.disabled ? ' disabled' : '') + '" data-auth="' + esc(a.auth_id) + '">'
     + '<h2><span class="name" title="' + esc(a.label) + '">' + esc(a.label || a.auth_id) + '</span>'
     + '<span class="badges">' + badges
@@ -492,11 +550,12 @@ function card(a){
     + '</span></h2>'
     + '<div class="uid">' + esc(a.auth_id) + ' · ' + esc(a.user_id) + '</div>'
     + updated
-    + basicHTML(space)
+    + usageHTML(space)
     + '<div class="row"><span class="k">当前空间</span><span class="v" title="' + esc(a.space_name) + '">' + esc(a.space_name || '-') + '</span></div>'
-    + '<div class="row"><span class="k">订阅额度</span><span class="v ' + (premiumOf(a) > 0 ? 'ok' : 'warn') + '">' + premiumOf(a) + '</span></div>'
+    + '<div class="row"><span class="k">订阅余额</span><span class="v ' + (balance > 0 ? 'ok' : 'warn') + '">' + balanceLabel + '</span></div>'
     + spacesHTML(a)
     + '<div class="actions">'
+    + '<button class="sec" data-action="refresh">刷新额度</button>'
     + '<button class="sec" data-action="test">测试</button>'
     + '<button class="sec" data-action="toggle" data-disabled="' + (a.disabled ? '1' : '0') + '">' + toggleLabel + '</button>'
     + '</div>'
@@ -508,13 +567,14 @@ function summaryHTML(list){
   const total = list.length;
   const enabled = list.filter(a => !a.disabled).length;
   const premium = list.filter(a => !a.disabled).reduce((sum, a) => sum + premiumOf(a), 0);
+  const ceiling = list.filter(a => !a.disabled).reduce((sum, a) => sum + premiumLimitOf(a), 0);
   const spaces = list.reduce((sum, a) => sum + (a.spaces || []).length, 0);
   return '<div class="summary-hd"><span class="summary-title">账号总览</span>'
     + '<span class="summary-meta">共 ' + total + ' 个账号 · ' + spaces + ' 个工作空间</span></div>'
     + '<div class="summary-grid">'
     + '<div class="summary-item"><div class="k">启用中</div><div class="v ok">' + enabled + '</div></div>'
     + '<div class="summary-item"><div class="k">已禁用</div><div class="v' + (total - enabled > 0 ? ' warn' : '') + '">' + (total - enabled) + '</div></div>'
-    + '<div class="summary-item"><div class="k">订阅额度合计</div><div class="v">' + premium + '</div></div>'
+    + '<div class="summary-item"><div class="k">订阅余额 / 上限</div><div class="v">' + premium + ' / ' + ceiling + '</div></div>'
     + '<div class="summary-item"><div class="k">工作空间</div><div class="v">' + spaces + '</div></div>'
     + '</div>';
 }
@@ -524,6 +584,11 @@ let currentSearch = '';
 let currentSort = 'desc';
 let pendingAuthId = '';
 let testAuthId = '';
+let usageTimer = null;
+let usageRefreshing = false;
+
+// 额度快照超过该时长即视为过期，页面打开时自动刷新。
+const USAGE_REFRESH_MS = 4 * 60 * 60 * 1000;
 
 function sortAccounts(list){
   const copy = list.slice();
@@ -669,6 +734,55 @@ async function toggleAccount(btn, authId, disabled){
   }
 }
 
+// ---------- 额度刷新 ----------
+// refreshUsage 向插件请求一次实时额度并落盘。
+//
+// /usage 会现场调用 Notion 的额度端点并写回账号文件，所以刷新后
+// 再拉一次 /accounts 就能看到新快照，而不是停留在导入时刻的数字。
+async function refreshUsage(btn, authId, silent){
+  if (usageRefreshing) return false;
+  usageRefreshing = true;
+  busy(btn, true);
+  try {
+    const data = await request('/usage?auth_id=' + encodeURIComponent(authId));
+    if (data.error) throw new Error(data.error);
+    toast('额度已刷新', 'ok', describeSpaces(data.spaces));
+    await loadAll();
+    return true;
+  } catch (e) {
+    if (!silent) toast('刷新额度失败', 'err', e.message);
+    return false;
+  } finally {
+    usageRefreshing = false;
+    busy(btn, false);
+  }
+}
+
+// describeSpaces 把空间额度压成一行简短说明。
+function describeSpaces(spaces){
+  const list = Array.isArray(spaces) ? spaces : [];
+  return list.map(s => {
+    if ((Number(s.premium_limit) || 0) > 0) {
+      return '订阅 ' + (Number(s.premium_credits) || 0) + ' / ' + (Number(s.premium_limit) || 0);
+    }
+    return '基础 ' + (Number(s.basic_usage) || 0) + ' / ' + (Number(s.basic_limit) || 0);
+  }).join(' · ');
+}
+
+// autoRefreshStaleUsage 在页面打开时补刷过期快照。
+//
+// 插件本身没有后台定时任务（未声明 scheduler 能力），额度只会在导入、
+// 手动刷新与打开面板时更新。这里按 4 小时阈值逐个补刷，串行执行避免
+// 同时打满上游额度接口。
+async function autoRefreshStaleUsage(){
+  const stale = lastAccounts.filter(a => !a.disabled && needsUsageRefresh(a));
+  if (!stale.length) return;
+  for (const a of stale) {
+    const ok = await refreshUsage(null, a.auth_id, true);
+    if (!ok) break;
+  }
+}
+
 // ---------- 测试模型 ----------
 async function openTestModal(authId){
   testAuthId = authId;
@@ -735,6 +849,7 @@ document.getElementById('grid').addEventListener('click', event => {
   if (action === 'delete') openDeleteModal(authId);
   else if (action === 'toggle') toggleAccount(btn, authId, btn.dataset.disabled === '1');
   else if (action === 'test') openTestModal(authId);
+  else if (action === 'refresh') refreshUsage(btn, authId, false);
 });
 
 document.getElementById('testModelList').addEventListener('click', event => {
@@ -748,7 +863,11 @@ document.getElementById('keyInput').addEventListener('keydown', e => {
 });
 
 window.__ntThemeSync();
-loadAll();
+// 页面常驻时每 30 分钟检查一次快照时效，超过 4 小时才真正请求上游。
+loadAll().then(() => {
+  autoRefreshStaleUsage();
+  usageTimer = setInterval(autoRefreshStaleUsage, 30 * 60 * 1000);
+});
 </script>
 </body>
 </html>

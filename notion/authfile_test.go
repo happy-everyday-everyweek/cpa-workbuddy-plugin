@@ -4,10 +4,14 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestParseCookieIdentity 校验 Cookie 三种输入形态。
@@ -544,5 +548,265 @@ func TestMapLegacyAccountByUserAndSpace(t *testing.T) {
 	// 缺 user 或 space 时也不映射。
 	if got := mapLegacyAccount(&StoredAuth{SpaceID: "space-free"}); got != nil {
 		t.Fatal("缺少 user_id 时不应映射")
+	}
+}
+
+// TestPremiumUsageOf 校验订阅额度的周期用量推导。
+//
+// 上游只给余额与上限，已用量必须由两者相减；余额高于上限（赠送、补额）
+// 时不能算出负数，否则进度条会显示成负宽度。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，订阅额度口径回归。
+func TestPremiumUsageOf(t *testing.T) {
+	cases := []struct {
+		name    string
+		limit   int
+		balance int
+		want    int
+	}{
+		{name: "正常消耗", limit: 300, balance: 168, want: 132},
+		{name: "额度用尽", limit: 300, balance: 0, want: 300},
+		{name: "余额倒挂", limit: 300, balance: 400, want: 0},
+		{name: "无订阅", limit: 0, balance: 0, want: 0},
+	}
+
+	for _, tc := range cases {
+		if got := premiumUsageOf(tc.limit, tc.balance); got != tc.want {
+			t.Fatalf("%s：已用 = %d, 期望 %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPremiumCeilingFallsBackToBalance 校验旧快照没有上限时回落到余额。
+//
+// 0.2.1 及更早落盘的账号没有 premium_limit 字段，升级后若直接读上限，
+// 所有订阅空间都会被当成免费空间。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，旧快照兼容回归。
+func TestPremiumCeilingFallsBackToBalance(t *testing.T) {
+	if got := premiumCeiling(&NotionSpace{PremiumCredits: 300}); got != 300 {
+		t.Fatalf("旧快照应回落到余额，实际 %d", got)
+	}
+	if got := premiumCeiling(&NotionSpace{PremiumCredits: 300, PremiumLimit: 300}); got != 300 {
+		t.Fatalf("有上限时应取上限，实际 %d", got)
+	}
+	// 额度用尽：余额 0 但上限仍在，必须仍判为订阅空间。
+	if got := premiumCeiling(&NotionSpace{PremiumCredits: 0, PremiumLimit: 300}); got != 300 {
+		t.Fatalf("额度用尽后上限不能丢，实际 %d", got)
+	}
+}
+
+// TestAccountLabelKeepsTierWhenExhausted 校验额度用尽后账号仍标记为订阅。
+//
+// 若按余额判定，额度耗尽后重新导入会把订阅卡标成「免费」，
+// 用户会误以为订阅空间丢失。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，额度耗尽后的套餐标记回归。
+func TestAccountLabelKeepsTierWhenExhausted(t *testing.T) {
+	exhausted := NotionSpace{ID: "s1", PremiumCredits: 0, PremiumLimit: 300}
+	if got := accountLabel("主账号", exhausted, "notion-a"); got != "主账号 · 订阅" {
+		t.Fatalf("额度用尽仍应标记订阅，实际：%s", got)
+	}
+}
+
+// TestApplyUsageEligibilityUsesThreeFields 校验额度字段按各自语义写入。
+//
+// 生产实测同一份响应里：上限在 limits.purchased.totalLimit(=300)、余额在
+// premiumCredits.totalCreditBalance(=300)、基础计数在 basicCredits(=152/50)。
+// 若误用 basicCredits 当订阅额度，面板会显示成 152/50 满额红灯。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，额度字段口径回归。
+func TestApplyUsageEligibilityUsesThreeFields(t *testing.T) {
+	raw := `{
+  "basicCredits": {"spaceUsage": 152, "userUsage": 152, "spaceLimit": 50, "userLimit": 50},
+  "limits": {"purchased": {"totalLimit": 300}},
+  "premiumCredits": {"totalCreditBalance": 168, "creditsInOverage": 0,
+    "perSource": {"monthlyAllocated": {"usageTotal": 0, "limit": 300}}},
+  "usage": {"currentServicePeriod": {"spaceUsage": 0, "userUsage": 0},
+    "lifetime": {"spaceUsage": 152, "userUsage": 152}, "totalCreditBalance": 168}
+}`
+	var resp usageEligibilityResponse
+	if errUnmarshal := json.Unmarshal([]byte(raw), &resp); errUnmarshal != nil {
+		t.Fatalf("解析失败：%v", errUnmarshal)
+	}
+
+	space := &NotionSpace{ID: "space-paid"}
+	applyUsageEligibility(space, &resp)
+
+	if space.PremiumLimit != 300 {
+		t.Fatalf("订阅上限应取 limits.purchased.totalLimit=300，实际 %d", space.PremiumLimit)
+	}
+	if space.PremiumCredits != 168 {
+		t.Fatalf("订阅余额应取 totalCreditBalance=168，实际 %d", space.PremiumCredits)
+	}
+	if space.PremiumUsage != 132 {
+		t.Fatalf("订阅已用应推导为 132，实际 %d", space.PremiumUsage)
+	}
+	// 基础计数原样保留，但它不能冒充订阅上限。
+	if space.BasicLimit != 50 || space.BasicUsage != 152 {
+		t.Fatalf("基础计数写入错误：%d / %d", space.BasicUsage, space.BasicLimit)
+	}
+	if space.UsageCheckedAt == "" {
+		t.Fatal("未记录快照时间")
+	}
+}
+
+// rewriteHostTransport 把请求转发到测试服务，保留原路径与请求体。
+type rewriteHostTransport struct {
+	target string
+}
+
+// RoundTrip 实现 http.RoundTripper。
+// [参数] req: 原始请求。
+// [返回] 测试服务的响应与错误。
+// 最近修改时间：2026-10-19；改动原因：新增，额度刷新测试的上游替身。
+func (t rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	parsed, errParse := url.Parse(t.target)
+	if errParse != nil {
+		return nil, errParse
+	}
+	clone.URL.Scheme = parsed.Scheme
+	clone.URL.Host = parsed.Host
+	clone.Host = parsed.Host
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// TestRefreshUsageForAuthPersists 校验刷新额度会把上游新值写回账号文件。
+//
+// 只刷新内存不落盘时，面板下一次读 /accounts 又会退回导入时的旧快照，
+// 用户看到的仍然是 02:19 那组数字。这条链路必须端到端可验证。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，刷新落盘回归。
+func TestRefreshUsageForAuthPersists(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	paid := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-paid",
+		CookieHeader: "token_v2=t; notion_user_id=u", TokenV2: "t",
+		UserID: "u", SpaceID: "space-paid",
+		Spaces:    []NotionSpace{{ID: "space-paid", PremiumCredits: 300, BasicUsage: 152}},
+		CreatedAt: "2026-10-19T02:19:04+08:00",
+	}
+	path := filepath.Join(dir, paid.AuthID+notionAuthFileSuffix)
+	if errWrite := writeAuthFileDirect(path, paid); errWrite != nil {
+		t.Fatalf("落盘失败：%v", errWrite)
+	}
+
+	// 上游替身：返回订阅余额 168 / 上限 300。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+  "basicCredits": {"spaceUsage": 152, "spaceLimit": 50},
+  "limits": {"purchased": {"totalLimit": 300}},
+  "premiumCredits": {"totalCreditBalance": 168}
+}`))
+	}))
+	defer srv.Close()
+
+	// 上游前缀是常量，用改写 URL 的传输层把请求引到测试服务。
+	origClient := usageHTTPClientFn
+	usageHTTPClientFn = func(timeout time.Duration) *http.Client {
+		return &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	}
+	defer func() { usageHTTPClientFn = origClient }()
+
+	auth, errFind := findAccount("notion-paid")
+	if errFind != nil {
+		t.Fatalf("查找账号失败：%v", errFind)
+	}
+	if errRefresh := refreshUsageForAuth(auth); errRefresh != nil {
+		t.Fatalf("刷新额度失败：%v", errRefresh)
+	}
+
+	reloaded, errRead := readAuthFile(path)
+	if errRead != nil {
+		t.Fatalf("回读失败：%v", errRead)
+	}
+	if len(reloaded.Spaces) != 1 {
+		t.Fatalf("空间数量异常：%+v", reloaded.Spaces)
+	}
+	space := reloaded.Spaces[0]
+	if space.PremiumCredits != 168 || space.PremiumLimit != 300 || space.PremiumUsage != 132 {
+		t.Fatalf("刷新结果未落盘：%+v", space)
+	}
+	if space.UsageCheckedAt == "" || space.UsageCheckedAt == "2026-10-19T02:19:04+08:00" {
+		t.Fatalf("快照时间未更新：%s", space.UsageCheckedAt)
+	}
+}
+
+// TestPersistUsageSnapshotSyncsSiblings 校验刷新额度会写回同账号的全部空间文件。
+//
+// 同一份 Cookie 拆成多个账号文件，每个文件都保存完整空间列表；只写当前
+// 文件会让另一张卡片一直显示旧数字。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，额度快照跨空间同步回归。
+func TestPersistUsageSnapshotSyncsSiblings(t *testing.T) {
+	dir := t.TempDir()
+	setAccountsDir(dir)
+	defer setAccountsDir("")
+
+	paid := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-paid",
+		CookieHeader: "token_v2=t; notion_user_id=u", TokenV2: "t",
+		UserID: "u", SpaceID: "space-paid",
+		Spaces: []NotionSpace{{ID: "space-paid", PremiumCredits: 300, BasicUsage: 152}},
+	}
+	free := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-free",
+		CookieHeader: "token_v2=t; notion_user_id=u", TokenV2: "t",
+		UserID: "u", SpaceID: "space-free",
+		Spaces: []NotionSpace{{ID: "space-free", BasicLimit: 50, BasicUsage: 5}},
+	}
+	other := &StoredAuth{
+		Type: providerName, Provider: providerName, AuthID: "notion-other",
+		CookieHeader: "token_v2=o; notion_user_id=other", TokenV2: "o",
+		UserID: "other", SpaceID: "space-x",
+		Spaces: []NotionSpace{{ID: "space-x", BasicLimit: 50, BasicUsage: 1}},
+	}
+	for _, a := range []*StoredAuth{paid, free, other} {
+		if errWrite := writeAuthFileDirect(filepath.Join(dir, a.AuthID+notionAuthFileSuffix), a); errWrite != nil {
+			t.Fatalf("落盘失败：%v", errWrite)
+		}
+	}
+
+	fresh := []NotionSpace{
+		{ID: "space-paid", PremiumCredits: 168, PremiumLimit: 300, PremiumUsage: 132},
+		{ID: "space-free", BasicLimit: 50, BasicUsage: 6},
+	}
+	updated, errFind := findAccount("notion-paid")
+	if errFind != nil {
+		t.Fatalf("查找账号失败：%v", errFind)
+	}
+	updated.Spaces = fresh
+	if errPersist := persistUsageSnapshot(updated); errPersist != nil {
+		t.Fatalf("写回额度失败：%v", errPersist)
+	}
+
+	for _, id := range []string{"notion-paid", "notion-free"} {
+		got, errRead := readAuthFile(filepath.Join(dir, id+notionAuthFileSuffix))
+		if errRead != nil {
+			t.Fatalf("%s 回读失败：%v", id, errRead)
+		}
+		if len(got.Spaces) != 2 || got.Spaces[0].PremiumLimit != 300 || got.Spaces[1].BasicUsage != 6 {
+			t.Fatalf("%s 额度未同步：%+v", id, got.Spaces)
+		}
+	}
+
+	// 其他用户的账号不能被这次刷新改动。
+	untouched, errRead := readAuthFile(filepath.Join(dir, "notion-other"+notionAuthFileSuffix))
+	if errRead != nil {
+		t.Fatalf("其他账号回读失败：%v", errRead)
+	}
+	if untouched.Spaces[0].BasicUsage != 1 {
+		t.Fatalf("其他用户的额度被误改：%+v", untouched.Spaces)
 	}
 }

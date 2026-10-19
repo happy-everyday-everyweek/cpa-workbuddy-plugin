@@ -69,6 +69,14 @@ func fetchSpaces(ctx context.Context, cl *http.Client, scope requestScope) ([]No
 }
 
 // usageEligibilityResponse 是 getAIUsageEligibilityV2 的响应结构。
+//
+// 三个额度字段语义不同，不能互相替代：
+//   - premiumCredits.totalCreditBalance 是**剩余余额**；
+//   - limits.purchased.totalLimit 是本服务周期的订阅额度**上限**；
+//   - basicCredits 是不限额空间也会累计增长的**基础消息计数**。
+//
+// 实测订阅空间 basicCredits.spaceUsage 会超过 spaceLimit（152 / 50），
+// 因此它不能用来算订阅空间的占用百分比，否则会显示成 100% 满额红灯。
 type usageEligibilityResponse struct {
 	PremiumCredits struct {
 		TotalCreditBalance int `json:"totalCreditBalance"`
@@ -79,6 +87,11 @@ type usageEligibilityResponse struct {
 			} `json:"monthlyAllocated"`
 		} `json:"perSource"`
 	} `json:"premiumCredits"`
+	Limits struct {
+		Purchased struct {
+			TotalLimit int `json:"totalLimit"`
+		} `json:"purchased"`
+	} `json:"limits"`
 	BasicCredits struct {
 		SpaceLimit int `json:"spaceLimit"`
 		SpaceUsage int `json:"spaceUsage"`
@@ -104,11 +117,42 @@ func enrichSpaceUsage(ctx context.Context, cl *http.Client, scope requestScope, 
 		if errQuery := doNotionJSON(ctx, cl, queryScope, "/getAIUsageEligibilityV2", body, &resp); errQuery != nil {
 			continue
 		}
-		spaces[i].PremiumCredits = resp.PremiumCredits.TotalCreditBalance
-		spaces[i].BasicLimit = resp.BasicCredits.SpaceLimit
-		spaces[i].BasicUsage = resp.BasicCredits.SpaceUsage
-		spaces[i].UsageCheckedAt = time.Now().Format(time.RFC3339)
+		applyUsageEligibility(&spaces[i], &resp)
 	}
+}
+
+// applyUsageEligibility 把上游额度响应写入空间快照。
+//
+// 余额、上限、基础计数分别取自三个互不相同的字段；混用会让订阅空间
+// 显示成基础额度满额，因此单独成函数以便回归。
+// [参数] space: 目标空间；resp: 上游响应。
+// [返回] 无（就地修改）。
+// 最近修改时间：2026-10-19；改动原因：抽出额度写入，补齐上限与周期用量。
+func applyUsageEligibility(space *NotionSpace, resp *usageEligibilityResponse) {
+	if space == nil || resp == nil {
+		return
+	}
+	space.PremiumCredits = resp.PremiumCredits.TotalCreditBalance
+	space.PremiumLimit = resp.Limits.Purchased.TotalLimit
+	space.PremiumUsage = premiumUsageOf(space.PremiumLimit, space.PremiumCredits)
+	space.BasicLimit = resp.BasicCredits.SpaceLimit
+	space.BasicUsage = resp.BasicCredits.SpaceUsage
+	space.UsageCheckedAt = time.Now().Format(time.RFC3339)
+}
+
+// premiumUsageOf 由上限与余额推导本周期已用订阅额度。
+//
+// 上游没有直接给出订阅额度的已用量，只有余额与上限。余额高于上限
+// （赠送额度、人工补额）时按 0 处理，不把倒挂显示成负数。
+// [参数] limit: 本周期上限；balance: 剩余余额。
+// [返回] 本周期已用量。
+// 最近修改时间：2026-10-19；改动原因：新增，订阅额度占用口径。
+func premiumUsageOf(limit, balance int) int {
+	used := limit - balance
+	if used < 0 {
+		return 0
+	}
+	return used
 }
 
 // availableModelsResponse 是 getAvailableModels 的响应结构。
