@@ -66,7 +66,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.4.6"
+	version      = "0.5.0"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -275,8 +275,8 @@ func cozeRegistration() registration {
 			AuthProvider:          true,
 			Executor:              true,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
-			ExecutorInputFormats:  []string{"openai"},
-			ExecutorOutputFormats: []string{"openai"},
+			ExecutorInputFormats:  []string{"openai", "openai-image"},
+			ExecutorOutputFormats: []string{"openai", "openai-image"},
 			Scheduler:             false,
 			ManagementAPI:         true,
 			UsagePlugin:           false,

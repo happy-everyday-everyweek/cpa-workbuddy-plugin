@@ -523,6 +523,12 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, errParse
 	}
 
+	// 标准图片端点与对话端点共用同一个 executor，必须按来源格式分流：
+	// images 请求没有 messages，按 chat 解析必然报「请求缺少 messages」。
+	if isImagesExecution(req) {
+		return handleImagesExecute(sa, req)
+	}
+
 	chatReq, errChat := parseChatRequest(executorRequestBody(req))
 	if errChat != nil {
 		return nil, errChat

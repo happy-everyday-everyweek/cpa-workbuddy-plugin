@@ -129,8 +129,8 @@ func TestDiscoverModels_MapsTypesAndSkipsOffline(t *testing.T) {
 	if byID[modelIDPrefix+"chat-a"] != "chat" {
 		t.Fatalf("对话模型类型应为 chat，实际 %q", byID[modelIDPrefix+"chat-a"])
 	}
-	if byID[modelIDPrefix+"img-a"] != "image" {
-		t.Fatalf("图像模型类型应为 image，实际 %q", byID[modelIDPrefix+"img-a"])
+	if byID[modelIDPrefix+"img-a"] != openAIImageModelType {
+		t.Fatalf("图像模型类型应为 %s，实际 %q", openAIImageModelType, byID[modelIDPrefix+"img-a"])
 	}
 	if _, exists := byID[modelIDPrefix+"video-gone"]; exists {
 		t.Fatal("已下线模型不应登记")
@@ -284,7 +284,7 @@ func TestModelStatic_ReturnsFallbackWithoutAccounts(t *testing.T) {
 // 最近修改时间：2026-10-18；改动原因：新增，映射用例。
 func TestHostTypeForCapability(t *testing.T) {
 	cases := map[string]string{
-		"image_gen":      "image",
+		"image_gen":      openAIImageModelType,
 		"generate_video": "video",
 		"unknown":        "",
 	}

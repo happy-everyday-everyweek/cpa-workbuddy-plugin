@@ -57,6 +57,13 @@ const (
 	// 宿主按 provider 聚合多个插件的模型，裸名容易与其他服务商的同名模型冲突。
 	modelIDPrefix = "coze/"
 
+	// openAIImageModelType 是宿主图片端点白名单认的模型类型。
+	//
+	// 必须与宿主 internal/registry 的 OpenAIImageModelType 字面量一致：
+	// POST /v1/images/generations 只接受 Type == "openai-image" 的模型，
+	// 填 "image" 会被 rejectUnsupportedImagesModel 直接 400 拒绝。
+	openAIImageModelType = "openai-image"
+
 	// referenceCreated 是目录条目的固定创建时间。
 	//
 	// 用固定值而非 time.Now()：该字段参与客户端缓存判定，每次轮询都变化会让
@@ -80,7 +87,7 @@ type modelListType struct {
 // 顺序决定输出顺序：对话模型在前，生成类在后，与用户在面板里的使用频率一致。
 var modelListTypes = []modelListType{
 	{Upstream: modelTypeLLM, Host: "chat"},
-	{Upstream: modelTypeImage, Host: "image"},
+	{Upstream: modelTypeImage, Host: openAIImageModelType},
 	{Upstream: modelTypeVideo, Host: "video"},
 	{Upstream: modelTypeEmbed, Host: "embedding"},
 	{Upstream: modelTypeTTS, Host: "audio"},
@@ -427,7 +434,7 @@ func discoverModels(sa *StoredAuth) ([]pluginapi.ModelInfo, error) {
 func hostTypeForCapability(capability string) string {
 	switch strings.ToLower(strings.TrimSpace(capability)) {
 	case "image_gen":
-		return "image"
+		return openAIImageModelType
 	case "generate_video":
 		return "video"
 	default:
@@ -481,7 +488,7 @@ func modelTypeRank(hostType string) int {
 	switch hostType {
 	case "chat":
 		return 0
-	case "image":
+	case openAIImageModelType:
 		return 1
 	case "video":
 		return 2
@@ -517,7 +524,7 @@ func staticFallbackModels() []pluginapi.ModelInfo {
 		{"doubao-seed-2-0-pro-260215", "Doubao-Seed-2.0-pro", "旗舰级全能通用模型，擅长复杂推理与长链路任务。", "chat"},
 		{"doubao-seed-2-0-lite-260215", "Doubao-Seed-2.0-lite", "轻量通用模型，兼顾速度与质量。", "chat"},
 		{"doubao-seed-2-0-mini-260215", "Doubao-Seed-2.0-mini", "超轻量模型，响应最快。", "chat"},
-		{"doubao-seedream-5-0-260128", "Doubao-Seedream-5.0-lite", "图像生成模型。", "image"},
+		{"doubao-seedream-5-0-260128", "Doubao-Seedream-5.0-lite", "图像生成模型。", openAIImageModelType},
 		{"doubao-seedance-2-0-260128", "Doubao-Seedance-2.0", "视频生成模型。", "video"},
 	}
 	out := make([]pluginapi.ModelInfo, 0, len(seeds))

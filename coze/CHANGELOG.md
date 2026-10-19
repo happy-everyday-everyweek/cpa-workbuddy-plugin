@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0 (2026-10-19)
+
+### 新增
+
+- **支持标准图片端点 `POST /v1/images/generations`**。此前 coze 的生图只能通过
+  对话内嵌（`/v1/chat/completions` 返回 Markdown 图片），new-api 的图片页
+  走标准端点时必然失败。现在该端点可用，返回 OpenAI 规范的
+  `{created, data[]}`，支持 `response_format=url` 与 `b64_json`。
+- 生图模型对外类型由 `"image"` 改为 `"openai-image"`：CPA 的图片端点白名单
+  只认这个类型，填 `"image"` 会被 `rejectUnsupportedImagesModel` 直接 400。
+  静态兜底目录同步修正（否则「无账号时 400、有账号时可用」的双轨不一致）。
+- executor 声明 `openai-image` 输入/输出格式：宿主按插件声明协商格式，
+  缺这个声明会让请求在 1ms 内 500（`does not support input format`）。
+
+### 实现
+
+- 新增 `coze/images.go`：images 请求解析、尺寸/张数翻译成提示词、
+  响应包装。复用既有 claw 对话通道，不新增上游路径。
+- b64_json 模式真实下载后编码，下载失败即报错——不返回伪造 base64。
+- 图片下载限定 `coze.site` 白名单且必须 https：URL 来自上游响应，
+  不限制目标等于让上游决定插件去请求哪个地址（SSRF）。
+- 入口按 `Format` / `SourceFormat` 分流到 images 路径，
+  不进 chat 解析（images 请求没有 messages）。
+
+### 测试
+
+- 新增 13 个用例：请求解析、格式归一化、提示词翻译、url/b64 响应、
+  下载失败传播、SSRF 白名单、入口分流、静态兜底类型、对话/视频不回归。
+- 5 项变异反证全部精确失败：入口分流、能力映射、SSRF 调用点、
+  下载失败传播、响应格式口径。
+- 补强两处最初抓不到变异的用例（单函数测试抓不到「调用点被删」）。
+
+### 修复
+
+- 静态兜底目录的生图模型类型此前漏改，导致无账号时图片端点必然 400。
+
 ## 0.4.6 (2026-10-19)
 
 ### 修复
