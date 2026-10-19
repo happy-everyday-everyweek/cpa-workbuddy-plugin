@@ -70,12 +70,12 @@ func TestChatContentTooLongErrorCarries413(t *testing.T) {
 // TestRequestFaultEnvelopeCarriesStatus 验证信封序列化出 http_status。
 //
 // 宿主的 rpc_client 只在 envelope.Error.HTTPStatus > 0 时构造带状态码的
-// 错误；字段缺失即退化成 5xx，这正是本轮生产故障的放大器。
+// 错误；字段缺失即退化成 0，请求级故障会被误当成账号故障。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，信封字段契约。
+// 最近修改时间：2026-10-19；改动原因：改为新信封出口的重名契约。
 func TestRequestFaultEnvelopeCarriesStatus(t *testing.T) {
-	raw := requestFaultEnvelope(http.StatusRequestEntityTooLarge, "invalid_request", "请求内容过长")
+	raw := faultEnvelope(http.StatusRequestEntityTooLarge, faultCodeRequest, "请求内容过长")
 	var parsed struct {
 		OK    bool `json:"ok"`
 		Error struct {
@@ -103,13 +103,14 @@ func TestRequestFaultEnvelopeCarriesStatus(t *testing.T) {
 	}
 }
 
-// TestCommonErrorEnvelopeOmitsStatus 验证普通错误仍走无状态码通道。
+// TestCommonErrorEnvelopeOmitsStatus 验证无状态码的下层构造器行为。
 //
-// 上游账号类失败必须保持原有语义：宿主据此换号与冷却。
-// 若给所有错误都补 4xx，会把真实的账号故障伪装成请求故障。
+// errorEnvelope 仍是方法分发等非执行路径的通用出口，它不带状态码；
+// 执行路径必须走 faultEnvelope（见 faults_test.go），
+// 否则宿主取到 0 会既不冷却也不换号。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，防过度上报。
+// 最近修改时间：2026-10-19；改动原因：明确通用出口的适用边界。
 func TestCommonErrorEnvelopeOmitsStatus(t *testing.T) {
 	raw := errorEnvelope("plugin_error", "提交消息失败：该用户积分已耗尽")
 	var parsed struct {

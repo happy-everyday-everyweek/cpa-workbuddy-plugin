@@ -303,7 +303,7 @@ func (c *clawClient) fetchClawID() (string, error) {
 		return "", err
 	}
 	if !env.isSuccess() {
-		return "", fmt.Errorf("取 claw_id 失败：%s", env.describe())
+		return "", clawBusinessError("取 claw_id 失败", env)
 	}
 
 	var parsed clawInfoResponse
@@ -327,7 +327,7 @@ func (c *clawClient) fetchMainSession(clawID string) (string, error) {
 		return "", err
 	}
 	if !env.isSuccess() {
-		return "", fmt.Errorf("取主会话失败：%s", env.describe())
+		return "", clawBusinessError("取主会话失败", env)
 	}
 
 	var parsed clawSessionResponse
@@ -410,7 +410,7 @@ func (c *clawClient) sendChat(sessionID, content string) (string, error) {
 		// 兜底：本地预检放行但上游仍报该码时，按上游服务端故障处理，
 		// 保留原始码值。不能在这里猜成「内容过长」——体积正常时该码
 		// 也可能出现，误标会让用户反复删内容却毫无改善。
-		return "", fmt.Errorf("提交消息失败：%s", env.describe())
+		return "", clawBusinessError("提交消息失败", env)
 	}
 
 	var parsed clawChatResponse
@@ -439,7 +439,7 @@ func (c *clawClient) listMessages(sessionID string) ([]clawMessage, error) {
 		return nil, err
 	}
 	if !env.isSuccess() {
-		return nil, fmt.Errorf("拉取消息失败：%s", env.describe())
+		return nil, clawBusinessError("拉取消息失败", env)
 	}
 
 	var parsed clawMessageListResponse
@@ -459,7 +459,7 @@ func (c *clawClient) fetchFrontierKey() (*frontierKeyResponse, error) {
 		return nil, err
 	}
 	if !env.isSuccess() {
-		return nil, fmt.Errorf("取 frontier 凭证失败：%s", env.describe())
+		return nil, clawBusinessError("取 frontier 凭证失败", env)
 	}
 
 	var parsed frontierKeyResponse
