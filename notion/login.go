@@ -534,7 +534,7 @@ func writeBridgeScript(b *strings.Builder) {
 //
 // 脚本在 Notion 页面上下文执行，因此：同源 fetch 天然带上登录 Cookie，
 // 用它校验登录态有效；同时把浏览器可读的 Cookie 拼成 header 交给回调页。
-// token_v2 读不到（HttpOnly），回调页会提示补填。
+// token_v2 读不到（HttpOnly），由回调页粘一次 Copy as cURL 由服务端解析。
 // [参数] state: 登录会话标识。
 // [返回] 可粘贴执行的 JS 源码（含待替换的 origin 占位符）。
 // 最近修改时间：2026-10-19；改动原因：新增，从粘贴 Cookie 改为脚本采集。
@@ -554,7 +554,7 @@ func buildAuthScript(state string) string {
 	b.WriteString("    const r=await fetch('/api/v3/getSpaces',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:'{}'});\n")
 	b.WriteString("    if(!r.ok){fail('当前页面未登录 Notion（HTTP '+r.status+'），请先登录再执行脚本');return;}\n")
 	b.WriteString("  }catch(e){fail('校验登录态失败：'+(e&&e.message?e.message:String(e)));return;}\n")
-	// 只采集可读 Cookie；token_v2 由回调页补填。
+	// 只采集可读 Cookie；token_v2 由回调页的 Copy as cURL 补齐。
 	b.WriteString("  const kv=[];\n")
 	b.WriteString("  document.cookie.split(';').forEach(p=>{const s=p.trim();if(s.indexOf('=')>0){kv.push(s)}});\n")
 	b.WriteString("  if(!kv.some(s=>s.indexOf('notion_user_id=')===0)){fail('未取到 notion_user_id，请确认已在 Notion 登录');return;}\n")
@@ -575,11 +575,9 @@ func jsStringEscape(s string) string {
 // handleLoginCallback 渲染脚本跳回的接收页。
 //
 // 脚本把采集到的可读 Cookie 放在 URL fragment 里（#cookie=...），服务端
-// 看不到 fragment，因此首次请求只返回接收页；页面脚本把 fragment 解析出来、
-// 提示用户补填 token_v2，再经同源请求头提交到 /login/import。
-//
-// 为什么不直接由脚本提交：token_v2 是 HttpOnly，脚本读不到；必须给用户一个
-// 可见的补填入口，否则导入必然因「缺少 token_v2」失败。
+// 看不到 fragment，因此首次请求只返回接收页；页面脚本把 fragment 解析出来
+// 作为排错对照，真正的完整凭据由用户粘一次 Copy as cURL 后经同源请求头
+// 提交到 /login/import，由服务端解析 Cookie（含 HttpOnly 的 token_v2）。
 // [参数] state: 登录会话标识。
 // [返回] 管理响应（HTML）。
 // 最近修改时间：2026-10-19；改动原因：新增，脚本回调落点。
@@ -596,10 +594,11 @@ func handleLoginCallback(state string) pluginapi.ManagementResponse {
 
 // loginCallbackShell 渲染脚本回调页。
 //
-// detail 非空时只展示错误；否则读取 fragment 中的 Cookie 并给出补填表单。
+// detail 非空时只展示错误；否则读取 fragment 中的 Cookie 作为对照，
+// 并给出 Copy as cURL 的整段粘贴入口。
 // [参数] state: 登录会话标识；detail: 错误说明。
 // [返回] 管理响应（HTML）。
-// 最近修改时间：2026-10-19；改动原因：新增，fragment 接收与补填页。
+// 最近修改时间：2026-10-19；改动原因：新增，fragment 接收与整段粘贴页。
 func loginCallbackShell(state, detail string) pluginapi.ManagementResponse {
 	var b strings.Builder
 	writeBridgeHead(&b, state)
