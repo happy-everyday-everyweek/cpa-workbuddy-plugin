@@ -13,6 +13,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
+import base64
+
 PAGE_DIR = sys.argv[1] if len(sys.argv) > 1 else ".tmp_pages"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
 CAPTURE = os.path.join(PAGE_DIR, "captured.json")
@@ -29,10 +31,28 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path.endswith("/login/import"):
-            header = self.headers.get("X-Notion-Cookie", "")
+            # 0.2.6 起前端走 base64 原文头；旧的纯 Cookie 头保留为兜底对照。
+            encoded = self.headers.get("X-Notion-Auth-Input", "")
+            header = ""
+            if encoded:
+                try:
+                    header = base64.b64decode(encoded).decode("utf-8", "replace")
+                except Exception:
+                    header = ""
+            if not header:
+                header = self.headers.get("X-Notion-Cookie", "")
             pairs = [p.strip().split("=")[0] for p in header.split(";") if "=" in p]
             with open(CAPTURE, "w", encoding="utf-8") as f:
-                json.dump({"pair_keys": pairs, "len": len(header)}, f)
+                json.dump(
+                    {
+                        "pair_keys": pairs,
+                        "encoded_len": len(encoded),
+                        "decoded_len": len(header),
+                        "has_curl": "curl " in header,
+                        "has_token": "token_v2=" in header,
+                    },
+                    f,
+                )
             body = json.dumps(
                 {"ok": True, "labels": ["验证账号 · 订阅"], "auth_ids": ["notion-x"]}
             ).encode("utf-8")

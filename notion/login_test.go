@@ -469,23 +469,30 @@ func TestLoginBridgeRendersScriptForValidState(t *testing.T) {
 	}
 }
 
-// TestLoginCallbackRendersCurlForm 校验回调页只要整段粘贴，不要逐项补字段。
+// TestLoginCallbackRendersCurlForm 校验回调页以自动读取剪贴板为主、手动粘贴为兜底。
 //
 // token_v2 是 HttpOnly，脚本采集不到；但让用户去 Application 面板逐个找
 // 字段，既容易被 token 轮换打过期，也容易抄错值（真实反馈里的 401 就是这么来的）。
-// 正确形态是让用户粘一次 Copy as cURL，由插件解析。
+// 0.2.6 起主路径改为回调页直接读剪贴板并提交，用户只需复制一次 Copy as cURL，
+// 不需要把内容粘进任何输入框；手动粘贴仅作浏览器拒绝剪贴板时的兜底。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：从「补 token_v2」改为「整段粘贴」。
+// 最近修改时间：2026-10-20；改动原因：回调页改为自动读取剪贴板并直接出结果。
 func TestLoginCallbackRendersCurlForm(t *testing.T) {
 	resetLoginSessions()
 	resp := startLoginForTest(t)
 
 	page := handleLoginCallback(resp.State)
 	body := string(page.Body)
-	for _, want := range []string{`id="curl"`, `id="cookie"`, `id="submit"`, callbackCookieParam, "Copy as cURL"} {
+	for _, want := range []string{`id="curl"`, `id="submit"`, `id="retry"`, `id="status"`, callbackCookieParam, "Copy as cURL"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("回调页缺少 %s：%s", want, body)
+		}
+	}
+	// 自动路径的必备件：剪贴板读取、内容形态校验、焦点回到页面即重试。
+	for _, want := range []string{"navigator.clipboard.readText", "looksLikeCredential", "addEventListener(\"focus\"", "visibilitychange"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("回调页缺少自动读取剪贴板的 %s", want)
 		}
 	}
 	// 不能再要求用户手工补 token_v2：那正是被反馈否掉的交互。
@@ -510,9 +517,9 @@ func TestLoginCallbackRendersCurlForm(t *testing.T) {
 	if !strings.Contains(body, "history.replaceState") {
 		t.Fatal("clearHash 必须真的改写地址栏")
 	}
-	// 提交的必须是整段原文：前端再拼一次 Cookie 就等于把识别逻辑又搬回浏览器。
-	if !strings.Contains(body, "curlEl.value") {
-		t.Fatal("提交内容必须取自一整段粘贴文本")
+	// 自动路径与手动路径必须共用同一个提交函数，不能各写一份。
+	if !strings.Contains(body, "submit(t)") || !strings.Contains(body, "submit(curlEl&&curlEl.value)") {
+		t.Fatal("自动读取与手动粘贴必须共用同一个提交入口")
 	}
 }
 

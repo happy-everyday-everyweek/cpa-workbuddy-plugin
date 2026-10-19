@@ -613,40 +613,47 @@ func loginCallbackShell(state, detail string) pluginapi.ManagementResponse {
 	return htmlManagementResponse(b.String())
 }
 
-// writeCallbackBody 写出凭据补全表单。
+// writeCallbackBody 写出回调页主体：状态区 + 指引 + 折叠的兜底粘贴框。
 //
-// 页面不再要求用户逐个字段抄写：主入口是「Copy as cURL」整段粘贴，
-// 插件在服务端自己解析 Cookie（含 HttpOnly 的 token_v2）。脚本已采集的
-// 可读 Cookie 单独保留为只读展示，仅用于出错时对照。
+// 主路径是「复制后切回本页自动完成」：回调页读取剪贴板里的 Copy as cURL
+// 原文并直接提交，用户不需要把内容粘到任何输入框。剪贴板读取受浏览器
+// 授权限制（页面必须获得焦点且需要用户手势），因此保留一个手动粘贴折叠区
+// 作为兜底，而不是把它当成主入口。
 // [参数] b: 输出缓冲。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：改为整段粘贴 + 插件自行识别。
+// 最近修改时间：2026-10-20；改动原因：改为回调页自动读取剪贴板并直接出结果。
 func writeCallbackBody(b *strings.Builder) {
 	b.WriteString("<h1>完成 Notion 授权</h1>")
-	b.WriteString("<p>脚本已采集到可读 Cookie。最后一步只需要把 Notion 的请求整段交给插件，<code>token_v2</code> 由插件自己解析——不用去 Application 面板逐项找。</p>")
-	b.WriteString("<ol>")
-	b.WriteString("<li>回到已登录的 Notion 页面，按 <code>F12</code> → <code>Network</code>（网络）标签。</li>")
-	b.WriteString("<li>点任意一个 <code>api/v3</code> 请求（例如 <code>getSpaces</code>），右键 → <code>Copy</code> → <code>Copy as cURL</code>。</li>")
-	b.WriteString("<li>把复制到的整段内容粘贴到下面的框里，点「完成授权」。</li>")
+	b.WriteString("<div id=\"status\" class=\"note\">等待你从 Notion 复制 Copy as cURL；复制后切回本页会自动完成。</div>")
+	b.WriteString("<ol id=\"guide\" style=\"margin-top:14px\">")
+	b.WriteString("<li>在已登录的 Notion 页面按 <code>F12</code> → <code>Network</code>（网络）。</li>")
+	b.WriteString("<li>任意 <code>api/v3</code> 请求右键 → <code>Copy</code> → <code>Copy as cURL</code>。</li>")
+	b.WriteString("<li>切回本页即自动完成，不需要粘贴。</li>")
 	b.WriteString("</ol>")
-	b.WriteString("<p style=\"margin-top:18px\">粘贴 Copy as cURL / 请求头（插件自动识别 Cookie）：</p>")
-	b.WriteString("<textarea id=\"curl\" style=\"min-height:120px\" placeholder=\"curl 'https://www.notion.so/api/v3/getSpaces' -H 'cookie: token_v2=...; notion_user_id=...' ...\"></textarea>")
-	b.WriteString("<details style=\"margin-top:12px\"><summary style=\"cursor:pointer;font-size:13px;color:#6d6760\">脚本已采集的可读 Cookie（只读，供排错对照）</summary>")
-	b.WriteString("<textarea id=\"cookie\" readonly style=\"margin-top:8px;min-height:64px;background:#f7f6f2\"></textarea></details>")
+	b.WriteString("<button id=\"retry\" type=\"button\">我已复制，立即授权</button>")
+	b.WriteString("<details style=\"margin-top:14px\"><summary style=\"cursor:pointer;font-size:13px;color:#6d6760\">自动读取失败？手动粘贴</summary>")
+	b.WriteString("<textarea id=\"curl\" style=\"margin-top:8px\" placeholder=\"curl 'https://www.notion.so/api/v3/getSpaces' -H 'cookie: token_v2=...; notion_user_id=...' ...\"></textarea>")
 	b.WriteString("<button id=\"submit\" type=\"button\">完成授权</button>")
+	b.WriteString("</details>")
 	b.WriteString("<div id=\"result\"></div>")
 	b.WriteString("<div class=\"note\">导入会先校验登录态与工作空间，成功才落盘。每个工作空间会拆成独立账号（订阅 / 免费额度分开路由）。</div>")
 }
 
 // writeCallbackScript 写出回调页脚本：解析 fragment、提交整段请求。
 //
-// 提交的内容是用户粘贴的原文（Copy as cURL / 请求头整段），Cookie 的抽取
-// 全部交给服务端：token_v2 是 HttpOnly，前端既读不到、也不该在这里做
-// 「猜哪个字段是凭据」的判断——那正是之前让用户逐项找字段的根源。
+// 提交的内容是剪贴板或手动粘贴的原文（Copy as cURL / 请求头整段），
+// Cookie 的抽取全部交给服务端：token_v2 是 HttpOnly，前端既读不到、也不该
+// 在这里做「猜哪个字段是凭据」的判断——那正是之前让用户逐项找字段的根源。
+//
+// 自动路径：页面加载后进入「等待复制」状态；用户从 Notion 复制完切回本页时
+// （focus / visibilitychange）尝试读一次剪贴板并直接提交。浏览器要求剪贴板
+// 读取必须有用户手势或已授权，因此首屏不会自说自话地卡在「检查中」——
+// 读不到就把状态写成明确的「等待你复制」，并保留一个按钮供手动触发。
+// 回退路径：自动读取始终被拒时，展开手动粘贴区由用户提交。
 // 成功后用 history.replaceState 清掉 fragment，避免凭据留在浏览历史里。
 // [参数] b: 输出缓冲。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：改为整段提交，插件自行识别凭据。
+// 最近修改时间：2026-10-20；改动原因：回调页状态机化，避免首屏卡在「检查中」。
 func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("<script>")
 	b.WriteString("var PROVIDER=document.body.getAttribute(\"data-provider\")||\"\";")
@@ -656,7 +663,13 @@ func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("var collected=p.get(\"" + callbackCookieParam + "\")||\"\";")
 	b.WriteString("var upstreamErr=p.get(\"" + callbackErrorParam + "\")||\"\";")
 	b.WriteString("var box=document.getElementById(\"result\");")
+	b.WriteString("var status=document.getElementById(\"status\");")
+	b.WriteString("var retryBtn=document.getElementById(\"retry\");")
+	b.WriteString("var curlEl=document.getElementById(\"curl\");")
+	b.WriteString("var submitBtn=document.getElementById(\"submit\");")
+	b.WriteString("var busy=false;var done=false;")
 	b.WriteString("function show(text,cls){box.className=cls;box.textContent=text;}")
+	b.WriteString("function setStatus(text,cls){if(!status){return}status.className=cls||\"note\";status.textContent=text;}")
 	b.WriteString("function clearHash(){try{history.replaceState(null,\"\",location.pathname+location.search)}catch(e){}}")
 	// TextEncoder 保证中文与 emoji 也按 UTF-8 编码，btoa 只接受单字节字符。
 	b.WriteString("function toBase64(text){try{")
@@ -665,34 +678,90 @@ func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("  return btoa(bin)}catch(e){return \"\"}}")
 	// Copy as cURL 会把请求体一起带上，整段可能几十 KB；请求头有大小上限，
 	// 因此只挑出 Cookie 那一行提交。字段级的识别仍然全部交给服务端。
+	//
+	// 取值必须停在引号闭合处：cmd 形态是 -H "cookie: ..."、bash 是 -H 'cookie: ...'，
+	// 直接按字符集裁剪会把后面的 `' --data-raw '{}` 一并吞进 Cookie 值。
 	b.WriteString("function pickCookie(text){")
 	b.WriteString("  var m=String(text||\"\").match(/cookie\\s*:\\s*([^\\r\\n]*)/i);")
 	b.WriteString("  if(!m){return \"\"}")
-	b.WriteString("  return m[1].replace(/^[\\s\\\"']+/,\"\").replace(/[\\s\\\\^\\\"',;]+$/,\"\")")
+	b.WriteString("  var raw=m[1];var out=\"\";")
+	b.WriteString("  for(var i=0;i<raw.length;i++){")
+	b.WriteString("    var ch=raw.charAt(i);")
+	b.WriteString("    if(ch===\"'\"||ch==='\"'){break}")
+	b.WriteString("    out+=ch")
+	b.WriteString("  }")
+	b.WriteString("  return out.replace(/[\\s\\\\^]+$/,\"\").replace(/;+$/,\"\")")
 	b.WriteString("}")
-	b.WriteString("clearHash();")
-	b.WriteString("var curlEl=document.getElementById(\"curl\");")
-	b.WriteString("var cookieEl=document.getElementById(\"cookie\");")
-	b.WriteString("if(upstreamErr){show(\"Notion 侧未完成授权：\"+upstreamErr,\"err\");}")
-	b.WriteString("cookieEl.value=collected;")
-	b.WriteString("document.getElementById(\"submit\").addEventListener(\"click\",function(){")
-	b.WriteString("  var btn=this;var raw=(curlEl.value||\"\").trim();")
-	b.WriteString("  if(!raw){show(\"请先粘贴 Copy as cURL 的内容\",\"err\");return}")
-	b.WriteString("  btn.disabled=true;show(\"正在识别凭据、校验登录态与工作空间…\",\"\");")
+	// 只认看起来像凭据的剪贴板内容：避免把无关文本误提交成一次失败授权。
+	b.WriteString("function looksLikeCredential(text){")
+	b.WriteString("  var t=String(text||\"\");")
+	b.WriteString("  if(t.length<20){return false}")
+	b.WriteString("  return /token_v2\\s*=/i.test(t)||/notion_user_id\\s*=/i.test(t)||/^\\s*curl\\s/i.test(t)")
+	b.WriteString("}")
+	// 单次提交：成功/失败都只走这里，页面结果区直接给出终态。
+	b.WriteString("function submit(raw){")
+	b.WriteString("  if(busy||done){return}")
+	b.WriteString("  var text=String(raw||\"\").trim();")
+	b.WriteString("  if(!text){setStatus(\"等待从 Notion 复制授权信息…\",\"note\");return}")
+	b.WriteString("  if(!looksLikeCredential(text)){setStatus(\"剪贴板内容不像是 Notion 授权信息，请重新复制。\",\"note\");return}")
+	b.WriteString("  busy=true;")
+	b.WriteString("  if(retryBtn){retryBtn.disabled=true}")
+	b.WriteString("  if(submitBtn){submitBtn.disabled=true}")
+	b.WriteString("  setStatus(\"正在识别凭据、校验登录态与工作空间…\",\"note\");")
 	// 整段原文经 base64 提交：请求头不允许含换行，直传会被浏览器判为 Invalid value。
 	// 抽取 token_v2 / notion_user_id 仍然是服务端的职责。
 	// 优先只提交 Cookie 那一行：请求体可能很大，而头部有大小上限。
 	// 认不出 Cookie 行时退回整段原文，由服务端继续识别（含纯 Cookie 粘贴）。
-	b.WriteString("  var picked=pickCookie(raw);var payload=picked||raw;")
+	b.WriteString("  var picked=pickCookie(text);var payload=picked||text;")
 	b.WriteString("  var encoded=toBase64(payload);")
-	b.WriteString("  if(!encoded){show(\"这段内容无法编码，请确认粘贴的是文本\",\"err\");btn.disabled=false;return}")
+	b.WriteString("  if(!encoded){busy=false;setStatus(\"这段内容无法编码，请确认复制的是文本。\",\"note\");if(submitBtn){submitBtn.disabled=false}return}")
 	b.WriteString("  fetch(IMPORT,{method:\"GET\",cache:\"no-store\",headers:{\"" + loginBridgeInputHeader + "\":encoded}})")
 	b.WriteString("    .then(function(res){return res.json().then(function(d){return d}).catch(function(){return {error:\"响应解析失败\"}})}).then(function(d){")
-	b.WriteString("      if(d&&d.ok){var labels=(d.labels||[]).join(\"、\");btn.textContent=\"已授权\";show(\"授权成功\"+(labels?\"：\"+labels:\"\")+\"，正在通知管理页…\",\"ok\");return}")
-	b.WriteString("      show(\"授权失败：\"+((d&&d.error)||\"未知错误\"),\"err\");")
-	b.WriteString("    }).catch(function(e){show(\"授权失败：\"+(e&&e.message?e.message:String(e)),\"err\")})")
-	b.WriteString("    .then(function(){btn.disabled=false});")
-	b.WriteString("});")
+	b.WriteString("      busy=false;")
+	b.WriteString("      if(d&&d.ok){done=true;var labels=(d.labels||[]).join(\"、\");setStatus(\"授权成功\"+(labels?\"：\"+labels:\"\")+\"，正在通知管理页…\",\"ok\");show(\"\",\"\");if(retryBtn){retryBtn.textContent=\"已授权\"}return}")
+	// 失败原因同时写进状态区与结果区：状态区是首屏可见位置，
+	// 只写 result 会让用户以为页面没反应。
+	b.WriteString("      var why=(d&&d.error)||\"未知错误\";")
+	b.WriteString("      setStatus(\"授权失败：\"+why,\"err\");")
+	b.WriteString("      show(\"授权失败：\"+why,\"err\");")
+	b.WriteString("      if(retryBtn){retryBtn.disabled=false}")
+	b.WriteString("      if(submitBtn){submitBtn.disabled=false}")
+	b.WriteString("    }).catch(function(e){")
+	b.WriteString("      busy=false;var why=(e&&e.message?e.message:String(e));")
+	b.WriteString("      setStatus(\"授权失败：\"+why,\"err\");")
+	b.WriteString("      show(\"授权失败：\"+why,\"err\");")
+	b.WriteString("      if(retryBtn){retryBtn.disabled=false}")
+	b.WriteString("      if(submitBtn){submitBtn.disabled=false}")
+	b.WriteString("    });")
+	b.WriteString("}")
+	// 脚本采集回来的可读 Cookie 只有排错价值：它不含 token_v2，提交必然失败。
+	// 因此不再作为主入口，只在页面上提示用户去复制 Copy as cURL。
+	//
+	// 状态机：idle（等你复制）→ 读到就 submit；读不到保持 idle 并说明原因。
+	// 不能一进来就写「正在检查授权状态」，那会让用户以为页面在转圈。
+	b.WriteString("function tryClipboard(){")
+	b.WriteString("  if(done||busy){return}")
+	b.WriteString("  if(!(navigator.clipboard&&navigator.clipboard.readText)){")
+	b.WriteString("    setStatus(\"当前浏览器不允许自动读取剪贴板，请展开下方手动粘贴。\",\"note\");return")
+	b.WriteString("  }")
+	b.WriteString("  navigator.clipboard.readText().then(function(t){")
+	b.WriteString("    if(looksLikeCredential(t)){submit(t);return}")
+	b.WriteString("    setStatus(\"等待你复制授权信息：在上方 Notion 页面复制 Copy as cURL 后切回本页即可。\",\"note\")")
+	b.WriteString("  }).catch(function(){")
+	b.WriteString("    setStatus(\"需要你点一下「我已复制，立即授权」，或展开下方手动粘贴。\",\"note\")")
+	b.WriteString("  })")
+	b.WriteString("}")
+	b.WriteString("clearHash();")
+	b.WriteString("if(upstreamErr){show(\"Notion 侧未完成授权：\"+upstreamErr,\"err\");}")
+	// 首屏就给出可读的等待说明，而不是「正在检查」这类转圈文案。
+	b.WriteString("setStatus(\"等待你从 Notion 复制 Copy as cURL；复制后切回本页会自动完成。\",\"note\");")
+	b.WriteString("if(retryBtn){retryBtn.addEventListener(\"click\",function(){tryClipboard()})}")
+	b.WriteString("if(submitBtn){submitBtn.addEventListener(\"click\",function(){submit(curlEl&&curlEl.value)})}")
+	// 用户从 Notion 复制后切回本页：focus / visibilitychange 各试一次，静默完成。
+	b.WriteString("window.addEventListener(\"focus\",function(){tryClipboard()});")
+	b.WriteString("document.addEventListener(\"visibilitychange\",function(){if(!document.hidden){tryClipboard()}});")
+	// 首屏不主动读剪贴板：没有用户手势时必然抛 NotAllowedError，
+	// 只会把状态写成一条容易误解的报错。等 focus / 点击再读。
 	b.WriteString("</script>")
 }
 
