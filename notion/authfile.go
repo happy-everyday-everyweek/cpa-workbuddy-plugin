@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -152,9 +153,10 @@ func getAccountsDir() string {
 //
 // 只有 token_v2 与 notion_user_id 同时存在时才算可用登录态：
 // 缺 token_v2 无法访问任何 API，缺 user id 则无法构造 active-user 头。
-// [参数] header: 用户粘贴的 Cookie header 或完整 cURL。
+// [参数] header: 裸 Cookie header、`Cookie:` 前缀、DevTools 请求头整段，
+// 或 Network 面板 Copy as cURL / Copy as fetch 的整段文本。
 // [返回] 解析结果与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，Cookie 解析入口。
+// 最近修改时间：2026-10-19；改动原因：入口接受整段请求，支持 Copy as cURL。
 func parseCookieIdentity(header string) (*CookieIdentity, error) {
 	normalized := normalizeCookieHeader(header)
 	if normalized == "" {
@@ -188,17 +190,30 @@ func parseCookieIdentity(header string) (*CookieIdentity, error) {
 	return identity, nil
 }
 
+// cookieHeaderName 是请求头里 Cookie 的名字。
+const cookieHeaderName = "cookie"
+
 // normalizeCookieHeader 把用户输入规范成单行 Cookie header。
 //
-// 用户可能粘贴三种形态：完整的 `Cookie: a=b; c=d`、裸的 `a=b; c=d`，
-// 或浏览器导出的多行文本。这里统一去掉前缀与换行。
+// 用户可能粘贴四种形态：裸的 `a=b; c=d`、完整的 `Cookie: a=b; c=d`、
+// DevTools「Copy request headers」的整段请求头，或 Network 面板的
+// 「Copy as cURL」/「Copy as fetch」。后两种里 Cookie 只是其中一段，
+// 整段当 Cookie 发出去必然 401，因此先抽出 Cookie 头本身。
 // [参数] header: 原始输入。
 // [返回] 单行 Cookie header。
-// 最近修改时间：2026-10-18；改动原因：新增，输入形态归一。
+// 最近修改时间：2026-10-19；改动原因：真正解析 cURL / 请求头整段，插件自行识别。
 func normalizeCookieHeader(header string) string {
 	s := strings.TrimSpace(header)
-	s = strings.TrimPrefix(s, "Cookie:")
-	s = strings.TrimPrefix(s, "cookie:")
+	if s == "" {
+		return ""
+	}
+
+	if value := extractCookieHeaderValue(s); value != "" {
+		s = value
+	} else {
+		s = strings.TrimPrefix(s, "Cookie:")
+		s = strings.TrimPrefix(s, "cookie:")
+	}
 
 	// 多行粘贴时只保留含 `=` 的行，拼成单行。
 	if strings.ContainsAny(s, "\r\n") {
@@ -215,6 +230,127 @@ func normalizeCookieHeader(header string) string {
 	}
 
 	return strings.TrimSpace(strings.TrimSuffix(s, ";"))
+}
+
+// extractCookieHeaderValue 从整段请求文本中抽出 Cookie 头的值。
+//
+// Chrome 的 Copy as cURL / Copy as fetch、DevTools 的 Copy request headers
+// 都会把 Cookie 写成 `cookie: ...` 一行。这里按「头名 + 冒号」定位，
+// 兼容 -H/--header 前缀、单双引号包裹以及 Windows cmd 的 ^" 转义。
+// [参数] text: 用户粘贴的原文。
+// [返回] Cookie 头的值；文本里没有 Cookie 头声明时返回空串。
+// 最近修改时间：2026-10-19；改动原因：新增，支持 Copy as cURL 整段识别。
+func extractCookieHeaderValue(text string) string {
+	lower := strings.ToLower(text)
+	for cursor := 0; cursor < len(lower); {
+		idx := strings.Index(lower[cursor:], cookieHeaderName)
+		if idx < 0 {
+			return ""
+		}
+		nameAt := cursor + idx
+		cursor = nameAt + len(cookieHeaderName)
+		// 跳过 `notion_cookie_id` 这类把 cookie 当词根的字段名，
+		// 也跳过响应头里的 `set-cookie`。
+		if nameAt > 0 && isHeaderNameChar(text[nameAt-1]) {
+			continue
+		}
+		if nameAt >= 4 && strings.EqualFold(text[nameAt-4:nameAt], "set-") {
+			continue
+		}
+
+		rest := strings.TrimLeft(text[cursor:], " \t\"'")
+		if !strings.HasPrefix(rest, ":") {
+			continue
+		}
+		if value := readCookieHeaderValue(strings.TrimLeft(rest[1:], " \t")); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// isHeaderNameChar 判断字符能否构成请求头名。
+//
+// 用于排除 `notion_cookie_id` 这类把 cookie 当词根的更长字段名。
+// [参数] c: 待判断字符。
+// [返回] 是头名字符时返回 true。
+// 最近修改时间：2026-10-19；改动原因：新增，避免误匹配字段名。
+func isHeaderNameChar(c byte) bool {
+	switch {
+	case c == '_' || c == '-':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	default:
+		return false
+	}
+}
+
+// readCookieHeaderValue 读出冒号之后的 Cookie 值。
+//
+// 引号包裹时读到同名引号为止；否则读到行尾。两种形态都要再清一次
+// 尾部残留：cmd 的 Copy as cURL 会留下 `^"` 与续行符 `^`，
+// 不清掉会污染最后一个 Cookie 的值。
+// [参数] rest: 冒号之后的文本。
+// [返回] 清理后的值。
+// 最近修改时间：2026-10-19；改动原因：新增，引号与行尾两种取值形态。
+func readCookieHeaderValue(rest string) string {
+	if rest == "" {
+		return ""
+	}
+	quote := rest[0]
+	if quote == '\'' || quote == '"' {
+		return trimHeaderValueTail(unquoteSegment(rest, quote))
+	}
+	if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
+		rest = rest[:nl]
+	}
+	return trimHeaderValueTail(rest)
+}
+
+// unquoteSegment 读取引号内的内容，保留反斜杠转义后的字符。
+// [参数] text: 以引号开头的文本；quote: 引号字符。
+// [返回] 引号内的字符串。
+// 最近修改时间：2026-10-19；改动原因：新增，引号取值。
+func unquoteSegment(text string, quote byte) string {
+	var b strings.Builder
+	escaped := false
+	for i := 1; i < len(text); i++ {
+		c := text[i]
+		if escaped {
+			b.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == quote {
+			break
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// trimHeaderValueTail 清掉值两端的空白与命令行残留符号。
+// [参数] raw: 原始值。
+// [返回] 清理后的值。
+// 最近修改时间：2026-10-19；改动原因：新增，清理 cmd 的 ^" 与续行符。
+func trimHeaderValueTail(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	for {
+		next := strings.TrimRight(trimmed, " \t\r\n\\^\"'")
+		if next == trimmed {
+			return trimmed
+		}
+		trimmed = next
+	}
 }
 
 // splitCookiePair 拆分 `key=value`。
@@ -480,6 +616,26 @@ func scopeForAuth(auth *StoredAuth, clientVersion string) requestScope {
 	}
 }
 
+// loginHintForProbeError 为上游鉴权类失败补一句可执行的下一步。
+//
+// 401 的原文只有一句 `Token is invalid.`，用户看不出该重来还是该换账号。
+// 这里只补操作指引，不改变错误判定与状态码。
+// [参数] err: 探测工作空间返回的错误。
+// [返回] 追加文案；非鉴权类错误返回空串。
+// 最近修改时间：2026-10-19；改动原因：新增，把 401 转成可操作提示。
+func loginHintForProbeError(err error) string {
+	var apiErr *notionAPIError
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	switch apiErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "（凭据已失效：请确认粘贴的是当前已登录标签页的请求，并重新执行授权脚本后重试）"
+	default:
+		return ""
+	}
+}
+
 // saveCredentials 校验并落盘一份导入的登录态。
 //
 // 流程：解析 Cookie → 拉取 workspace 列表 → 刷新全部空间额度 → 按空间逐个落盘。
@@ -509,7 +665,7 @@ func saveCredentials(header, label, spaceID string) ([]*StoredAuth, error) {
 	}
 	spaces, errSpaces := fetchSpaces(ctx, cl, probeScope)
 	if errSpaces != nil {
-		return nil, fmt.Errorf("探测工作空间失败：%w", errSpaces)
+		return nil, fmt.Errorf("探测工作空间失败：%w%s", errSpaces, loginHintForProbeError(errSpaces))
 	}
 	if len(spaces) == 0 {
 		return nil, fmt.Errorf("账号下没有可用工作空间")

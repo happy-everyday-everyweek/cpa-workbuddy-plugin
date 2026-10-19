@@ -7,6 +7,7 @@ package main
 // 起点、轮询与桥接页三条链路。
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -458,32 +459,49 @@ func TestLoginBridgeRendersScriptForValidState(t *testing.T) {
 	if !strings.Contains(body, resp.State) {
 		t.Fatal("页面未携带 state，回调时会因缺少会话标识被拒")
 	}
-	// HttpOnly 是这次形态设计的前提：页面必须如实告知 token_v2 需手动补填。
+	// HttpOnly 是这次形态设计的前提：页面必须如实告知 token_v2 读不到，
+	// 并给出 Copy as cURL 这条不需要逐项找字段的替代路径。
 	if !strings.Contains(body, "HttpOnly") {
 		t.Fatal("页面必须说明 token_v2 是 HttpOnly、脚本读不到")
 	}
+	if !strings.Contains(body, "Copy as cURL") {
+		t.Fatal("页面必须给出 Copy as cURL 这条整段粘贴路径")
+	}
 }
 
-// TestLoginCallbackRendersTokenForm 校验回调页给出 token_v2 补填入口。
+// TestLoginCallbackRendersCurlForm 校验回调页只要整段粘贴，不要逐项补字段。
 //
-// token_v2 是 HttpOnly，脚本采集不到；回调页若不给补填表单，
-// 导入必然因「Cookie 缺少 token_v2」失败。
+// token_v2 是 HttpOnly，脚本采集不到；但让用户去 Application 面板逐个找
+// 字段，既容易被 token 轮换打过期，也容易抄错值（真实反馈里的 401 就是这么来的）。
+// 正确形态是让用户粘一次 Copy as cURL，由插件解析。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，回调页补填回归。
-func TestLoginCallbackRendersTokenForm(t *testing.T) {
+// 最近修改时间：2026-10-19；改动原因：从「补 token_v2」改为「整段粘贴」。
+func TestLoginCallbackRendersCurlForm(t *testing.T) {
 	resetLoginSessions()
 	resp := startLoginForTest(t)
 
 	page := handleLoginCallback(resp.State)
 	body := string(page.Body)
-	for _, want := range []string{`id="tokenv2"`, `id="cookie"`, `id="submit"`, callbackCookieParam} {
+	for _, want := range []string{`id="curl"`, `id="cookie"`, `id="submit"`, callbackCookieParam, "Copy as cURL"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("回调页缺少 %s：%s", want, body)
 		}
 	}
-	if !strings.Contains(body, loginBridgeImportHeader) {
-		t.Fatal("提交必须带自定义 Cookie 头，否则资源路由拿不到凭据")
+	// 不能再要求用户手工补 token_v2：那正是被反馈否掉的交互。
+	if strings.Contains(body, `id="tokenv2"`) {
+		t.Fatal("回调页不应再要求手动补填 token_v2")
+	}
+	if !strings.Contains(body, loginBridgeInputHeader) {
+		t.Fatal("提交必须带原文请求头，否则资源路由拿不到凭据")
+	}
+	// 整段 cURL 含换行，浏览器不允许把它直接放进请求头：必须 base64。
+	if !strings.Contains(body, "toBase64(payload)") || !strings.Contains(body, "btoa(bin)") {
+		t.Fatal("整段原文必须 base64 编码后提交，否则 Headers 构造会失败")
+	}
+	// Copy as cURL 会带上请求体，只挑 Cookie 那一行能避开请求头大小上限。
+	if !strings.Contains(body, "pickCookie") {
+		t.Fatal("提交前应只挑出 Cookie 行，避免整段请求体撑爆请求头")
 	}
 	// 断言调用点而不是函数定义：只留定义不调用，fragment 依然会留在地址栏。
 	if !strings.Contains(body, "clearHash();") {
@@ -492,8 +510,54 @@ func TestLoginCallbackRendersTokenForm(t *testing.T) {
 	if !strings.Contains(body, "history.replaceState") {
 		t.Fatal("clearHash 必须真的改写地址栏")
 	}
-	if !strings.Contains(body, `pairs.push("token_v2="+raw)`) {
-		t.Fatal("提交前必须把 token_v2 拼回 Cookie header")
+	// 提交的必须是整段原文：前端再拼一次 Cookie 就等于把识别逻辑又搬回浏览器。
+	if !strings.Contains(body, "curlEl.value") {
+		t.Fatal("提交内容必须取自一整段粘贴文本")
+	}
+}
+
+// TestLoginImportDecodesBase64Input 校验服务端能解出整段原文并识别 Cookie。
+//
+// 不解码会让整段 base64 当成 Cookie 发去上游，表现为一条莫名的 401。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，base64 入参解析回归。
+func TestLoginImportDecodesBase64Input(t *testing.T) {
+	curlText := "curl 'https://www.notion.so/api/v3/getSpaces' \\\n" +
+		"  -H 'cookie: notion_user_id=u-1; token_v2=v03%3Aabc'"
+	req := pluginapi.ManagementRequest{
+		Headers: http.Header{loginBridgeInputHeader: []string{base64.StdEncoding.EncodeToString([]byte(curlText))}},
+	}
+	got, err := loginInputFromRequest(req)
+	if err != nil {
+		t.Fatalf("解码失败：%v", err)
+	}
+	if got != curlText {
+		t.Fatalf("解出的原文不一致：%q", got)
+	}
+
+	identity, errParse := parseCookieIdentity(got)
+	if errParse != nil {
+		t.Fatalf("整段原文应能解析出凭据：%v", errParse)
+	}
+	if identity.TokenV2 != "v03%3Aabc" || identity.UserID != "u-1" {
+		t.Fatalf("识别结果不对：%+v", identity)
+	}
+
+	// 旧形态（单行 Cookie 头）必须继续可用，避免打断已按旧方式提交的调用方。
+	legacy := pluginapi.ManagementRequest{
+		Headers: http.Header{loginBridgeImportHeader: []string{"token_v2=t; notion_user_id=u"}},
+	}
+	if got, _ := loginInputFromRequest(legacy); got == "" {
+		t.Fatal("旧 Cookie 头兜底失效")
+	}
+
+	// 损坏的 base64 要给明确提示，而不是把乱码发给上游。
+	broken := pluginapi.ManagementRequest{
+		Headers: http.Header{loginBridgeInputHeader: []string{"not-base64!!"}},
+	}
+	if _, errBroken := loginInputFromRequest(broken); errBroken == nil {
+		t.Fatal("损坏的 base64 应当报错")
 	}
 }
 
@@ -568,6 +632,70 @@ func TestLoginImportFailureSurfacesInPoll(t *testing.T) {
 	}
 	if !strings.Contains(poll.Message, "上次尝试失败") {
 		t.Fatalf("轮询应回显失败原因，实际：%s", poll.Message)
+	}
+}
+
+// TestCurlInputReachesUpstreamAsCleanCookie 校验整段 cURL 最终变成干净的 Cookie 头。
+//
+// 这是整条链路唯一真正发往上游的地方：base64 入参 → 识别 Cookie →
+// requestScope → 请求头。任何一步漏掉，上游收到的都是 curl 原文，表现为 401。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，链路级回归。
+func TestCurlInputReachesUpstreamAsCleanCookie(t *testing.T) {
+	curlText := "curl 'https://www.notion.so/api/v3/getSpaces' \\\n" +
+		"  -H 'accept: */*' \\\n" +
+		"  -H 'cookie: notion_user_id=u-1; token_v2=v03%3Aabc; notion_browser_id=b-1' \\\n" +
+		"  --data-raw '{}'"
+
+	req := pluginapi.ManagementRequest{
+		Headers: http.Header{loginBridgeInputHeader: []string{base64.StdEncoding.EncodeToString([]byte(curlText))}},
+	}
+	raw, errInput := loginInputFromRequest(req)
+	if errInput != nil {
+		t.Fatalf("取入参失败：%v", errInput)
+	}
+	identity, errParse := parseCookieIdentity(raw)
+	if errParse != nil {
+		t.Fatalf("解析失败：%v", errParse)
+	}
+
+	upstream, errRequest := newNotionRequest(t.Context(), requestScope{
+		Cookie:  identity.CookieHeader,
+		UserID:  identity.UserID,
+		SpaceID: "space-1",
+	}, "/getSpaces", []byte(`{}`))
+	if errRequest != nil {
+		t.Fatalf("构造上游请求失败：%v", errRequest)
+	}
+
+	got := upstream.Header.Get("Cookie")
+	if got != "notion_user_id=u-1; token_v2=v03%3Aabc; notion_browser_id=b-1" {
+		t.Fatalf("上游收到的 Cookie 头不对：%q", got)
+	}
+	for _, leaked := range []string{"curl", "accept:", "--data-raw"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("上游 Cookie 头混入了 %q：%s", leaked, got)
+		}
+	}
+}
+
+// TestLoginProbeErrorAddsActionableHint 校验上游 401 会补上可执行的下一步。
+//
+// 上游原文只有一句 `Token is invalid.`，用户看不出该重来还是换账号。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，鉴权失败提示回归。
+func TestLoginProbeErrorAddsActionableHint(t *testing.T) {
+	unauthorized := &notionAPIError{StatusCode: http.StatusUnauthorized, Body: `{"name":"UnauthorizedError"}`}
+	hint := loginHintForProbeError(unauthorized)
+	if hint == "" || !strings.Contains(hint, "凭据已失效") {
+		t.Fatalf("401 应补可操作提示，实际 %q", hint)
+	}
+
+	serverErr := &notionAPIError{StatusCode: http.StatusInternalServerError}
+	if hint := loginHintForProbeError(serverErr); hint != "" {
+		t.Fatalf("非鉴权错误不应误加提示，实际 %q", hint)
 	}
 }
 

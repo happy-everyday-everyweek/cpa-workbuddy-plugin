@@ -12,6 +12,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,6 +36,19 @@ const loginStateTTL = 15 * time.Minute
 // resource 路由由宿主强制改写为 GET 且不转发请求体，Cookie 只能走请求头；
 // 用自定义头而不是 Cookie 头，避免与浏览器自身的 Cookie 语义混淆。
 const loginBridgeImportHeader = "X-Notion-Cookie"
+
+// loginBridgeInputHeader 承载用户粘贴的整段请求原文（base64）。
+//
+// 不能直接放进请求头：Copy as cURL 是多行文本，而浏览器构造 Headers 时会
+// 直接拒绝含换行的值（实测 `Failed to construct 'Headers': Invalid value`）。
+// base64 还顺带解决了中文与引号在头部传输中的编码问题。
+const loginBridgeInputHeader = "X-Notion-Auth-Input"
+
+// loginInputMaxBytes 是整段原文的上限。
+//
+// 只需要其中的 Cookie 行，正常 cURL 在数 KB 以内；设上限是为了避免
+// 用户误粘大段日志时把请求头撑爆。
+const loginInputMaxBytes = 64 << 10
 
 // callbackPath 是脚本采集完成后跳回的 resource 路径。
 const callbackPath = "/login/callback"
@@ -132,7 +146,7 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 		Metadata: map[string]any{
 			"logo":       pluginLogoURL,
 			"bridge_url": bridgeURL,
-			"prompt":     "在打开的引导页中粘贴 Notion 网页端的 Cookie，导入成功后此窗口会自动完成。",
+			"prompt":     "在打开的引导页执行脚本并粘贴一次 Copy as cURL，插件自行识别凭据，导入成功后此窗口会自动完成。",
 		},
 	})
 }
@@ -325,10 +339,14 @@ func handleLoginBridgeImport(req pluginapi.ManagementRequest) pluginapi.Manageme
 		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "登录会话不存在或已过期，请回到管理页重新发起"})
 	}
 
-	cookie := strings.TrimSpace(req.Headers.Get(loginBridgeImportHeader))
+	cookie, errInput := loginInputFromRequest(req)
+	if errInput != nil {
+		markLoginFailed(state, errInput.Error())
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": errInput.Error()})
+	}
 	if cookie == "" {
-		markLoginFailed(state, "未收到 Cookie")
-		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "cookie 不能为空"})
+		markLoginFailed(state, "未收到登录凭据")
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "没有收到登录凭据，请粘贴 Copy as cURL 的内容"})
 	}
 
 	accounts, errSave := saveCredentials(cookie, "", "")
@@ -359,6 +377,29 @@ func handleLoginBridgeImport(req pluginapi.ManagementRequest) pluginapi.Manageme
 		"labels":   labels,
 		"message":  fmt.Sprintf("登录态导入成功，共 %d 个工作空间", len(authIDs)),
 	})
+}
+
+// loginInputFromRequest 取出用户提交的整段请求原文。
+//
+// 优先读 base64 头：Copy as cURL 是多行文本，浏览器不允许把它直接放进
+// 请求头（实测 Headers 构造即报 Invalid value）。旧的纯 Cookie 头保留为
+// 兜底，供面板等已按单行形态提交的调用方继续使用。
+// [参数] req: 宿主透传的管理请求。
+// [返回] 用户原文与错误。
+// 最近修改时间：2026-10-19；改动原因：新增，整段原文 base64 传输。
+func loginInputFromRequest(req pluginapi.ManagementRequest) (string, error) {
+	encoded := strings.TrimSpace(req.Headers.Get(loginBridgeInputHeader))
+	if encoded != "" {
+		decoded, errDecode := base64.StdEncoding.DecodeString(encoded)
+		if errDecode != nil {
+			return "", fmt.Errorf("粘贴内容传输格式错误，请重新复制后提交")
+		}
+		if len(decoded) > loginInputMaxBytes {
+			return "", fmt.Errorf("粘贴内容过长（超过 %d 字节），请只复制一条 api/v3 请求", loginInputMaxBytes)
+		}
+		return strings.TrimSpace(string(decoded)), nil
+	}
+	return strings.TrimSpace(req.Headers.Get(loginBridgeImportHeader)), nil
 }
 
 // loginStateFromRequest 从管理请求中取出桥接会话标识。
@@ -430,9 +471,10 @@ func writeBridgeHead(b *strings.Builder, state string) {
 // 与 coze 桥接页同一形态：页面给出「可复制的链接」和「可在 Notion 页面
 // Console 直接粘贴执行的脚本」，脚本采集完成后自动跳回插件回调页。
 //
-// 与 coze 的差异（Notion 特有约束）：token_v2 是 HttpOnly，页面 JS 读不到，
-// 因此脚本无法像 coze 那样从响应头直接取到完整凭据，只能采集全部可读 Cookie
-// 并提示用户补 token_v2 一项。
+// 与 coze 的差异（Notion 特有约束）：token_v2 是 HttpOnly，页面 JS 读不到。
+// 因此不能只靠脚本采集——脚本负责校验登录态并带回可读 Cookie，回调页再让
+// 用户一次粘贴「Copy as cURL」整段请求，由插件自己把 token_v2 抽出来。
+// 用户不需要去 Application 面板逐个找字段。
 // [参数] b: 输出缓冲；state: 登录会话标识。
 // [返回] 无。
 // 最近修改时间：2026-10-19；改动原因：改为可复制链接 + 控制台脚本形态。
@@ -454,8 +496,8 @@ func writeBridgeBody(b *strings.Builder, state string) {
 	b.WriteString("<pre id=\"authScript\">" + htmlEscape(script) + "</pre>")
 	b.WriteString("<button id=\"copyScript\" type=\"button\">复制脚本</button>")
 	b.WriteString("<div id=\"copyHint\"></div>")
-	b.WriteString("<div class=\"note\">脚本只做一件事：在 Notion 页面内采集浏览器可读的登录 Cookie，然后交给本插件。它不读取、也不上传你的 <code>token_v2</code>（该值被浏览器设为 HttpOnly，任何页面脚本都读不到）。</div>")
-	b.WriteString("<div class=\"note\">回调页会提示补填 <code>token_v2</code>：从 Notion 的 <code>F12 → Application → Cookies → notion.com</code> 复制该项即可。这是浏览器安全策略决定的唯一手动步骤。</div>")
+	b.WriteString("<div class=\"note\">脚本只做一件事：在 Notion 页面内校验登录态、采集浏览器可读的 Cookie，然后交给本插件。它不读取、也不上传你的 <code>token_v2</code>（该值被浏览器设为 HttpOnly，任何页面脚本都读不到）。</div>")
+	b.WriteString("<div class=\"note\">回调页会用「Copy as cURL」补齐最后一步：在 Notion 页面按 <code>F12 → Network</code>，任选一个 <code>api/v3</code> 请求右键 → <code>Copy</code> → <code>Copy as cURL</code>，把整段粘进回调页即可。插件会自己解析出 <code>token_v2</code>，不需要你逐项找。</div>")
 }
 
 // writeBridgeScript 写出桥接页自身的交互脚本（复制按钮与打开 Notion）。
@@ -572,33 +614,40 @@ func loginCallbackShell(state, detail string) pluginapi.ManagementResponse {
 	return htmlManagementResponse(b.String())
 }
 
-// writeCallbackBody 写出补填表单。
+// writeCallbackBody 写出凭据补全表单。
+//
+// 页面不再要求用户逐个字段抄写：主入口是「Copy as cURL」整段粘贴，
+// 插件在服务端自己解析 Cookie（含 HttpOnly 的 token_v2）。脚本已采集的
+// 可读 Cookie 单独保留为只读展示，仅用于出错时对照。
 // [参数] b: 输出缓冲。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，回调页正文。
+// 最近修改时间：2026-10-19；改动原因：改为整段粘贴 + 插件自行识别。
 func writeCallbackBody(b *strings.Builder) {
 	b.WriteString("<h1>完成 Notion 授权</h1>")
-	b.WriteString("<p>已从 Notion 页面采集到可读登录 Cookie。还剩一步：<code>token_v2</code> 被浏览器设为 HttpOnly，任何页面脚本都读不到，需要你手动补上。</p>")
+	b.WriteString("<p>脚本已采集到可读 Cookie。最后一步只需要把 Notion 的请求整段交给插件，<code>token_v2</code> 由插件自己解析——不用去 Application 面板逐项找。</p>")
 	b.WriteString("<ol>")
-	b.WriteString("<li>回到 Notion 页面，<code>F12</code> → <code>Application</code>（Chrome）/ <code>Storage</code>（Firefox）。</li>")
-	b.WriteString("<li>左侧 <code>Cookies</code> → <code>https://www.notion.so</code>（或 <code>app.notion.com</code>）。</li>")
-	b.WriteString("<li>找到 <code>token_v2</code>，双击 Value 全选复制，粘贴到下面第二个框。</li>")
+	b.WriteString("<li>回到已登录的 Notion 页面，按 <code>F12</code> → <code>Network</code>（网络）标签。</li>")
+	b.WriteString("<li>点任意一个 <code>api/v3</code> 请求（例如 <code>getSpaces</code>），右键 → <code>Copy</code> → <code>Copy as cURL</code>。</li>")
+	b.WriteString("<li>把复制到的整段内容粘贴到下面的框里，点「完成授权」。</li>")
 	b.WriteString("</ol>")
-	b.WriteString("<p style=\"margin-top:18px\">已采集的 Cookie（可编辑）：</p>")
-	b.WriteString("<textarea id=\"cookie\" placeholder=\"notion_user_id=...; notion_browser_id=...\"></textarea>")
-	b.WriteString("<p style=\"margin-top:12px\">token_v2 的值：</p>")
-	b.WriteString("<textarea id=\"tokenv2\" style=\"min-height:64px\" placeholder=\"粘贴 token_v2 的值（不含 token_v2= 前缀也可以）\"></textarea>")
+	b.WriteString("<p style=\"margin-top:18px\">粘贴 Copy as cURL / 请求头（插件自动识别 Cookie）：</p>")
+	b.WriteString("<textarea id=\"curl\" style=\"min-height:120px\" placeholder=\"curl 'https://www.notion.so/api/v3/getSpaces' -H 'cookie: token_v2=...; notion_user_id=...' ...\"></textarea>")
+	b.WriteString("<details style=\"margin-top:12px\"><summary style=\"cursor:pointer;font-size:13px;color:#6d6760\">脚本已采集的可读 Cookie（只读，供排错对照）</summary>")
+	b.WriteString("<textarea id=\"cookie\" readonly style=\"margin-top:8px;min-height:64px;background:#f7f6f2\"></textarea></details>")
 	b.WriteString("<button id=\"submit\" type=\"button\">完成授权</button>")
 	b.WriteString("<div id=\"result\"></div>")
 	b.WriteString("<div class=\"note\">导入会先校验登录态与工作空间，成功才落盘。每个工作空间会拆成独立账号（订阅 / 免费额度分开路由）。</div>")
 }
 
-// writeCallbackScript 写出回调页脚本：解析 fragment、拼接 Cookie、提交导入。
+// writeCallbackScript 写出回调页脚本：解析 fragment、提交整段请求。
 //
+// 提交的内容是用户粘贴的原文（Copy as cURL / 请求头整段），Cookie 的抽取
+// 全部交给服务端：token_v2 是 HttpOnly，前端既读不到、也不该在这里做
+// 「猜哪个字段是凭据」的判断——那正是之前让用户逐项找字段的根源。
 // 成功后用 history.replaceState 清掉 fragment，避免凭据留在浏览历史里。
 // [参数] b: 输出缓冲。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，fragment 解析与提交。
+// 最近修改时间：2026-10-19；改动原因：改为整段提交，插件自行识别凭据。
 func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("<script>")
 	b.WriteString("var PROVIDER=document.body.getAttribute(\"data-provider\")||\"\";")
@@ -610,24 +659,35 @@ func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("var box=document.getElementById(\"result\");")
 	b.WriteString("function show(text,cls){box.className=cls;box.textContent=text;}")
 	b.WriteString("function clearHash(){try{history.replaceState(null,\"\",location.pathname+location.search)}catch(e){}}")
+	// TextEncoder 保证中文与 emoji 也按 UTF-8 编码，btoa 只接受单字节字符。
+	b.WriteString("function toBase64(text){try{")
+	b.WriteString("  var bytes=new TextEncoder().encode(text);var bin=\"\";")
+	b.WriteString("  for(var i=0;i<bytes.length;i++){bin+=String.fromCharCode(bytes[i])}")
+	b.WriteString("  return btoa(bin)}catch(e){return \"\"}}")
+	// Copy as cURL 会把请求体一起带上，整段可能几十 KB；请求头有大小上限，
+	// 因此只挑出 Cookie 那一行提交。字段级的识别仍然全部交给服务端。
+	b.WriteString("function pickCookie(text){")
+	b.WriteString("  var m=String(text||\"\").match(/cookie\\s*:\\s*([^\\r\\n]*)/i);")
+	b.WriteString("  if(!m){return \"\"}")
+	b.WriteString("  return m[1].replace(/^[\\s\\\"']+/,\"\").replace(/[\\s\\\\^\\\"',;]+$/,\"\")")
+	b.WriteString("}")
 	b.WriteString("clearHash();")
+	b.WriteString("var curlEl=document.getElementById(\"curl\");")
 	b.WriteString("var cookieEl=document.getElementById(\"cookie\");")
-	b.WriteString("var tokenEl=document.getElementById(\"tokenv2\");")
 	b.WriteString("if(upstreamErr){show(\"Notion 侧未完成授权：\"+upstreamErr,\"err\");}")
 	b.WriteString("cookieEl.value=collected;")
-	b.WriteString("function splitPairs(text){")
-	b.WriteString("  var out=[];String(text||\"\").split(\";\").forEach(function(p){var s=p.trim();if(s&&s.indexOf(\"=\")>0){out.push(s)}});return out")
-	b.WriteString("}")
 	b.WriteString("document.getElementById(\"submit\").addEventListener(\"click\",function(){")
-	b.WriteString("  var btn=this;var pairs=splitPairs(cookieEl.value);")
-	b.WriteString("  var raw=(tokenEl.value||\"\").trim();")
-	b.WriteString("  if(raw.indexOf(\"token_v2=\")===0){raw=raw.slice(\"token_v2=\".length).trim()}")
-	b.WriteString("  if(!raw){show(\"请先补填 token_v2 的值\",\"err\");return}")
-	b.WriteString("  pairs=pairs.filter(function(s){return s.indexOf(\"token_v2=\")!==0});")
-	b.WriteString("  pairs.push(\"token_v2=\"+raw);")
-	b.WriteString("  if(!pairs.some(function(s){return s.indexOf(\"notion_user_id=\")===0})){show(\"缺少 notion_user_id，请回到 Notion 页面重新执行脚本\",\"err\");return}")
-	b.WriteString("  btn.disabled=true;show(\"正在校验登录态与工作空间…\",\"\");")
-	b.WriteString("  fetch(IMPORT,{method:\"GET\",cache:\"no-store\",headers:{\"" + loginBridgeImportHeader + "\":pairs.join(\"; \")}})")
+	b.WriteString("  var btn=this;var raw=(curlEl.value||\"\").trim();")
+	b.WriteString("  if(!raw){show(\"请先粘贴 Copy as cURL 的内容\",\"err\");return}")
+	b.WriteString("  btn.disabled=true;show(\"正在识别凭据、校验登录态与工作空间…\",\"\");")
+	// 整段原文经 base64 提交：请求头不允许含换行，直传会被浏览器判为 Invalid value。
+	// 抽取 token_v2 / notion_user_id 仍然是服务端的职责。
+	// 优先只提交 Cookie 那一行：请求体可能很大，而头部有大小上限。
+	// 认不出 Cookie 行时退回整段原文，由服务端继续识别（含纯 Cookie 粘贴）。
+	b.WriteString("  var picked=pickCookie(raw);var payload=picked||raw;")
+	b.WriteString("  var encoded=toBase64(payload);")
+	b.WriteString("  if(!encoded){show(\"这段内容无法编码，请确认粘贴的是文本\",\"err\");btn.disabled=false;return}")
+	b.WriteString("  fetch(IMPORT,{method:\"GET\",cache:\"no-store\",headers:{\"" + loginBridgeInputHeader + "\":encoded}})")
 	b.WriteString("    .then(function(res){return res.json().then(function(d){return d}).catch(function(){return {error:\"响应解析失败\"}})}).then(function(d){")
 	b.WriteString("      if(d&&d.ok){var labels=(d.labels||[]).join(\"、\");btn.textContent=\"已授权\";show(\"授权成功\"+(labels?\"：\"+labels:\"\")+\"，正在通知管理页…\",\"ok\");return}")
 	b.WriteString("      show(\"授权失败：\"+((d&&d.error)||\"未知错误\"),\"err\");")

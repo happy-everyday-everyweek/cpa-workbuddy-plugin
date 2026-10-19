@@ -88,7 +88,7 @@ func managementRegistration() managementRegistrationResponse {
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Notion", Description: "Notion Provider 管理面板：Cookie 导入、额度刷新与探活。"},
 			{Path: "/login", Description: "宿主「添加账号」弹窗打开的登录引导页（可复制链接 + 控制台脚本）。"},
-			{Path: "/login/callback", Description: "登录脚本采集完成后的回调页（补填 token_v2 并提交）。"},
+			{Path: "/login/callback", Description: "登录脚本采集完成后的回调页（粘贴 Copy as cURL，由插件识别凭据）。"},
 			{Path: "/login/import", Description: "登录引导页的 Cookie 提交入口（免管理密钥，state 短时凭证）。"},
 		},
 	}

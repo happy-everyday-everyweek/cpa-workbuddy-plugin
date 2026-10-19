@@ -86,6 +86,98 @@ func TestParseCookieIdentity(t *testing.T) {
 	}
 }
 
+// TestParseCookieIdentityFromCurl 校验能从 DevTools 整段请求里识别 Cookie。
+//
+// 这是「用户不该去 Application 面板逐项找字段」的关键：Copy as cURL 的原文
+// 里 Cookie 只是众多请求头之一，整段当 Cookie 发出去会直接 401。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，整段请求识别回归。
+func TestParseCookieIdentityFromCurl(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "Copy as cURL（bash 单引号）",
+			input: "curl 'https://www.notion.so/api/v3/getSpaces' \\\n" +
+				"  -H 'accept: */*' \\\n" +
+				"  -H 'cookie: notion_user_id=u-1; token_v2=v03%3Aabc; notion_browser_id=b-1' \\\n" +
+				"  -H 'x-notion-space-id: s-1' \\\n" +
+				"  --data-raw '{}'",
+		},
+		{
+			name: "Copy as cURL（cmd 双引号 + ^ 续行）",
+			input: "curl ^\"https://www.notion.so/api/v3/getSpaces^\" ^\n" +
+				"  -H ^\"cookie: notion_user_id=u-1; token_v2=v03%3Aabc\\\"",
+		},
+		{
+			name: "Copy as fetch",
+			input: "fetch(\"https://www.notion.so/api/v3/getSpaces\", {\n" +
+				"  \"headers\": {\n" +
+				"    \"cookie\": \"notion_user_id=u-1; token_v2=v03%3Aabc\"\n" +
+				"  },\n" +
+				"  \"method\": \"POST\"\n" +
+				"});",
+		},
+		{
+			name: "Copy request headers 整段",
+			input: "accept: */*\n" +
+				"cookie: notion_user_id=u-1; token_v2=v03%3Aabc\n" +
+				"x-notion-space-id: s-1\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			identity, err := parseCookieIdentity(tc.input)
+			if err != nil {
+				t.Fatalf("解析失败：%v", err)
+			}
+			if identity.TokenV2 != "v03%3Aabc" {
+				t.Fatalf("TokenV2 = %q, 期望 v03%%3Aabc", identity.TokenV2)
+			}
+			if identity.UserID != "u-1" {
+				t.Fatalf("UserID = %q, 期望 u-1", identity.UserID)
+			}
+			// 抽取结果必须是干净的单行 Cookie：混入 curl 参数会直接 401。
+			for _, leaked := range []string{"curl", "--data-raw", "accept:", "x-notion-space-id", "\n"} {
+				if strings.Contains(identity.CookieHeader, leaked) {
+					t.Fatalf("归一结果混入了非 Cookie 内容 %q：%s", leaked, identity.CookieHeader)
+				}
+			}
+		})
+	}
+}
+
+// TestExtractCookieHeaderValueSkipsLookalikes 校验不会把相似字段当成 Cookie 头。
+//
+// `notion_cookie_id`、响应头 `set-cookie` 都含 cookie 字样，误匹配会把
+// 无关值当成登录凭据，最终以 401 的形式失败。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，误匹配防护回归。
+func TestExtractCookieHeaderValueSkipsLookalikes(t *testing.T) {
+	if got := extractCookieHeaderValue(`{"notion_cookie_id":"x"}`); got != "" {
+		t.Fatalf("字段名不应被当成 Cookie 头：%q", got)
+	}
+	if got := extractCookieHeaderValue("set-cookie: token_v2=v; Path=/; HttpOnly"); got != "" {
+		t.Fatalf("响应头 set-cookie 不应被当成请求 Cookie：%q", got)
+	}
+	if got := extractCookieHeaderValue("cookie: token_v2=v; notion_user_id=u"); got == "" {
+		t.Fatal("正常 Cookie 头应当被识别")
+	}
+	// 带连字符的请求头不能被误伤：`x-notion-*` 里没有 cookie 词根，
+	// 但若边界判断把 `-` 漏掉，`set-cookie` 就会被当成请求 Cookie。
+	if got := extractCookieHeaderValue("x-notion-space-id: s-1"); got != "" {
+		t.Fatalf("不含 Cookie 头的请求不应返回值：%q", got)
+	}
+	// 大小写混写也要能识别，DevTools 不同版本会改写头名大小写。
+	if got := extractCookieHeaderValue("-H 'Cookie: a=b'"); got != "a=b" {
+		t.Fatalf("头名大小写混写应能识别，实际 %q", got)
+	}
+}
+
 // TestAuthIDForStable 校验账号标识稳定、按空间区分且不泄露原始值。
 // [参数] t: 测试上下文。
 // [返回] 无。

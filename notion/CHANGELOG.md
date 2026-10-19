@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.5 (2026-10-19)
+
+### 修复
+
+- **导入不再要求去 Application 面板逐个找 `token_v2`**。`normalizeCookieHeader`
+  的注释一直声称支持完整 cURL，实际只剥了 `Cookie:` 前缀——把整段 cURL
+  粘进来会连 `curl '...'` 一起当 Cookie 发出去，上游直接 401。现在真正
+  解析 Copy as cURL / Copy as fetch / 请求头整段，插件自己把 Cookie 抽出来。
+- **登录回调页改为「粘一次整段请求」**。用户反馈「为什么要我们手动找字段」：
+  原页面要求从 `F12 → Application → Cookies` 复制 `token_v2`，抄错或 token
+  已被轮换就会得到 `Token is invalid`。现在只需在 Network 面板对任意
+  `api/v3` 请求点 `Copy as cURL`，整段粘进回调页即可。
+- **上游 401 补可执行提示**。原文只有一句 `Token is invalid.`，用户看不出
+  该重来还是换账号；现在追加「凭据已失效：请确认粘贴的是当前已登录标签页
+  的请求」这类下一步说明。
+
+### 安全
+
+- 回调页提交的整段原文经 **base64** 传输：`fetch` 的 Headers 不允许含换行，
+  直传会被浏览器判为 `Invalid value`（实测 `Failed to construct 'Headers'`）。
+- 前端先挑出 Cookie 那一行再提交，避免 `Copy as cURL` 携带的几十 KB 请求体
+  撑爆请求头大小上限；字段识别仍全部在服务端完成。
+- 服务端对 base64 解码失败与超长输入给出明确错误，不把乱码发往上游。
+
+### 测试
+
+- `TestParseCookieIdentityFromCurl`：bash 单引号、cmd 双引号 `^` 续行、
+  Copy as fetch、请求头整段四种形态都能识别，且归一结果不含 curl 参数。
+- `TestExtractCookieHeaderValueSkipsLookalikes`：`notion_cookie_id`、响应头
+  `set-cookie` 不被误当成请求 Cookie。
+- `TestCurlInputReachesUpstreamAsCleanCookie`：链路级回归——整段 cURL 经
+  base64、解析、`requestScope` 后，最终发往上游的 Cookie 头完全干净。
+- `TestLoginImportDecodesBase64Input`：正常 / 旧 Cookie 头兜底 / 损坏 base64
+  三条分支。
+- 变异验证 6 处（禁用 cURL 抽取、去掉 set-cookie 排除、回调页退回手动补填、
+  去掉 401 提示、绕过 base64 解码、吞掉解码错误）全部转红。
+
+## 0.2.4 (2026-10-19)
+
+### 修复
+
+- **登录页改为可复制链接 + 控制台脚本**。Notion 没有一键授权，登录态是
+  HttpOnly Cookie，插件无法作为 OAuth 回调接收方。桥接页给出可在 Notion
+  页面 Console 直接执行的脚本，采集完成后自动跳回插件回调页。
+
+### 测试
+
+- 七类浏览器探测确证 `token_v2` 在任何前端通道都读不到：`document.cookie`、
+  Cookie Store API、localStorage、sessionStorage、IndexedDB、window 全局、
+  响应头；`gist.web.userToken` 与 `/api/v3/getSessionToken` 同样不可用。
+
 ## 0.2.3 (2026-10-19)
 
 ### 修复

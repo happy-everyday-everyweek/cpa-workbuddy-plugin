@@ -216,10 +216,10 @@ button.danger:hover{background:var(--err);color:#fff}
       <button type="button" class="modal-x" onclick="closeModal('importModal')" aria-label="关闭">×</button>
     </div>
     <div class="modal-bd">
-      <p class="hint">在浏览器打开 Notion，开发者工具 → Network → 任意请求 → Request Headers 里的完整 <code>Cookie</code>。导入会先校验登录态与工作空间，成功才落盘。</p>
+      <p class="hint">在已登录的 Notion 页面打开开发者工具 → Network → 任意 <code>api/v3</code> 请求 → 右键 <code>Copy as cURL</code>，把整段粘贴到下面即可；插件会自己识别出 Cookie，不需要逐项找字段。导入会先校验登录态与工作空间，成功才落盘。</p>
       <p class="hint">导入会把每个工作空间拆成独立账号（订阅 / 免费额度分开路由、独立冷却）；留空空间 id 表示全部导入。</p>
-      <label for="cookie">Cookie header</label>
-      <textarea id="cookie" placeholder="token_v2=...; notion_user_id=...; notion_browser_id=..."></textarea>
+      <label for="cookie">Copy as cURL / Cookie header</label>
+      <textarea id="cookie" placeholder="curl 'https://www.notion.so/api/v3/getSpaces' -H 'cookie: token_v2=...; notion_user_id=...' ...&#10;（也可以只粘贴 Cookie 本身）"></textarea>
       <label for="label">备注名（可空）</label>
       <input id="label" placeholder="例如：主账号">
       <label for="spaceId">只导入指定工作空间 id（可空，留空导入全部）</label>
@@ -668,7 +668,7 @@ function openImportModal(){
 
 async function importAccount(btn){
   const cookie = document.getElementById('cookie').value.trim();
-  if (!cookie) { toast('请先粘贴 Cookie', 'warn'); return; }
+  if (!cookie) { toast('请先粘贴 Copy as cURL 或 Cookie', 'warn'); return; }
   busy(btn, true);
   try {
     const data = await request('/import', {
