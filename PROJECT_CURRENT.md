@@ -32,6 +32,33 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-19）：**coze 0.4.6 发布生产：64KB 内容超限不再拖垮账号池**：
+  - 用户报障：`doubao-seed-2-0-lite` 持续 `503 auth_unavailable ... last upstream error: 提交消息失败：数据库错误（code=1000003）`。
+  - **根因（直连上游二分实测）**：`message/chat` 的 content 有 **65535 字节硬上限**（65536 即失败），越界返回的是 `1000003 数据库错误` 而非参数错误。插件原样上抛，宿主因无状态码按 5xx 判定为账号级故障，依次冷却两个账号 → 此后所有请求 3–5ms 短路 503。**单次超长请求放大成整池故障**。
+  - **修复**：① 同步入口 `handleExecExecute` / `handleExecStream` 按 UTF-8 字节预检，超限返回 **413** 请求级错误，不触达上游；② `envelopeError` 补 `HTTPStatus`/`Retryable`，新增 `requestFaultEnvelope` 与 `writeExecutionError`，让宿主能识别请求级故障（跳过冷却与换号）；③ 其余上游错误（`1000521` 积分耗尽、`700012006` 会话失效）保持原账号级语义不变。
+  - **验证**：cgo-shim build+vet+test 全绿（新增 6 用例）；变异反证 3 次全部精确捕获（移除预检 / 413 改 500 / 信封丢状态码）。
+  - **发布链**：`af492ec`(fix 8 文件) → CI run `39262011655` success → assets 6/6 `ALL CHECKSUMS OK` → registry `ec51b56` → 远端 6/6 assets 200 → 生产 `plugin-store install?version=0.4.6` 返回 `restart_required:false`，`hot reloaded active_version=0.4.6 retired_version=0.4.5`（21:55:17），落盘 `.so` sha256 `5a8964e9…` 与本地 zip 逐字节一致，**零容器重启**。
+  - **生产行为验收**：70016 字节请求 **0.03s 返回 413**（修复前 5.8s / 500），随后三次正常短请求全部 200，账号池未被冷却。
+  - **踩坑**：生产生效配置是容器内 `/CLIProxyAPI/config.yaml`（明文 secret-key），**不是** MySQL spool 的 `/CLIProxyAPI/mysqlstore/mysqlstore/config/config.yaml`（后者 secret-key 为 bcrypt 哈希，用它认证必然 401）。
+  - 文档：`doc/4-bugs/2026-10-19_212000_coze超长内容触发池级冷却根因诊断.md`、`doc/6-review/2026-10-19_212500_Coze超长内容池级冷却修复_6-review.md`。
+- 当前会话（2026-10-19）：**账号故障冷却基数 30s → 60s（10 插件全量，未发布生产）**：
+  - 用户需求：「统一的 30s 冷却递增改成 60s 开始递增 60s」，裁定为 **60s、120s、180s…线性递增、上限仍 10 分钟**，覆盖全部含该阶梯的插件。
+  - **实现**：9 插件 `failoverCooldownBase` 30s→60s（workbuddy / workbuddy-ai / traework / qoderwork / qoder-ai / qwenwork / copilot / zcode / doubao）；notion 改 `failoverDefaultBaseSeconds` 与 `defaultConfig().CooldownSeconds` 默认值 30→60（配置项保留，已显式配置的值优先）。公式不变（仍 `base × count`），`LadderCap` 由 `max/base` 自动从 20 档变 10 档。账号×模型双层冷却共用同一函数，两层同时生效。
+  - **验证**：10 插件 `cgo-shim-build.py` build+vet+test 全绿；全部改动文件 gofmt 干净；`POLLUTION: PASS`；变异验证（workbuddy 基数改回 30s）→ 4 个用例精确 FAIL 并打印 `= 30s, want 1m0s`，还原后全绿。
+  - **注意**：notion 生产若已显式写 `cooldown_seconds: 30`，该值继续生效；各插件 CHANGELOG 的历史记录不改写。
+  - 文档：`doc/3-实施/2026-10-19_213000_账号冷却基数30s改60s实施总览.md`。
+  - **同时完成的并发盘点（只读，未改代码）**：各插件 4 小时级定时刷新并非统一串行/并发，而是混用——coze 续期并发 4；workbuddy/workbuddy-ai/traework/qoder-ai/qoderwork/qwenwork 的积分刷新走 `refreshConcurrency=10` worker 池；签到/保活为 goroutine + sem=4；traework 自动签到与 qwenwork 对账为纯串行；**traework 签到重试 `checkin_retry.go:145` 每项直接 `go` 无并发上限**（唯一越界点）；zcode 单 worker + 300ms 间隔；copilot/cursor/doubao/notion 无插件侧账号定时循环。全仓无跨插件共享限流。4h 槽位按本地整点（00/04/08/12/16/20）对齐，所有插件同一时刻触发，叠加启动/热重载首轮，整机峰值估算约 70–80 个上游请求同时在场。
+- 当前会话（2026-10-19）：**Qoder 系模型发现风暴与 OOM 修复 P0/P1/P2 本地实施（按约束未发布生产）**：
+  - 来源：会话 `6f11d093` 只读分析给出的 P0/P1/P2 优先级建议。生产连续 5 次 OOM 的放大器链：`callModelsAPI` 签名 body 与 GET 实际 body 不一致 → `Signature invalid` 恒 403（累计 5449 条、从未成功）→ 失败不写任何缓存 → 宿主每次 auth 重写触发 `model.for_auth` 逐账号全量重扫（实测 8409 条 N+1 风暴）。
+  - **P0（qoder-ai / qoderwork）**：两处 `callModelsAPI` 抽出 `newModelsAPIRequest`，GET 以 `strings.NewReader(encodedBody)` 真实携带与签名同一的 `qoderEncode("{}")`。修复方向由外部可工作实现 qoder2api-hub（`qoder_proxy.py::read_dynamic_models`，commit `fd7a3740`）裁定：其 `sign_body` 同时进签名与 `data=`，裸 GET 判 403。qwenwork 走 Bearer 无 COSY 不受影响。
+  - **P1（五插件）**：`dynamicModelsCache` 增 `failedAt` + `dynamicModelsFailCacheTTL=5min`；全部扫描/拉取入口窗口内直接返回 nil 走静态兜底，全败路径 `markDynamicModelsFailed`，`storeDynamicModels` 成功即清零。切断 N+1 风暴，即使 P0 未生效或上游再变更也不再重演。
+  - **P2（qoder 三插件）**：`pickNextAuth` 选定候选后统一 `time.Sleep(failoverBackoff=50ms)`（唯一 chokepoint 单点收口，不动 21 个调用位）；`readAllUpstreamErr` 改 `io.LimitReader(r, 1<<20)`。
+  - **验证**：新增 9 个测试文件（签名一致性反推 md5 断言 / 负缓存三行为 / 错误体截断+退避护栏）；P0/P1/P2 各经真实变异复验捕获，报错打印旧值 vs 新值；五插件 `cgo-shim-build.py` build+vet+test 全绿；改动文件 gofmt 全绿；`POLLUTION: PASS`。P0 宿主转发链已对宿主源码取证（`internal/pluginhost/http_bridge.go:156` 用 `bytes.NewReader(bytes.Clone(req.Body))` 重建请求，GET body 会真实发出）。
+  - **复核追加修复（同日晚间）**：首版 `fetchDynamicModelsFromStorage` 先 `markDynamicModelsFailed()` 再 `fetchDynamicModels()`，而后者入口的窗口检查会立刻拦住 → 自身声明的「回退到已注册凭据扫描」成死路径（本账号凭据损坏时另一账号本可成功）。改为「先回退、无果再开窗」+ 抽出 `fetchDynamicModelsFallbackFn` 接缝；三插件各补 `TestNegativeCache_StorageFallbackRunsBeforeWindow`，变异（恢复先开窗）报 `回退结果应被采用，got []` 精确 FAIL，还原后五插件全绿。
+  - **未覆盖**：端到端「`dynamic discovery ok` 首现 / `Signature invalid` 归零」属生产观测项，本轮不发布不热重载留待发布后验收；workbuddy / workbuddy-ai 的 P2 未纳入本轮。
+  - 文档：`doc/3-实施/2026-10-19_133000_Qoder系模型发现风暴与OOM修复P0P1P2实施总览.md`、`doc/4-bugs/2026-10-12_015500_*`（§9 实施结论 + §6 裁定）。
+  - 同会话前段（2026-10-18~19）：**账号冷却模型维度与冷却前探活 周期 4（zcode/copilot）收口 + 五插件测试模板缺口补齐**：见 `doc/3-实施/2026-10-18_230000_账号冷却模型维度与冷却前探活实施总览.md`（五周期全部完成，5 插件：workbuddy/workbuddy-ai/traework/zcode/copilot，同样未发布）。
+
 - 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收连修四处真实缺陷（0.3.1~0.3.4）**：
   - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS → 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200。
   - **缺陷 1（0.3.0 → 0.3.1）：流式响应 500**。生产 `POST /v1/chat/completions` 立即返回 `json: unsupported type: <-chan pluginapi.ExecutorStreamChunk`。根因：宿主 `rpcExecutorStreamResponse.Chunks` 是 **slice**（`internal/pluginhost/rpc_schema.go:52`），`rpc_client_stream.go:29` 先判 `len()` 再转 channel；0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化即失败。修复：带 `stream_id` 时立即返回响应头，后台用 `host.stream.emit` 逐帧推送、`host.stream.close` 收尾；无 `stream_id` 时同步收集返回 slice；补 `X-Accel-Buffering: no`。回归 `TestStreamResponseSerializable`（变异回 channel 形态精确复现生产报错文案）。发布链 `06bb281` → CI `39121930862` success → registry `45e6851` → 远端 ALL PASS → 生产热重载 `active_version=0.3.1 retired_version=0.3.0`，落盘 sha256 `50dfcd41…` 与本地一致。
@@ -103,22 +130,9 @@
 
 - 会话（2026-10-14，已压缩）：**四插件定时探活降频至 4 小时并修失败账号节流缺陷**：**真实缺陷**：`recordActivePing` 原仅成功时刷新时间戳，失败账号不计时 → 每个 tick 被反复重测，比健康账号更耗配额；改为「无论成败都先刷新」。四插件各补回归用例，全链路发布生产、零容器重启。
 
-- 会话（2026-10-14，已压缩）：**zcode-provider 0.1.22 领取指引**：改为如实 Start Plan 指引（`guideModal`）；根因：额度领取须官方客户端手动完成（claim 强制阿里云人机验证头，无头一律 `400 3007`）。
+- 会话（2026-10-14/15，已压缩）：**zcode-provider 0.1.22 领取指引**：改为如实 Start Plan 指引（`guideModal`）；根因：额度领取须官方客户端手动完成（claim 强制阿里云人机验证头，无头一律 `400 3007`）。
 
-- 当前会话（2026-10-15）：**copilot-provider 0.1.1：宿主 OAuth 弹窗改开插件桥接页展示设备码，全链路发布生产**：
-  - 需求背景：用户在管理台点「登录」后，GitHub 授权页 8 个空白框需手输设备码，但宿主 OAuth 弹窗**不显示设备码**（附截图）。根因：宿主 `ServePluginAuthURL`（`auth_files_oauth_callback.go:218`）把插件 start 响应的 `Metadata` 只写进宿主 session store、**不回传前端**，硬编码返回 `{status,url,state}`；宿主内置 provider 是把 `user_code` 放响应顶层才显示，插件无法照做。用户采纳「选项 B：桥接页」方案。
-  - **实现（方案 B）**：`handleStartLogin` 的 `URL` 改返回**插件自有 resource 前缀桥接页相对路径** `/v0/resource/plugins/copilot-provider/login-bridge?state=<state>`（resource 路由是插件唯一免鉴权 GET 面），新增 `bridge.go`（`loginBridgeURL`/`handleLoginBridge`/`loginBridgePage`/`htmlEscape`），桥接页渲染设备码（32px/letter-spacing:4px/user-select:all）+ GitHub 授权链接 + 三步指引；注册进 `managementRegistration().Resources`（**不挂 Menu**，不进菜单）。
-  - **关键设计**：桥接页**只展示、不驱动轮询**——`pollDeviceLogin` 成功即 `Delete` 会话（read-once），桥接页若自行轮询会偷走凭据致宿主 `PollLogin` 拿不到 `AuthData`；轮询与落盘仍归宿主 `get-auth-status` → `PollLogin` 链路。
-  - **发布闭环**：`100bc6b`(fix 11 文件) → CI dispatch `38732577295` success（并 cancel 同 head 冗余 push run `38732367637`）→ `2324317`(8 assets，sha256sum -c 7/7 OK + zip 内 `.so` 含 `0.1.1`/`login-bridge`) → `a5c2da0`(registry) → `fe8ed5a`(prune 0.1.0)；生产热重载 `active_version=0.1.1 retired_version=0.1.0`（20:26:17），**零容器重启**（Up 42h），落盘 `.so` sha256 `12c9fb2e…` 与本地 zip 逐字节一致。
-  - **生产行为验收（真实端点）**：宿主弹窗端点 `GET /v0/management/copilot-provider-auth-url` 返回 `url=/v0/resource/plugins/copilot-provider/login-bridge?state=…`（`is_bridge=True`）；用该 state 打开桥接页真实渲染出设备码（与 start 返回一致）、含 GitHub 授权链接、HTML 完整；`get-auth-status` 返回 `{"status":"wait"}`；accounts/panel/bridge 内网与外网全 200。远端 7/7 artifacts sha256+size ALL PASS、0.1.0 已 404。
-  - 门禁：cgo-shim build/vet/test 全绿（30 例）+ 面板回归 PASS + 双重变异反证（哨兵进编译 / 还原 URL 精确 FAIL）+ 真实浏览器 DOM 取证（正常页与错误页两分支）+ `gofmt -l` 空 + `POLLUTION: PASS` + `STYLE: PASS` + OCR 无 Critical；提交全程路径限定（踩坑 57）。
-  - 文档：`doc/3-实施/2026-10-16_010000_copilot宿主OAuth弹窗设备码桥接页实施总览.md`、`doc/6-review/2026-10-16_013000_*`。
-
-- 上一会话（2026-10-15）：**新增 copilot-provider 插件（0.1.0 首发）并完成 Kiro 可行性评估（裁定不立项）**：
-  - **copilot-provider 立项与实现**：按 `doc/3-实施/2026-10-15_Copilot与Kiro插件立项实施总览.md` 的 CYCLE-1~4 推进。GitHub 免费档实测可用（`sku=free_limited_copilot` 可换内部令牌、发现 57 个模型、流式与非流式推理均通），关闭 `GAP-001`；`GAP-002` 关闭（持久化上游 `endpoints.api` 权威端点）。单测 27 例。
-  - **CYCLE-4 发布闭环**：`c546b57` → `56ac86f`(8 assets) → `8966b0c`(registry)；CI 双 run success；远端 7/7 ALL PASS；生产 `plugin-store install` 返回 `restart_required=false`，**零容器重启**，落盘 `.so` sha256 `65d428b8…` 逐字节一致，四路由全 200。`AC-006`/`AC-007` 双 PASS。
-  - **过程中的真实故障（已修复）**：侦察阶段提前写入的 registry 占位条目（`artifacts: []`）被并行会话的宽泛 `git add` 一并推送 → CPA 源级校验失败 → **所有插件** install 返回 `plugin_not_found`。由并行会话 `10a1f2f` 移除恢复；本轮随后严格按发布 skill Step 11 语义重做。
-  - **Kiro 可行性评估（CYCLE-5，评估非实现）**：结论**不立项**。① Kiro FAQ 明文禁第三方 harness；② 免费档仅 **50 credits/月**；另有社区终局封禁实证。报告 `doc/3-实施/2026-10-15_235000_Kiro可行性评估报告.md`。
+- 历史会话（2026-10-15，已压缩）：**copilot-provider 立项与 0.1.0/0.1.1 两轮发布**。要点留存：宿主 `ServePluginAuthURL`（`auth_files_oauth_callback.go:218`）不把插件 `Metadata` 回传前端 → 0.1.1 改用**桥接页**方案（`/v0/resource/plugins/copilot-provider/login-bridge?state=…`，resource 路由是插件唯一免鉴权 GET 面），桥接页**只展示不轮询**（轮询成功即 read-once 删除会话，桥接页自行轮询会偷走凭据）。两轮均热重载零重启、7/7 artifacts ALL PASS。**Kiro 裁定不立项**：FAQ 明文禁第三方 harness、免费档仅 50 credits/月、有终局封禁实证。文档：`doc/3-实施/2026-10-16_010000_copilot宿主OAuth弹窗设备码桥接页实施总览.md`、`doc/3-实施/2026-10-15_Copilot与Kiro插件立项实施总览.md`、`doc/3-实施/2026-10-15_235000_Kiro可行性评估报告.md`。
 
 - 会话（2026-10-13，更早历史已压缩，详见 git log 与 PROJECT_HISTORY.md）：
   - **六插件 max_tokens 统一 32768 底线**：`applyMaxTokensFloor` 四出口收敛；zcode 规格矩阵 14→64 条；四插件探活改「全量按序 any-success」。
