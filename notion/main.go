@@ -66,7 +66,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.2.2"
+	version      = "0.2.3"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -90,7 +90,7 @@ type Config struct {
 	SpaceID string `yaml:"space_id" json:"space_id"`
 	// RetryOn4xx 是 401/403/404/405 触发换号的次数预算。
 	RetryOn4xx int `yaml:"retry_on_4xx" json:"retry_on_4xx"`
-	// CooldownSeconds 是账号首次失败后的冷却基数（秒），按阶梯倍增。
+	// CooldownSeconds 是账号首次失败后的冷却基数（秒），按阶梯线性递增（n × 基数）。
 	CooldownSeconds int `yaml:"cooldown_seconds" json:"cooldown_seconds"`
 }
 
@@ -104,7 +104,7 @@ func defaultConfig() Config {
 		StreamTimeoutSeconds: 300,
 		ClientVersion:        browserClientVersion,
 		RetryOn4xx:           3,
-		CooldownSeconds:      30,
+		CooldownSeconds:      60,
 	}
 }
 
@@ -300,6 +300,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 	case pluginabi.MethodAuthParse:
 		return handleParseAuth(request)
+
+	case pluginabi.MethodAuthLoginStart:
+		return handleStartLogin(request)
+
+	case pluginabi.MethodAuthLoginPoll:
+		return handlePollLogin(request)
 
 	case pluginabi.MethodAuthRefresh:
 		return handleRefreshAuth(request)

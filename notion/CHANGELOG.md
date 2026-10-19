@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.2.3 (2026-10-19)
+
+### 修复
+
+- **OAuth 登录弹窗报「failed to generate authorization url」**。插件声明了
+  `auth_provider`，宿主「+ 添加账号」会调用 `auth.login.start`，但插件从未
+  实现 `auth.login.start` / `auth.login.poll`，宿主只能统一报错，流程根本
+  进不去。现在补齐这两个方法。
+- **登录入口改为 Cookie 导入桥接页**。Notion 没有开放给第三方的一键授权：
+  AI 登录态是浏览器里的 HttpOnly Cookie（`token_v2`），只能由用户从网页端
+  导出。新的 `/login` 桥接页引导用户粘贴 Cookie，`/login/import` 免管理密钥
+  接收（state 为 15 分钟一次性凭证），导入成功后宿主轮询领取。
+- **一次登录拆分出的多个工作空间全部回传**。宿主 `auth.login.poll` 支持
+  `Auths` 数组；只回传第一个账号会让另一个空间变成孤儿文件——插件侧存在、
+  宿主侧不可路由，额度永远用不上。
+- **登录回传的 `AuthData.ID` 与宿主文件名口径统一**（带 `.json`）。宿主有
+  两条注册路径：`host.auth.save` 按相对路径派生 ID，登录结果原样使用
+  `AuthData.ID`；两者不一致时同一个物理文件会被注册成两个 auth 记录，
+  管理页与面板都会出现重复账号。
+- **桥接页提交兼容宿主两种 query 下发形态**。宿主可能把 `state` 单独放进
+  `req.Query`，也可能只挂在 `req.Path` 上；只读其中一处会让提交稳定报
+  「缺少登录会话标识」（真实 `.so` 上实测到该形态差异）。
+
+### 安全
+
+- 桥接页 `state` 用 `crypto/rand` 生成 32 位十六进制随机值，15 分钟过期，
+  一次性消费；未知或过期 state 既不渲染导入表单，也不接受凭据提交。
+- 桥接页错误说明做 HTML 转义，避免上游错误文本被当作标记注入。
+- `/login/import` 走 resource 路由（免管理密钥），Cookie 放
+  `X-Notion-Cookie` 自定义头——宿主会把 resource 请求改写为 GET 且不转发
+  请求体。
+
+### 测试
+
+- `TestHandleMethodRoutesLogin`：从 `handleMethod` 分发入口断言登录方法已接线
+  （直接调用处理函数会漏掉「方法没注册」这一原始缺陷）。
+- `TestManagementRegistrationDeclaresLoginResources`：`/login` 与
+  `/login/import` 已注册为 resource 路由。
+- `TestStartLoginReturnsBridgeURL` / `TestStartLoginGeneratesUniqueState`：
+  起点返回相对 URL、state 唯一且足够长。
+- `TestPollLoginPendingThenError` / `TestPollLoginConsumesStateOnce`：轮询
+  状态机与结果一次性消费。
+- `TestMarkLoginImportedRequiresValidState`：未知 / 空 / 过期 state 均拒绝登记。
+- `TestPollLoginReturnsAllSpaces`：多空间账号全部回传且 `StorageJSON` 非空。
+- `TestLoginStateFromRequestHandlesBothShapes` /
+  `TestLoginBridgeImportAcceptsPathOnlyState`：两种 query 形态都能取到 state。
+- `TestLoginAuthDataIDMatchesFileName`：登录 ID 带 `.json` 且与 `FileName` 一致。
+- `TestLoginBridgeRejectsBadState` / `TestLoginBridgeRendersFormForValidState` /
+  `TestLoginBridgeEscapesDetail`：桥接页鉴权、渲染与 XSS 防护。
+- `test/notion/login_bridge_repro.mjs`：Node vm 真实执行桥接页内联 JS，18 项断言。
+
+以上用例均做过变异验证：移除方法分发、只回传首个空间、state 鉴权失效、
+登录 ID 与文件名不一致四处分别改坏，对应测试各自转红；真实 `.so` 上
+`auth.login.start` 从 `unknown_method` 变为返回桥接页 URL，端到端导入 2 个
+工作空间并成功领取。
+
 ## 0.2.2 (2026-10-19)
 
 ### 修复

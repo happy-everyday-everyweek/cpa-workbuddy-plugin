@@ -672,11 +672,9 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		auth.AuthID = strings.TrimSuffix(fileName, notionAuthFileSuffix)
 	}
 
-	data := authDataForLogin(&auth)
-	// 宿主扫描时已按相对路径派生过 ID（含 .json）。这里回传同形 ID，
-	// 否则同一次扫描会既登记路径 ID、又登记本函数返回的裸 ID。
-	data.ID = fileName
-	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: data})
+	// authDataForLogin 已回传带 .json 的文件名形态，与宿主按相对路径
+	// 派生的 ID 同形；同一次扫描不会既登记路径 ID、又登记裸 ID。
+	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: authDataForLogin(&auth)})
 }
 
 // handleRefreshAuth 响应宿主 auth.refresh。
@@ -717,8 +715,10 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // 最近修改时间：2026-10-19；改动原因：补 StorageJSON，修复宿主覆盖凭据导致账号失效。
 func authDataForLogin(auth *StoredAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(auth)
+	fileName := authFileNameOf(auth.AuthID)
 	return pluginapi.AuthData{
-		ID:          auth.AuthID,
+		ID:          fileName,
+		FileName:    fileName,
 		Provider:    providerName,
 		Label:       auth.Label,
 		Disabled:    auth.Disabled,
@@ -730,6 +730,19 @@ func authDataForLogin(auth *StoredAuth) pluginapi.AuthData {
 			"space_name": auth.SpaceName,
 		},
 	}
+}
+
+// authFileNameOf 把账号标识规范成宿主 auth 目录下的文件名。
+//
+// 宿主有两条注册路径：host.auth.save 走「相对路径派生 ID」（含 .json），
+// 登录结果走 AuthData.ID（原样使用）。两者不一致时同一个物理文件会被注册成
+// 两个 auth 记录，面板与宿主管理页都会出现两条一模一样的账号。
+// [参数] authID: 账号标识（可带或不带 .json 后缀）。
+// [返回] 形如 notion-<hash>.json 的文件名。
+// 最近修改时间：2026-10-19；改动原因：新增，登录回传 ID 与文件名统一口径。
+func authFileNameOf(authID string) string {
+	authID = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(authID), notionAuthFileSuffix))
+	return authID + notionAuthFileSuffix
 }
 
 // listHostAuthFiles 从宿主获取账号索引，宿主不可用时回落到本地扫描。

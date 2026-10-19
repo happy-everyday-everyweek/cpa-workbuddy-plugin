@@ -86,7 +86,9 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/usage", Description: "查询账号各工作空间的额度（query: auth_id）。"},
 		},
 		Resources: []resourceRoute{
-			{Path: "/panel", Menu: "Notion", Description: "Notion Provider 管理面板：Cookie 导入、工作空间切换与探活。"},
+			{Path: "/panel", Menu: "Notion", Description: "Notion Provider 管理面板：Cookie 导入、额度刷新与探活。"},
+			{Path: "/login", Description: "宿主「添加账号」弹窗打开的登录引导页（浏览器 Cookie 导入桥接）。"},
+			{Path: "/login/import", Description: "登录引导页的 Cookie 提交入口（免管理密钥，state 短时凭证）。"},
 		},
 	}
 }
@@ -144,6 +146,20 @@ func handleManagement(raw []byte) ([]byte, error) {
 
 	if method == http.MethodGet && (subPath == "/" || subPath == "/panel") {
 		return handlePanelPage()
+	}
+
+	if method == http.MethodGet && subPath == "/login" {
+		state := loginStateFromRequest(req)
+		if state == "" && urlQuery != nil {
+			state = strings.TrimSpace(urlQuery.Get("state"))
+		}
+		return okEnvelope(handleLoginBridge(state))
+	}
+
+	// 桥接页的提交入口：宿主把 resource 请求强制改写为 GET 且不转发请求体，
+	// 因此这里必须用 GET 分支；Cookie 由桥接页放进自定义请求头。
+	if method == http.MethodGet && subPath == "/login/import" {
+		return okEnvelope(handleLoginBridgeImport(req))
 	}
 
 	switch {
