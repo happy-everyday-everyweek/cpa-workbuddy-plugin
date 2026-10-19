@@ -87,7 +87,8 @@ func managementRegistration() managementRegistrationResponse {
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Notion", Description: "Notion Provider 管理面板：Cookie 导入、额度刷新与探活。"},
-			{Path: "/login", Description: "宿主「添加账号」弹窗打开的登录引导页（浏览器 Cookie 导入桥接）。"},
+			{Path: "/login", Description: "宿主「添加账号」弹窗打开的登录引导页（可复制链接 + 控制台脚本）。"},
+			{Path: "/login/callback", Description: "登录脚本采集完成后的回调页（补填 token_v2 并提交）。"},
 			{Path: "/login/import", Description: "登录引导页的 Cookie 提交入口（免管理密钥，state 短时凭证）。"},
 		},
 	}
@@ -154,6 +155,11 @@ func handleManagement(raw []byte) ([]byte, error) {
 			state = strings.TrimSpace(urlQuery.Get("state"))
 		}
 		return okEnvelope(handleLoginBridge(state))
+	}
+
+	// 脚本采集完成后的回调页：fragment 里的 Cookie 由页面脚本读取后经 /login/import 提交。
+	if method == http.MethodGet && subPath == callbackPath {
+		return okEnvelope(handleLoginCallback(loginStateFromRequest(req)))
 	}
 
 	// 桥接页的提交入口：宿主把 resource 请求强制改写为 GET 且不转发请求体，

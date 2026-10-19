@@ -129,7 +129,7 @@ func TestManagementRegistrationDeclaresLoginResources(t *testing.T) {
 	for _, res := range reg.Resources {
 		found[res.Path] = true
 	}
-	for _, want := range []string{"/login", "/login/import"} {
+	for _, want := range []string{"/login", "/login/callback", "/login/import"} {
 		if !found[want] {
 			t.Fatalf("登录资源 %s 未注册，弹窗会打开 404 地址", want)
 		}
@@ -419,8 +419,8 @@ func TestLoginBridgeRejectsBadState(t *testing.T) {
 			t.Fatalf("错误页仍应是 200 以便浏览器渲染，实际 %d", resp.StatusCode)
 		}
 		body := string(resp.Body)
-		if strings.Contains(body, `id="cookie"`) {
-			t.Fatalf("state=%q 时不应渲染 Cookie 表单", state)
+		if strings.Contains(body, `id="authScript"`) {
+			t.Fatalf("state=%q 时不应渲染授权脚本", state)
 		}
 		if !strings.Contains(body, "无法继续") {
 			t.Fatalf("state=%q 时应展示错误说明：%s", state, body)
@@ -428,24 +428,173 @@ func TestLoginBridgeRejectsBadState(t *testing.T) {
 	}
 }
 
-// TestLoginBridgeRendersFormForValidState 校验有效 state 渲染完整导入表单。
+// TestLoginBridgeRendersScriptForValidState 校验有效 state 渲染可复制的脚本与链接。
+//
+// 这是本轮相对「粘贴 Cookie」形态的核心改动：用户要能直接复制一段脚本，
+// 在 Notion 页面 Console 执行后自动跳回回调页。
 // [参数] t: 测试上下文。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，桥接页正常路径回归。
-func TestLoginBridgeRendersFormForValidState(t *testing.T) {
+// 最近修改时间：2026-10-19；改动原因：新增，桥接页脚本形态回归。
+func TestLoginBridgeRendersScriptForValidState(t *testing.T) {
 	resetLoginSessions()
 	resp := startLoginForTest(t)
 
 	page := handleLoginBridge(resp.State)
 	body := string(page.Body)
-	if !strings.Contains(body, `id="cookie"`) || !strings.Contains(body, `id="submit"`) {
-		t.Fatalf("有效 state 应渲染导入表单：%s", body)
+	for _, want := range []string{`id="authScript"`, `id="copyScript"`, `id="notionURL"`, `id="copyURL"`, `id="openNotion"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("桥接页缺少 %s：%s", want, body)
+		}
 	}
-	if !strings.Contains(body, loginBridgeImportHeader) {
-		t.Fatal("提交脚本必须带自定义 Cookie 头，否则资源路由拿不到凭据")
+	if !strings.Contains(body, callbackPath) {
+		t.Fatal("脚本必须指向回调页，否则采集结果无处提交")
+	}
+	if !strings.Contains(body, callbackCookieParam) || !strings.Contains(body, callbackErrorParam) {
+		t.Fatal("脚本必须同时带回 Cookie 与错误原因")
+	}
+	if !strings.Contains(body, cpaOriginPlaceholder) {
+		t.Fatal("回调地址必须保留 origin 占位符，由桥接页在浏览器里替换")
 	}
 	if !strings.Contains(body, resp.State) {
-		t.Fatal("页面未携带 state，导入时会因缺少会话标识被拒")
+		t.Fatal("页面未携带 state，回调时会因缺少会话标识被拒")
+	}
+	// HttpOnly 是这次形态设计的前提：页面必须如实告知 token_v2 需手动补填。
+	if !strings.Contains(body, "HttpOnly") {
+		t.Fatal("页面必须说明 token_v2 是 HttpOnly、脚本读不到")
+	}
+}
+
+// TestLoginCallbackRendersTokenForm 校验回调页给出 token_v2 补填入口。
+//
+// token_v2 是 HttpOnly，脚本采集不到；回调页若不给补填表单，
+// 导入必然因「Cookie 缺少 token_v2」失败。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，回调页补填回归。
+func TestLoginCallbackRendersTokenForm(t *testing.T) {
+	resetLoginSessions()
+	resp := startLoginForTest(t)
+
+	page := handleLoginCallback(resp.State)
+	body := string(page.Body)
+	for _, want := range []string{`id="tokenv2"`, `id="cookie"`, `id="submit"`, callbackCookieParam} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("回调页缺少 %s：%s", want, body)
+		}
+	}
+	if !strings.Contains(body, loginBridgeImportHeader) {
+		t.Fatal("提交必须带自定义 Cookie 头，否则资源路由拿不到凭据")
+	}
+	// 断言调用点而不是函数定义：只留定义不调用，fragment 依然会留在地址栏。
+	if !strings.Contains(body, "clearHash();") {
+		t.Fatal("必须调用 clearHash 清掉 fragment，避免凭据留在浏览历史里")
+	}
+	if !strings.Contains(body, "history.replaceState") {
+		t.Fatal("clearHash 必须真的改写地址栏")
+	}
+	if !strings.Contains(body, `pairs.push("token_v2="+raw)`) {
+		t.Fatal("提交前必须把 token_v2 拼回 Cookie header")
+	}
+}
+
+// TestLoginCallbackRejectsBadState 校验回调页在 state 失效时不渲染补填表单。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，回调页鉴权回归。
+func TestLoginCallbackRejectsBadState(t *testing.T) {
+	resetLoginSessions()
+
+	for _, state := range []string{"", "not-a-real-state"} {
+		resp := handleLoginCallback(state)
+		body := string(resp.Body)
+		if strings.Contains(body, `id="tokenv2"`) {
+			t.Fatalf("state=%q 时不应渲染补填表单", state)
+		}
+		if !strings.Contains(body, "无法继续") {
+			t.Fatalf("state=%q 时应展示错误说明：%s", state, body)
+		}
+	}
+}
+
+// TestLoginCallbackExpiredState 校验过期会话的回调页同样拒绝。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，会话过期回归。
+func TestLoginCallbackExpiredState(t *testing.T) {
+	resetLoginSessions()
+	resp := startLoginForTest(t)
+
+	loginSessionsMu.Lock()
+	loginSessions[resp.State].startedAt = time.Now().Add(-2 * loginStateTTL)
+	loginSessionsMu.Unlock()
+
+	body := string(handleLoginCallback(resp.State).Body)
+	if strings.Contains(body, `id="tokenv2"`) {
+		t.Fatal("过期会话不应渲染补填表单")
+	}
+	if !strings.Contains(body, "已过期") {
+		t.Fatalf("过期会话应提示重新发起：%s", body)
+	}
+}
+
+// TestLoginImportFailureSurfacesInPoll 校验导入失败的原因会回显给宿主轮询。
+//
+// 只把错误回给浏览器不够：宿主的弹窗在轮询，用户往往只盯着弹窗。
+// 失败不写进会话时，弹窗会一直显示「等待中」，看起来像卡死。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失败原因回显回归。
+func TestLoginImportFailureSurfacesInPoll(t *testing.T) {
+	resetLoginSessions()
+	resp := startLoginForTest(t)
+
+	req := pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/v0/resource/plugins/notion-provider/login/import?state=" + resp.State,
+		Headers: http.Header{loginBridgeImportHeader: []string{"notion_user_id=u1-not-valid"}},
+	}
+	result := handleLoginBridgeImport(req)
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(result.Body, &payload); errUnmarshal != nil {
+		t.Fatalf("解析提交结果失败：%v", errUnmarshal)
+	}
+	if msg, _ := payload["error"].(string); msg == "" {
+		t.Fatalf("无效 Cookie 应当报错，实际：%s", string(result.Body))
+	}
+
+	poll := pollLoginForTest(t, resp.State)
+	if poll.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("失败后仍应是 pending（等待重试），实际 %s", poll.Status)
+	}
+	if !strings.Contains(poll.Message, "上次尝试失败") {
+		t.Fatalf("轮询应回显失败原因，实际：%s", poll.Message)
+	}
+}
+
+// TestBuildAuthScriptEscapesState 校验脚本里的 state 不会破坏 JS 字面量。
+//
+// state 由服务端生成（十六进制），但这个转义是防止将来换熵源后
+// 引号或换行把脚本截断的最后一道防线。
+// [参数] t: 测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，脚本转义回归。
+func TestBuildAuthScriptEscapesState(t *testing.T) {
+	script := buildAuthScript(`a'b\c`)
+	if strings.Contains(script, `a'b\c`) {
+		t.Fatalf("state 未转义：%s", script)
+	}
+	if !strings.Contains(script, `a\'b\\c`) {
+		t.Fatalf("state 转义结果不符合预期：%s", script)
+	}
+	if !strings.Contains(script, cpaOriginPlaceholder+"/v0/resource/plugins/"+providerName+callbackPath) {
+		t.Fatalf("脚本回调地址拼接错误：%s", script)
+	}
+	// 脚本必须在 Notion 页面内先校验登录态，否则带着空 Cookie 跳回去只会得到一条难懂的报错。
+	if !strings.Contains(script, "getSpaces") || !strings.Contains(script, "credentials:'include'") {
+		t.Fatalf("脚本应带 Cookie 校验登录态：%s", script)
+	}
+	if !strings.Contains(script, "document.cookie") {
+		t.Fatalf("脚本应采集可读 Cookie：%s", script)
 	}
 }
 

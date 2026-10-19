@@ -36,6 +36,25 @@ const loginStateTTL = 15 * time.Minute
 // 用自定义头而不是 Cookie 头，避免与浏览器自身的 Cookie 语义混淆。
 const loginBridgeImportHeader = "X-Notion-Cookie"
 
+// callbackPath 是脚本采集完成后跳回的 resource 路径。
+const callbackPath = "/login/callback"
+
+// 回调页从 URL fragment 读取的键。
+//
+// 走 fragment 而不是 query：fragment 不会发给服务端，也不进访问日志；
+// 脚本采集到的可读 Cookie 只能先落在这里，再由页面经同源请求头回传。
+const (
+	callbackCookieParam = "cookie"
+	callbackErrorParam  = "err"
+)
+
+// cpaOriginPlaceholder 是脚本里等待替换成插件所在域 origin 的占位符。
+//
+// 不能直接在服务端拼绝对地址：插件运行在容器内，看不到用户实际访问的域名
+// （反向代理 / 端口映射都会改写）。桥接页在浏览器里加载，location.origin
+// 就是用户真实可用的地址，替换后才不会把 Cookie 发到 notion.com。
+const cpaOriginPlaceholder = "__CPA_ORIGIN__"
+
 // loginSession 是一次桥接会话。
 type loginSession struct {
 	// startedAt 是会话创建时间，用于判定会话是否过期。
@@ -46,6 +65,8 @@ type loginSession struct {
 	// 插件在正常请求后会把滚动 Cookie 写回账号文件，那也会刷新 UpdatedAt，
 	// 会让「用户还没粘贴」的会话被误判成登录完成。
 	importedAuthIDs []string
+	// lastError 记录最近一次失败的说明，供面板与轮询反馈。
+	lastError string
 }
 
 var (
@@ -143,8 +164,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		ok = false
 	}
 	var importedAuthIDs []string
+	var lastError string
 	if ok {
 		importedAuthIDs = append(importedAuthIDs, session.importedAuthIDs...)
+		lastError = session.lastError
 	}
 	loginSessionsMu.Unlock()
 
@@ -155,9 +178,13 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		})
 	}
 	if len(importedAuthIDs) == 0 {
+		msg := "等待在引导页执行授权脚本"
+		if lastError != "" {
+			msg = "上次尝试失败：" + lastError
+		}
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待在引导页中粘贴 Cookie",
+			Message: msg,
 		})
 	}
 
@@ -300,11 +327,14 @@ func handleLoginBridgeImport(req pluginapi.ManagementRequest) pluginapi.Manageme
 
 	cookie := strings.TrimSpace(req.Headers.Get(loginBridgeImportHeader))
 	if cookie == "" {
+		markLoginFailed(state, "未收到 Cookie")
 		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "cookie 不能为空"})
 	}
 
 	accounts, errSave := saveCredentials(cookie, "", "")
 	if errSave != nil {
+		// 失败原因同时记进会话：宿主轮询能显示具体原因，而不是永远「等待中」。
+		markLoginFailed(state, errSave.Error())
 		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": errSave.Error()})
 	}
 	authIDs := make([]string, 0, len(accounts))
@@ -365,7 +395,7 @@ func loginBridgePage(state, detail string) pluginapi.ManagementResponse {
 		b.WriteString("</div></body></html>")
 		return htmlManagementResponse(b.String())
 	}
-	writeBridgeBody(&b)
+	writeBridgeBody(&b, state)
 	writeBridgeScript(&b)
 	b.WriteString("</div></body></html>")
 	return htmlManagementResponse(b.String())
@@ -395,57 +425,254 @@ func writeBridgeHead(b *strings.Builder, state string) {
 	b.WriteString("</style></head><body data-provider=\"" + htmlEscape(providerName) + "\" data-state=\"" + htmlEscape(state) + "\"><div class=\"card\">")
 }
 
-// writeBridgeBody 写出引导文案与表单控件。
-// [参数] b: 输出缓冲。
+// writeBridgeBody 写出引导文案、可复制链接与一次性授权脚本。
+//
+// 与 coze 桥接页同一形态：页面给出「可复制的链接」和「可在 Notion 页面
+// Console 直接粘贴执行的脚本」，脚本采集完成后自动跳回插件回调页。
+//
+// 与 coze 的差异（Notion 特有约束）：token_v2 是 HttpOnly，页面 JS 读不到，
+// 因此脚本无法像 coze 那样从响应头直接取到完整凭据，只能采集全部可读 Cookie
+// 并提示用户补 token_v2 一项。
+// [参数] b: 输出缓冲；state: 登录会话标识。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，桥接页正文。
-func writeBridgeBody(b *strings.Builder) {
-	b.WriteString("<h1>绑定 Notion 账号</h1>")
-	b.WriteString("<p>Notion 没有开放给第三方的一键授权：AI 登录态是浏览器里的 HttpOnly Cookie，只能由你从网页端导出。请按下面三步操作。</p>")
+// 最近修改时间：2026-10-19；改动原因：改为可复制链接 + 控制台脚本形态。
+func writeBridgeBody(b *strings.Builder, state string) {
+	notionURL := "https://www.notion.so/ai"
+	script := buildAuthScript(state)
+	b.WriteString("<h1>授权 Notion 账号</h1>")
+	b.WriteString("<p>Notion 没有开放给第三方的一键授权：AI 登录态是浏览器里的 HttpOnly Cookie（<code>token_v2</code>），只发给 <code>notion.com</code>，插件无法作为 OAuth 回调接收方。请按下面三步操作，全程约 30 秒。</p>")
 	b.WriteString("<ol>")
-	b.WriteString("<li>在浏览器打开并登录 <code>https://www.notion.so/ai</code></li>")
-	b.WriteString("<li>开发者工具 → Network → 任意 <code>api/v3</code> 请求 → Request Headers → 复制完整 <code>Cookie</code></li>")
-	b.WriteString("<li>粘贴到下方文本框并点「导入并完成」</li>")
+	b.WriteString("<li>点击下方按钮打开 <code>" + notionURL + "</code>，确认已登录目标账号。</li>")
+	b.WriteString("<li>在 Notion 页面按 <code>F12</code> 打开开发者工具 → 切到 <code>Console</code> 标签。</li>")
+	b.WriteString("<li>复制下方脚本粘贴到 Console 回车执行；页面会跳回本插件并自动完成授权。</li>")
 	b.WriteString("</ol>")
-	b.WriteString("<textarea id=\"cookie\" placeholder=\"token_v2=...; notion_user_id=...; notion_browser_id=...\"></textarea>")
-	b.WriteString("<button id=\"submit\">导入并完成</button>")
-	b.WriteString("<div id=\"result\"></div>")
-	b.WriteString("<div class=\"note\">导入会先校验登录态与工作空间，成功才落盘。每个工作空间会拆成独立账号（订阅 / 免费额度分开路由）。</div>")
-	b.WriteString("<div class=\"note\">Notion 把 AI 权限绑定到登录 IP，请在本机导出 Cookie；导入成功后本页会自动提示。</div>")
+	b.WriteString("<button id=\"openNotion\" type=\"button\">打开 Notion</button>")
+	b.WriteString("<p style=\"margin-top:18px\">Notion 页面地址（可复制）：</p>")
+	b.WriteString("<pre id=\"notionURL\">" + htmlEscape(notionURL) + "</pre>")
+	b.WriteString("<button id=\"copyURL\" type=\"button\">复制链接</button>")
+	b.WriteString("<p style=\"margin-top:18px\">一次性授权脚本（15 分钟内有效）：</p>")
+	b.WriteString("<pre id=\"authScript\">" + htmlEscape(script) + "</pre>")
+	b.WriteString("<button id=\"copyScript\" type=\"button\">复制脚本</button>")
+	b.WriteString("<div id=\"copyHint\"></div>")
+	b.WriteString("<div class=\"note\">脚本只做一件事：在 Notion 页面内采集浏览器可读的登录 Cookie，然后交给本插件。它不读取、也不上传你的 <code>token_v2</code>（该值被浏览器设为 HttpOnly，任何页面脚本都读不到）。</div>")
+	b.WriteString("<div class=\"note\">回调页会提示补填 <code>token_v2</code>：从 Notion 的 <code>F12 → Application → Cookies → notion.com</code> 复制该项即可。这是浏览器安全策略决定的唯一手动步骤。</div>")
 }
 
-// writeBridgeScript 写出桥接页脚本。
+// writeBridgeScript 写出桥接页自身的交互脚本（复制按钮与打开 Notion）。
 //
-// 脚本保持纯静态：provider 与 state 从 body 的 data 属性读取，避免把 Go 变量
-// 拼进 JS 字面量。提交走 resource 路由（免管理密钥），Cookie 放自定义请求头，
-// 因为宿主把 resource 请求统一改写为 GET 且不转发请求体。
+// 脚本保持纯静态：provider 与 state 从 body 的 data 属性读取，避免把 Go
+// 变量拼进 JS 字面量。
 // [参数] b: 输出缓冲。
 // [返回] 无。
-// 最近修改时间：2026-10-19；改动原因：新增，桥接页提交脚本。
+// 最近修改时间：2026-10-19；改动原因：改为复制链接 / 复制脚本交互。
 func writeBridgeScript(b *strings.Builder) {
+	b.WriteString("<script>")
+	// 脚本在 Notion 页面执行，那里的 location.origin 是 notion.com；回调地址
+	// 必须指向本插件所在域，因此占位符在桥接页（即 CPA 域）加载时替换。
+	b.WriteString("var scriptEl=document.getElementById(\"authScript\");")
+	b.WriteString("if(scriptEl){scriptEl.textContent=scriptEl.textContent.split(\"" + cpaOriginPlaceholder + "\").join(location.origin)}")
+	b.WriteString("function bindCopy(btnId,preId,okText){")
+	b.WriteString("  var btn=document.getElementById(btnId);if(!btn){return}")
+	b.WriteString("  btn.addEventListener(\"click\",function(){")
+	b.WriteString("    var text=(document.getElementById(preId).textContent||\"\").trim();")
+	b.WriteString("    var hint=document.getElementById(\"copyHint\");")
+	b.WriteString("    var done=function(){hint.className=\"ok\";hint.textContent=okText};")
+	b.WriteString("    var fail=function(){hint.className=\"err\";hint.textContent=\"自动复制失败，请手动选中文本复制。\"};")
+	b.WriteString("    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fail)}else{fail()}")
+	b.WriteString("  })")
+	b.WriteString("}")
+	b.WriteString("bindCopy(\"copyScript\",\"authScript\",\"已复制，请到 Notion 页面的 Console 粘贴执行。\");")
+	b.WriteString("bindCopy(\"copyURL\",\"notionURL\",\"已复制，请在已登录的浏览器标签页打开。\");")
+	b.WriteString("var openBtn=document.getElementById(\"openNotion\");")
+	b.WriteString("if(openBtn){openBtn.addEventListener(\"click\",function(){window.open(\"https://www.notion.so/ai\",\"_blank\",\"noopener\")})}")
+	b.WriteString("</script>")
+}
+
+// buildAuthScript 生成一次性授权脚本。
+//
+// 脚本在 Notion 页面上下文执行，因此：同源 fetch 天然带上登录 Cookie，
+// 用它校验登录态有效；同时把浏览器可读的 Cookie 拼成 header 交给回调页。
+// token_v2 读不到（HttpOnly），回调页会提示补填。
+// [参数] state: 登录会话标识。
+// [返回] 可粘贴执行的 JS 源码（含待替换的 origin 占位符）。
+// 最近修改时间：2026-10-19；改动原因：新增，从粘贴 Cookie 改为脚本采集。
+func buildAuthScript(state string) string {
+	callback := "/v0/resource/plugins/" + providerName + callbackPath
+	var b strings.Builder
+	b.WriteString("(async()=>{\n")
+	b.WriteString("  const cb='")
+	b.WriteString(cpaOriginPlaceholder)
+	b.WriteString(callback)
+	b.WriteString("?state=")
+	b.WriteString(jsStringEscape(state))
+	b.WriteString("';\n")
+	b.WriteString("  const fail=(m)=>{location.href=cb+'#" + callbackErrorParam + "='+encodeURIComponent(m)};\n")
+	// 先确认登录态：未登录时上游返回 401，脚本直接报错而不是带着空 Cookie 跳回去。
+	b.WriteString("  try{\n")
+	b.WriteString("    const r=await fetch('/api/v3/getSpaces',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:'{}'});\n")
+	b.WriteString("    if(!r.ok){fail('当前页面未登录 Notion（HTTP '+r.status+'），请先登录再执行脚本');return;}\n")
+	b.WriteString("  }catch(e){fail('校验登录态失败：'+(e&&e.message?e.message:String(e)));return;}\n")
+	// 只采集可读 Cookie；token_v2 由回调页补填。
+	b.WriteString("  const kv=[];\n")
+	b.WriteString("  document.cookie.split(';').forEach(p=>{const s=p.trim();if(s.indexOf('=')>0){kv.push(s)}});\n")
+	b.WriteString("  if(!kv.some(s=>s.indexOf('notion_user_id=')===0)){fail('未取到 notion_user_id，请确认已在 Notion 登录');return;}\n")
+	b.WriteString("  location.href=cb+'#" + callbackCookieParam + "='+encodeURIComponent(kv.join('; '));\n")
+	b.WriteString("})()")
+	return b.String()
+}
+
+// jsStringEscape 转义要嵌入单引号 JS 字符串的文本。
+// [参数] s: 原始文本。
+// [返回] 转义后的文本。
+// 最近修改时间：2026-10-19；改动原因：新增，避免 state 破坏脚本字面量。
+func jsStringEscape(s string) string {
+	r := strings.NewReplacer("\\", "\\\\", "'", "\\'", "\n", "\\n", "\r", "\\r", "<", "\\x3c")
+	return r.Replace(s)
+}
+
+// handleLoginCallback 渲染脚本跳回的接收页。
+//
+// 脚本把采集到的可读 Cookie 放在 URL fragment 里（#cookie=...），服务端
+// 看不到 fragment，因此首次请求只返回接收页；页面脚本把 fragment 解析出来、
+// 提示用户补填 token_v2，再经同源请求头提交到 /login/import。
+//
+// 为什么不直接由脚本提交：token_v2 是 HttpOnly，脚本读不到；必须给用户一个
+// 可见的补填入口，否则导入必然因「缺少 token_v2」失败。
+// [参数] state: 登录会话标识。
+// [返回] 管理响应（HTML）。
+// 最近修改时间：2026-10-19；改动原因：新增，脚本回调落点。
+func handleLoginCallback(state string) pluginapi.ManagementResponse {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return loginCallbackShell("", "缺少 state 参数，请回到管理页重新发起授权。")
+	}
+	if !validLoginState(state) {
+		return loginCallbackShell("", "登录会话不存在或已过期（15 分钟有效）。请回到管理页重新发起。")
+	}
+	return loginCallbackShell(state, "")
+}
+
+// loginCallbackShell 渲染脚本回调页。
+//
+// detail 非空时只展示错误；否则读取 fragment 中的 Cookie 并给出补填表单。
+// [参数] state: 登录会话标识；detail: 错误说明。
+// [返回] 管理响应（HTML）。
+// 最近修改时间：2026-10-19；改动原因：新增，fragment 接收与补填页。
+func loginCallbackShell(state, detail string) pluginapi.ManagementResponse {
+	var b strings.Builder
+	writeBridgeHead(&b, state)
+	if detail != "" {
+		b.WriteString("<h1>无法继续</h1><div class=\"err\">" + htmlEscape(detail) + "</div>")
+		b.WriteString("<p class=\"note\">请回到管理页重新发起授权。</p></div></body></html>")
+		return htmlManagementResponse(b.String())
+	}
+	writeCallbackBody(&b)
+	writeCallbackScript(&b)
+	b.WriteString("</div></body></html>")
+	return htmlManagementResponse(b.String())
+}
+
+// writeCallbackBody 写出补填表单。
+// [参数] b: 输出缓冲。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，回调页正文。
+func writeCallbackBody(b *strings.Builder) {
+	b.WriteString("<h1>完成 Notion 授权</h1>")
+	b.WriteString("<p>已从 Notion 页面采集到可读登录 Cookie。还剩一步：<code>token_v2</code> 被浏览器设为 HttpOnly，任何页面脚本都读不到，需要你手动补上。</p>")
+	b.WriteString("<ol>")
+	b.WriteString("<li>回到 Notion 页面，<code>F12</code> → <code>Application</code>（Chrome）/ <code>Storage</code>（Firefox）。</li>")
+	b.WriteString("<li>左侧 <code>Cookies</code> → <code>https://www.notion.so</code>（或 <code>app.notion.com</code>）。</li>")
+	b.WriteString("<li>找到 <code>token_v2</code>，双击 Value 全选复制，粘贴到下面第二个框。</li>")
+	b.WriteString("</ol>")
+	b.WriteString("<p style=\"margin-top:18px\">已采集的 Cookie（可编辑）：</p>")
+	b.WriteString("<textarea id=\"cookie\" placeholder=\"notion_user_id=...; notion_browser_id=...\"></textarea>")
+	b.WriteString("<p style=\"margin-top:12px\">token_v2 的值：</p>")
+	b.WriteString("<textarea id=\"tokenv2\" style=\"min-height:64px\" placeholder=\"粘贴 token_v2 的值（不含 token_v2= 前缀也可以）\"></textarea>")
+	b.WriteString("<button id=\"submit\" type=\"button\">完成授权</button>")
+	b.WriteString("<div id=\"result\"></div>")
+	b.WriteString("<div class=\"note\">导入会先校验登录态与工作空间，成功才落盘。每个工作空间会拆成独立账号（订阅 / 免费额度分开路由）。</div>")
+}
+
+// writeCallbackScript 写出回调页脚本：解析 fragment、拼接 Cookie、提交导入。
+//
+// 成功后用 history.replaceState 清掉 fragment，避免凭据留在浏览历史里。
+// [参数] b: 输出缓冲。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，fragment 解析与提交。
+func writeCallbackScript(b *strings.Builder) {
 	b.WriteString("<script>")
 	b.WriteString("var PROVIDER=document.body.getAttribute(\"data-provider\")||\"\";")
 	b.WriteString("var STATE=document.body.getAttribute(\"data-state\")||\"\";")
 	b.WriteString("var IMPORT=\"/v0/resource/plugins/\"+PROVIDER+\"/login/import?state=\"+encodeURIComponent(STATE);")
-	b.WriteString("function show(text,cls){var r=document.getElementById(\"result\");r.className=cls;r.textContent=text;}")
+	b.WriteString("var p=new URLSearchParams(location.hash.replace(/^#/,\"\"));")
+	b.WriteString("var collected=p.get(\"" + callbackCookieParam + "\")||\"\";")
+	b.WriteString("var upstreamErr=p.get(\"" + callbackErrorParam + "\")||\"\";")
+	b.WriteString("var box=document.getElementById(\"result\");")
+	b.WriteString("function show(text,cls){box.className=cls;box.textContent=text;}")
+	b.WriteString("function clearHash(){try{history.replaceState(null,\"\",location.pathname+location.search)}catch(e){}}")
+	b.WriteString("clearHash();")
+	b.WriteString("var cookieEl=document.getElementById(\"cookie\");")
+	b.WriteString("var tokenEl=document.getElementById(\"tokenv2\");")
+	b.WriteString("if(upstreamErr){show(\"Notion 侧未完成授权：\"+upstreamErr,\"err\");}")
+	b.WriteString("cookieEl.value=collected;")
+	b.WriteString("function splitPairs(text){")
+	b.WriteString("  var out=[];String(text||\"\").split(\";\").forEach(function(p){var s=p.trim();if(s&&s.indexOf(\"=\")>0){out.push(s)}});return out")
+	b.WriteString("}")
 	b.WriteString("document.getElementById(\"submit\").addEventListener(\"click\",function(){")
-	b.WriteString("  var btn=this;var cookie=document.getElementById(\"cookie\").value.trim();")
-	b.WriteString("  if(!cookie){show(\"请先粘贴 Cookie\",\"err\");return}")
+	b.WriteString("  var btn=this;var pairs=splitPairs(cookieEl.value);")
+	b.WriteString("  var raw=(tokenEl.value||\"\").trim();")
+	b.WriteString("  if(raw.indexOf(\"token_v2=\")===0){raw=raw.slice(\"token_v2=\".length).trim()}")
+	b.WriteString("  if(!raw){show(\"请先补填 token_v2 的值\",\"err\");return}")
+	b.WriteString("  pairs=pairs.filter(function(s){return s.indexOf(\"token_v2=\")!==0});")
+	b.WriteString("  pairs.push(\"token_v2=\"+raw);")
+	b.WriteString("  if(!pairs.some(function(s){return s.indexOf(\"notion_user_id=\")===0})){show(\"缺少 notion_user_id，请回到 Notion 页面重新执行脚本\",\"err\");return}")
 	b.WriteString("  btn.disabled=true;show(\"正在校验登录态与工作空间…\",\"\");")
-	b.WriteString("  fetch(IMPORT,{method:\"GET\",cache:\"no-store\",headers:{\"X-Notion-Cookie\":cookie}})")
-	b.WriteString("    .then(function(res){return res.json().then(function(d){return {status:res.status,data:d}}).catch(function(){return {status:res.status,data:{error:\"响应解析失败\"}}})})")
-	b.WriteString("    .then(function(r){")
-	b.WriteString("      if(r.data&&r.data.ok){")
-	b.WriteString("        var labels=(r.data.labels||[]).join(\"、\");")
-	b.WriteString("        show(\"导入成功\"+(labels?\"：\"+labels:\"\")+\"，正在通知管理页…\",\"ok\");")
-	b.WriteString("        document.getElementById(\"submit\").textContent=\"已导入\";return")
-	b.WriteString("      }")
-	b.WriteString("      show(\"导入失败：\"+((r.data&&r.data.error)||\"未知错误\"),\"err\");")
-	b.WriteString("    })")
-	b.WriteString("    .catch(function(e){show(\"导入失败：\"+(e&&e.message?e.message:String(e)),\"err\")})")
-	b.WriteString("    .then(function(){btn.disabled=false})")
+	b.WriteString("  fetch(IMPORT,{method:\"GET\",cache:\"no-store\",headers:{\"" + loginBridgeImportHeader + "\":pairs.join(\"; \")}})")
+	b.WriteString("    .then(function(res){return res.json().then(function(d){return d}).catch(function(){return {error:\"响应解析失败\"}})}).then(function(d){")
+	b.WriteString("      if(d&&d.ok){var labels=(d.labels||[]).join(\"、\");btn.textContent=\"已授权\";show(\"授权成功\"+(labels?\"：\"+labels:\"\")+\"，正在通知管理页…\",\"ok\");return}")
+	b.WriteString("      show(\"授权失败：\"+((d&&d.error)||\"未知错误\"),\"err\");")
+	b.WriteString("    }).catch(function(e){show(\"授权失败：\"+(e&&e.message?e.message:String(e)),\"err\")})")
+	b.WriteString("    .then(function(){btn.disabled=false});")
 	b.WriteString("});")
 	b.WriteString("</script>")
+}
+
+// markLoginFailed 记录一次失败说明，供轮询回显。
+// [参数] state: 登录会话标识；reason: 失败原因。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，失败原因可见化。
+func markLoginFailed(state, reason string) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return
+	}
+	loginSessionsMu.Lock()
+	defer loginSessionsMu.Unlock()
+	if session, ok := loginSessions[state]; ok {
+		session.lastError = strings.TrimSpace(reason)
+	}
+}
+
+// validLoginState 判断登录会话是否仍然有效。
+// [参数] state: 登录会话标识。
+// [返回] 有效时返回 true。
+// 最近修改时间：2026-10-19；改动原因：新增，回调页与会话登记的共用校验。
+func validLoginState(state string) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	loginSessionsMu.Lock()
+	defer loginSessionsMu.Unlock()
+	session, ok := loginSessions[state]
+	if !ok || session == nil {
+		return false
+	}
+	if time.Since(session.startedAt) > loginStateTTL {
+		delete(loginSessions, state)
+		return false
+	}
+	return true
 }
 
 // htmlManagementResponse 把 HTML 文本包装成管理响应。
