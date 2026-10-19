@@ -32,6 +32,19 @@ import (
 // ok=false means no alternate account was usable; the caller should stop
 // retrying and propagate the last upstream error.
 func pickNextAuth(currentAuthID string) (nextAuthID string, nextSA *storedAuth, ok bool) {
+	return pickNextAuthForModel(currentAuthID, "")
+}
+
+// pickNextAuthForModel 在跳过冷却账号时带上模型维度。
+//
+// 传空模型时退化为纯账号维度判定，与历史 pickNextAuth 完全一致；传了模型时，
+// 只在该模型冷却中的账号同样会被跳过——否则同请求换号仍会选到一个「这个模型
+// 刚失败」的账号，换号等于没换。
+//
+// [参数] currentAuthID：当前失败账号；model：已归一化的上游模型名，可为空。
+// [返回] 下一个可用账号标识、凭据与是否找到。
+// 最近修改时间：2026-10-19 00:40:00；改动原因：新增账号×模型双层换号过滤。
+func pickNextAuthForModel(currentAuthID, model string) (nextAuthID string, nextSA *storedAuth, ok bool) {
 	currentAuthID = strings.TrimSpace(currentAuthID)
 	files, err := hostAuthList()
 	if err != nil || len(files) == 0 {
@@ -57,7 +70,7 @@ func pickNextAuth(currentAuthID string) (nextAuthID string, nextSA *storedAuth, 
 		if f.Disabled {
 			continue
 		}
-		if isAccountCoolingDown(id) {
+		if isAuthModelCoolingDown(id, model) {
 			continue
 		}
 		// 「测试」accounts are unusable by product definition — they must not

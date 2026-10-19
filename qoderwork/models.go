@@ -237,10 +237,35 @@ func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
 	return nil, false
 }
 
+// callModelsAPIFn 是 callModelsAPI 的可替换入口（同 sendActivePingQoderFn 惯例），
+// 供负缓存行为单测注入假上游，避免真实网络与宿主 RPC 依赖。
+var callModelsAPIFn = callModelsAPI
+
+// fetchDynamicModelsFallbackFn 是存储入口回退到全量扫描的调用点接缝。
+// 单测据此断言「回退发生在开启负缓存窗口之前」——顺序颠倒会让窗口
+// 立刻拦住回退本身，使另一账号本可成功的扫描永远走不到。
+var fetchDynamicModelsFallbackFn = fetchDynamicModels
+
+// inDynamicModelsFailWindow 判断当前是否处于模型发现负缓存窗口内。
+// [返回] true 表示窗口内，调用方应直接放弃本次逐账号扫描。
+func inDynamicModelsFailWindow() bool {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return !dynamicModelsCache.failedAt.IsZero() && time.Since(dynamicModelsCache.failedAt) < dynamicModelsFailCacheTTL
+}
+
+// markDynamicModelsFailed 记录一次「全账号扫描失败」，开启负缓存窗口。
+func markDynamicModelsFailed() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.failedAt = time.Now()
+	dynamicModelsCache.Unlock()
+}
+
 func storeDynamicModels(models []pluginapi.ModelInfo) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.models = models
 	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.failedAt = time.Time{} // 成功即清除负缓存窗口
 	dynamicModelsCache.Unlock()
 }
 
@@ -251,10 +276,16 @@ func storeDynamicModels(models []pluginapi.ModelInfo) {
 // 调用方无法区分"上游真的只有这些模型"与"上游调用失败"。
 // [参数] 无
 // [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-09-12（取消静默回退 wbModels，改由 resolveModels 统一兜底）
+// 最近修改时间 2026-10-19 13:10:00；改动原因：新增失败负缓存窗口拦截，切断 N+1 重扫风暴
 func fetchDynamicModels() []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
 		return models
+	}
+	// 负缓存窗口内直接放弃逐账号重扫：宿主每次 auth 重写都会触发
+	// model.for_auth，若失败不留窗口，N 账号 × 每事件一次全扫会放大成
+	// N+1 请求风暴（生产 OOM 主因，见 BUG-QODER-MODELS-SIGNATURE-INVALID-20261012）。
+	if inDynamicModelsFailWindow() {
+		return nil
 	}
 	files, err := hostAuthListFiles()
 	if err != nil || len(files) == 0 {
@@ -265,10 +296,12 @@ func fetchDynamicModels() []pluginapi.ModelInfo {
 	// would wrongly include workbuddy-*.json auths here and cause us to call
 	// the qoderwork models API with a workbuddy token.)
 	prefix := authFilePrefix
+	scanned := 0
 	for _, f := range files {
 		if !strings.HasPrefix(strings.ToLower(f.Name), prefix) {
 			continue
 		}
+		scanned++
 		raw, err := hostAuthGetByIndex(f.AuthIndex)
 		if err != nil {
 			continue
@@ -277,11 +310,14 @@ func fetchDynamicModels() []pluginapi.ModelInfo {
 		if err != nil || sa == nil {
 			continue
 		}
-		dyn, err := callModelsAPI(sa)
+		dyn, err := callModelsAPIFn(sa)
 		if err == nil && len(dyn) > 0 {
 			storeDynamicModels(dyn)
 			return dyn
 		}
+	}
+	if scanned > 0 {
+		markDynamicModelsFailed()
 	}
 	return nil
 }
@@ -290,34 +326,50 @@ func fetchDynamicModels() []pluginapi.ModelInfo {
 // 失败时再回退到已注册凭据扫描。**不**兜底配置与静态列表。
 // [参数] storageJSON：宿主传入的账号凭据 JSON
 // [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-09-12（取消配置短路与静态兜底，交给 resolveModels 判定）
+// 最近修改时间 2026-10-19 13:10:00；改动原因：新增失败负缓存窗口拦截与失败标记
 func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
 		return models
 	}
-	sa, err := parseStored(storageJSON)
-	if err == nil && sa != nil {
-		if dyn, dynErr := callModelsAPI(sa); dynErr == nil && len(dyn) > 0 {
-			storeDynamicModels(dyn)
-			return dyn
-		}
+	// 负缓存窗口内直接返回 nil，让上层走 resolveModels 静态兜底。
+	if inDynamicModelsFailWindow() {
+		return nil
 	}
-	return fetchDynamicModels()
+	sa, err := parseStored(storageJSON)
+	if err != nil || sa == nil {
+		return fetchDynamicModelsFallbackFn()
+	}
+	dyn, dynErr := callModelsAPIFn(sa)
+	if dynErr == nil && len(dyn) > 0 {
+		storeDynamicModels(dyn)
+		return dyn
+	}
+	// 本账号被拒后先回退全量扫描，回退必须在开窗之前：窗口一旦置位，
+	// 全量扫描入口立即返回 nil，本函数声明的「回退到已注册凭据扫描」
+	// 就变成死路径（另一账号本可成功）。
+	if dyn := fetchDynamicModelsFallbackFn(); len(dyn) > 0 {
+		return dyn
+	}
+	// 回退也拿不到结果才开窗：本账号确实打过上游，属真实失败而非
+	// 「本地没账号」，可以安全进入负缓存。
+	markDynamicModelsFailed()
+	return nil
 }
 
-// fetchDynamicModels calls the QoderWork API to get the latest model list.
-// Falls back to the hardcoded list on any error.
-// callModelsAPI GETs /algo/api/v2/model/list from the QoderWork gateway
-// with COSY signing (same as inference). Returns plain JSON (not QoderEncoding).
-// Falls back to wbModels() on any error.
-func callModelsAPI(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	// model/list needs no body but COSY still requires a body string for signing.
-	// An empty JSON object works (verified in reference_impl.py).
+// newModelsAPIRequest 构造一次 COSY 签名的模型清单 GET 请求。
+//
+// model/list 语义上无入参，但 COSY 签名覆盖 body，且服务端会校验
+// 「签名声明的 body == 实际收到的 body」：裸 GET（body=nil）恒被判
+// Signature invalid（403 code 101，生产累计 5449 条，见
+// BUG-QODER-MODELS-SIGNATURE-INVALID-20261012）。参照可正常工作的
+// qoder2api-hub read_dynamic_models，必须把编码后的 "{}" 真作为 GET
+// 请求体发出，与签名使用同一字符串。
+// [参数] ctx：请求上下文；sa：签名与鉴权所用账号；rawURL：模型清单端点。
+// [返回] 已附带 COSY 头的请求；签名构建失败时返回错误。
+// 最近修改时间：2026-10-19 12:30:00；改动原因：从 callModelsAPI 抽出，便于断言签名 body 与实际 body 一致。
+func newModelsAPIRequest(ctx context.Context, sa *storedAuth, rawURL string) (*http.Request, error) {
 	encodedBody := qoderEncode([]byte("{}"))
-	rawURL := endpointModels // includes ?Encode=1
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, strings.NewReader(encodedBody))
 	if err != nil {
 		return nil, err
 	}
@@ -327,6 +379,22 @@ func callModelsAPI(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", clientUA)
+	return req, nil
+}
+
+// callModelsAPI GETs /algo/api/v2/model/list from the QoderWork gateway
+// with COSY signing and parses the plain-JSON chat scene into ModelInfo.
+// 请求构造（含签名）见 newModelsAPIRequest。
+// [参数] sa：用于签名与鉴权的账号凭据
+// [返回] 动态模型列表；请求或解析失败时返回错误，由调用方按优先级链回退配置 / 静态默认。
+// 最近修改时间：2026-10-19 12:30:00；改动原因：GET 真携带签名所用 body，修复 Signature invalid。
+func callModelsAPI(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := newModelsAPIRequest(ctx, sa, endpointModels)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := hostHTTPDo(req)
 	if err != nil {
 		return nil, err

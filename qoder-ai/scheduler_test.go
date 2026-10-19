@@ -75,6 +75,10 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 	}
 }
 
+// TestSchedulerPick_PrefersLowCreditOverHighCredit guards the safety-floor
+// exclusion: an account below minRoutableCredits is hard-excluded, so the
+// remaining healthy account is routed. (The test name predates the
+// low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
 func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 	resetActiveAuth(t)
 	accountCache.Store("qai-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 10, TotalSize: 10}})
@@ -272,6 +276,10 @@ func TestEnsureDefaultActiveAuth(t *testing.T) {
 	}
 }
 
+// TestEnsureDefaultActiveAuth_PrefersLowCredit guards the safety-floor
+// exclusion: the below-floor low-credit account is skipped, so the healthy
+// high-credit account is selected. (The test name predates the
+// low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
 func TestEnsureDefaultActiveAuth_PrefersLowCredit(t *testing.T) {
 	resetActiveAuth(t)
 	storeCredits(t, "a-high", 500, 0, 500)

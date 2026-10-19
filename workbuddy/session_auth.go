@@ -171,7 +171,7 @@ func headerSessionPrefix(header string) string {
 //     disabled/exhausted/cooling-down/测试失败 is re-assigned;
 //   - new assignments prefer accounts with no live bindings, then round-robin
 //     across all usable accounts (the candidate slice is already ordered
-//     LOW-CREDIT-FIRST by handleSchedulerPick);
+//     HIGH-CREDIT-FIRST — healthiest first — by handleSchedulerPick);
 //   - when every account is unavailable, "" is returned so the scheduler
 //     defers to the host's built-in scheduler (cross-provider failover); the
 //     binding is kept for sticky recovery.

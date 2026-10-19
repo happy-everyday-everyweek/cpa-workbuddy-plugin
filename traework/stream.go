@@ -884,7 +884,7 @@ func pumpTraeStream(r io.Reader, ctx traeStreamPumpContext) {
 	if result.Err != nil {
 		log.Printf("[traework] stream pump error: request_id=%s stream_id=%s model=%s status=%d err=%s elapsed_ms=%d",
 			requestID, ctx.StreamID, ctx.Model, ctx.StatusCode, truncateRedacted(result.Err.Error(), 200), time.Since(started).Milliseconds())
-		reconcileAfterExecutorError(ctx.AuthID, ctx.StatusCode, result.Err.Error())
+		reconcileAfterExecutorErrorForModel(ctx.AuthID, ctx.UpstreamModel, ctx.StatusCode, result.Err.Error())
 		streamEmitError(ctx.StreamID, result.Err.Error())
 		publishUsage(ctx.Model, ctx.UpstreamModel, ctx.AuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), true, ctx.StatusCode, result.Err.Error(), "", ttftNSBetween(ctx.Started, result.FirstOutputAt), ctx.AuthUID, ctx.SessionKey)
 		return
@@ -893,7 +893,7 @@ func pumpTraeStream(r io.Reader, ctx traeStreamPumpContext) {
 		reason := "pseudo completion: upstream returned done with near-empty output"
 		log.Printf("[traework] stream pump pseudo-done: request_id=%s stream_id=%s model=%s status=%d chunks=%d elapsed_ms=%d",
 			requestID, ctx.StreamID, ctx.Model, ctx.StatusCode, len(result.Chunks), time.Since(started).Milliseconds())
-		noteForcedAccountFailure(ctx.AuthID, reason)
+		noteForcedAccountFailureForModel(ctx.AuthID, ctx.UpstreamModel, reason)
 		evictSessionBindingsForAuth(ctx.AuthID)
 		streamEmitError(ctx.StreamID, reason)
 		publishUsage(ctx.Model, ctx.UpstreamModel, ctx.AuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), true, ctx.StatusCode, reason, "", ttftNSBetween(ctx.Started, result.FirstOutputAt), ctx.AuthUID, ctx.SessionKey)
@@ -918,7 +918,7 @@ func pumpTraeStream(r io.Reader, ctx traeStreamPumpContext) {
 		}
 	}
 	if err != nil {
-		reconcileAfterExecutorError(ctx.AuthID, ctx.StatusCode, err.Error())
+		reconcileAfterExecutorErrorForModel(ctx.AuthID, ctx.UpstreamModel, ctx.StatusCode, err.Error())
 		streamEmitError(ctx.StreamID, err.Error())
 		publishUsage(ctx.Model, ctx.UpstreamModel, ctx.AuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), true, ctx.StatusCode, err.Error(), "", ttftNSBetween(ctx.Started, result.FirstOutputAt), ctx.AuthUID, ctx.SessionKey)
 		return

@@ -25,8 +25,8 @@ const (
 	// failoverCooldownMaxSeconds 是阶梯上限的秒数。
 	failoverCooldownMaxSeconds = 600
 
-	// failoverDefaultBaseSeconds 是配置缺失时的阶梯基数。
-	failoverDefaultBaseSeconds = 30
+	// failoverDefaultBaseSeconds 是配置缺失时的阶梯基数（60s 起、每次 +60s）。
+	failoverDefaultBaseSeconds = 60
 )
 
 var (

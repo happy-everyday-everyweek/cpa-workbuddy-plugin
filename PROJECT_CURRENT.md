@@ -41,13 +41,20 @@
   - **生产行为验收**：70016 字节请求 **0.03s 返回 413**（修复前 5.8s / 500），随后三次正常短请求全部 200，账号池未被冷却。
   - **踩坑**：生产生效配置是容器内 `/CLIProxyAPI/config.yaml`（明文 secret-key），**不是** MySQL spool 的 `/CLIProxyAPI/mysqlstore/mysqlstore/config/config.yaml`（后者 secret-key 为 bcrypt 哈希，用它认证必然 401）。
   - 文档：`doc/4-bugs/2026-10-19_212000_coze超长内容触发池级冷却根因诊断.md`、`doc/6-review/2026-10-19_212500_Coze超长内容池级冷却修复_6-review.md`。
+- 当前会话（2026-10-19）：**定时任务并发治理三连（均未发布生产）**：
+  - **① 4h 槽位抖动 + traework 签到重试并发上限**：6 插件槽位循环改走 `next*FireTime(now)`，新增 `schedulerJitterMax = 5 * time.Minute` + 可注入 `schedulerJitterFn`（`math/rand/v2`）；纯函数 `nextCheckinTime` 保持无副作用，抖动只加在创建定时器那一步。traework `checkinRetryLoop` 原 `for { go processCheckinRetry(e) }` 无上限（全仓唯一无界点）→ 抽出 `runCheckinRetryRound()` + `checkinRetryConcurrency = 4` + `wg.Wait()`，并抽出注入缝 `processCheckinRetryFn`。
+  - **② 六个 watchdog 首轮抖动**：`watchdogFirstTickDelay()` 复用 `schedulerJitterFn`，插在 `waitHostReadyForWatchdog` 之后、drain 之前。只抖首轮（后续轮从各自上轮结束起算，相位不再对齐）；等待**不可被 tick 打断**——configure 在插件加载时即投递 tick，若提前结束等待会让六插件重新同刻对齐。等待期 tick 由 drain 丢弃，语义与原「等待期内丢弃 tick」一致。
+  - **③ 全仓定时任务并发复查（只读）**：唯一无上限扇出是 **coze `/accounts`**（每账号一 goroutine、无信号量、失败不写缓存，账号越多瞬时并发越大，建议补 `sem=4`）；其次为 zcode 每账号 `listAllAuthFiles()` 全量重扫（O(N²)，并发不高）与三份 workbuddy 面板每 10 分钟自动刷新与 watchdog 同周期叠加。
+  - **验证**：六/十插件 `cgo-shim-build.py` 全绿；gofmt 干净；`POLLUTION: PASS`。三处变异均精确捕获并还原：抖动改 0 → `唤醒时刻 = 08:00:00, want 08:01:30`；去掉信号量 → `峰值并发 = 20，超过上限 4`；`watchdogFirstTickDelay` 返回 0 → `首轮抖动 = 0s, want 90s`。
+  - **未覆盖**：生产侧尖峰是否真被摊平需发布后观测；跨插件共享限流未做；coze `/accounts` 无上限扇出未修。
+  - 文档：`doc/3-实施/2026-10-19_220000_定时刷新抖动与签到重试并发上限实施总览.md`（§3.4/§3.5 为本轮追加）。
 - 当前会话（2026-10-19）：**账号故障冷却基数 30s → 60s（10 插件全量，未发布生产）**：
   - 用户需求：「统一的 30s 冷却递增改成 60s 开始递增 60s」，裁定为 **60s、120s、180s…线性递增、上限仍 10 分钟**，覆盖全部含该阶梯的插件。
   - **实现**：9 插件 `failoverCooldownBase` 30s→60s（workbuddy / workbuddy-ai / traework / qoderwork / qoder-ai / qwenwork / copilot / zcode / doubao）；notion 改 `failoverDefaultBaseSeconds` 与 `defaultConfig().CooldownSeconds` 默认值 30→60（配置项保留，已显式配置的值优先）。公式不变（仍 `base × count`），`LadderCap` 由 `max/base` 自动从 20 档变 10 档。账号×模型双层冷却共用同一函数，两层同时生效。
   - **验证**：10 插件 `cgo-shim-build.py` build+vet+test 全绿；全部改动文件 gofmt 干净；`POLLUTION: PASS`；变异验证（workbuddy 基数改回 30s）→ 4 个用例精确 FAIL 并打印 `= 30s, want 1m0s`，还原后全绿。
   - **注意**：notion 生产若已显式写 `cooldown_seconds: 30`，该值继续生效；各插件 CHANGELOG 的历史记录不改写。
   - 文档：`doc/3-实施/2026-10-19_213000_账号冷却基数30s改60s实施总览.md`。
-  - **同时完成的并发盘点（只读，未改代码）**：各插件 4 小时级定时刷新并非统一串行/并发，而是混用——coze 续期并发 4；workbuddy/workbuddy-ai/traework/qoder-ai/qoderwork/qwenwork 的积分刷新走 `refreshConcurrency=10` worker 池；签到/保活为 goroutine + sem=4；traework 自动签到与 qwenwork 对账为纯串行；**traework 签到重试 `checkin_retry.go:145` 每项直接 `go` 无并发上限**（唯一越界点）；zcode 单 worker + 300ms 间隔；copilot/cursor/doubao/notion 无插件侧账号定时循环。全仓无跨插件共享限流。4h 槽位按本地整点（00/04/08/12/16/20）对齐，所有插件同一时刻触发，叠加启动/热重载首轮，整机峰值估算约 70–80 个上游请求同时在场。
+  - **并发盘点（只读）**：积分刷新走 `refreshConcurrency=10` worker 池（6 插件）；签到/保活 sem=4；coze 续期并发 4；zcode 单 worker + 300ms；traework 自动签到与 qwenwork 对账串行；copilot/cursor/doubao/notion 无插件侧定时循环。全仓无跨插件共享限流，4h 槽位整点对齐致整机峰值约 70–80 个上游请求同刻在场。
 - 当前会话（2026-10-19）：**Qoder 系模型发现风暴与 OOM 修复 P0/P1/P2 本地实施（按约束未发布生产）**：
   - 来源：会话 `6f11d093` 只读分析给出的 P0/P1/P2 优先级建议。生产连续 5 次 OOM 的放大器链：`callModelsAPI` 签名 body 与 GET 实际 body 不一致 → `Signature invalid` 恒 403（累计 5449 条、从未成功）→ 失败不写任何缓存 → 宿主每次 auth 重写触发 `model.for_auth` 逐账号全量重扫（实测 8409 条 N+1 风暴）。
   - **P0（qoder-ai / qoderwork）**：两处 `callModelsAPI` 抽出 `newModelsAPIRequest`，GET 以 `strings.NewReader(encodedBody)` 真实携带与签名同一的 `qoderEncode("{}")`。修复方向由外部可工作实现 qoder2api-hub（`qoder_proxy.py::read_dynamic_models`，commit `fd7a3740`）裁定：其 `sign_body` 同时进签名与 `data=`，裸 GET 判 403。qwenwork 走 Bearer 无 COSY 不受影响。
@@ -114,21 +121,15 @@
   - **CI 阻断修复（既有缺陷，非本轮引入）**：`go-cross/cgo-actions@v1` 内硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从 `download.freebsd.org/releases` 下线（404），既有 patch 指向的 `archive.freebsd.org/old-releases` 同样 404，导致全部 10 插件 freebsd-amd64 构建失败并连带 `Release` job 被 skipped。已改为在 wget 包装层把 `14.3-RELEASE` 改写为仍可用的 `14.4-RELEASE`。
   - **生产验收边界**：热重载后 15 分钟窗口内无断流事件，端到端「断流 → 换号 → 第二次成功」未能实证；已改为确认新符号 `shouldRotateOnStreamReadError` / `after partial output` / `daily cooling persist failed` 已进入三插件生产二进制（qoderwork 另含 `mergeActiveDailyCooling`），服务 `/v1/models` 200、无 error/panic 日志。后续需在真实断流发生时观察日志。
   - 文档：`doc/4-bugs/2026-10-17_202500_qoderwork流式中途断流不换号且24h冷却未落盘根因诊断.md`、`doc/3-实施/2026-10-17_203500_qoder三插件流式断流换号与冷却落盘修复实施总览.md`（§14 记录执行结果与偏差）。
-- 会话（2026-10-15，已压缩）：**跨插件同步第二轮复检（只读审计）**：以 md5 对比 + 机制分布 grep + 版本矩阵复核 9 插件，原批次 A~D 全部闭环。
+- 会话（2026-10-15，已压缩）：**跨插件同步第二轮复检（只读审计）**：md5 对比 + 机制分布 grep + 版本矩阵复核 9 插件，原批次 A~D 全部闭环。
 
-- 会话（2026-10-15，已压缩）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20）**：根因是模板 baseprompt 的 agent 上下文 + 插件重建 messages 丢掉 `tool_calls`/`tool_call_id`；方案 A 补三字段并同步自定义 `UnmarshalJSON`（陷阱：加字段必须同步解析否则恒空）。**判别力边界**：单工具任务 6/6 无判别力，探索型任务不收敛 ⇒ 只修结构丢失，不承诺消除持续工具调用。发布链 `f74a5e8`→`6d32f84`→`d9e8592`→`5124003`，热重载零重启，远端 14/14 ALL PASS。
+- 会话（2026-10-15，已压缩）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20）**：根因是 baseprompt 的 agent 上下文 + 插件重建 messages 丢掉 `tool_calls`/`tool_call_id`；补三字段并同步自定义 `UnmarshalJSON`（陷阱：加字段必须同步解析否则恒空）。**判别力边界**：只修结构丢失，探索型任务仍不收敛。
 
-- 会话（2026-10-15，已压缩）：**五插件签到节奏统一为每 4 小时**：qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效门控；修正面板与文档错标的 `09:00/21:00`；四插件发布生产、零重启，远端 28/28 ALL PASS。
+- 会话（2026-10-15，已压缩）：**五插件签到节奏统一为每 4 小时**：qoderwork/qoder-ai 由 `[10,22]` 恢复为 `[0,4,8,12,16,20]` 并移除失效门控；修正面板与文档错标的时段文案；四插件发布生产、零重启，远端 28/28 ALL PASS。
 
-- 会话（2026-10-15，已压缩）：**zcode-provider 0.1.31 面板额度改为逐模型独立进度条**：`quotaHTML` 由单条汇总条改为按 `entitlements[]` 逐模型渲染，移除「过期」行；回归脚本补逐模型断言；发布链 `0702b84`→CI success→`b7b754a`(assets)→`0d6c46a`(registry)；生产面板 `pb-item`/`pb-name` 各 4 处、旧结构残留 0。
+- 会话（2026-10-14/15，已压缩）：**zcode-provider 中国区支持与额度领取链路（0.1.22→0.1.31）**：bigmodel OAuth 按 provider/域名/回调路径参数化复用 CLI 轮询链路；面板内无感验证领取额度（`captchaVerifyParam` 需带 `prefix`/`region`，修复后含 `securityToken`）；额度展示改走 `billing/balance` 取真实已用/剩余，面板改逐模型独立进度条。**未覆盖**：上游对全部账号 `billing/preview` 返回 `plans:[]`，完整激活未实证（上游活动态）。
 
-- 会话（2026-10-15，已压缩）：**zcode-provider 0.1.30 面板额度改用 `billing/balance` 取真实用量**：根因是 `billing/current` 只返回授予量、无已用/剩余，且面板进度条硬编码 100%；改走 balance（强制设备三头 `X-Platform`/`X-Device-Mid`/`X-ZCode-App-Version`）+ `friendlyClaimError` 文案友好化；发布链 `a49101a`→`1b80e6f`(assets)→`6fd166d`(registry)，生产热重载零重启，`/credits` 返回 `source=balance has_usage=True` 且用量真实。Bug 文档 `doc/4-bugs/2026-10-15_023000_zcode面板额度永远显示满额根因诊断.md`。
-
-- 会话（2026-10-14/15，已压缩）：**zcode-provider 默认中国区 + 面板内无感验证领取额度（0.1.28→0.1.29）**：0.1.28 加中国区默认与动态 planId；0.1.29 修 `captchaVerifyParam` 仅 76 字符缺陷（未传 `prefix`/`region`），修复后 280 字符含 `securityToken`。**未覆盖**：上游对全部账号 `billing/preview` 返回 `plans:[]`，完整激活未实证（上游活动态）。
-
-- 会话（2026-10-14，已压缩）：**zcode-provider 支持 bigmodel（中国区）OAuth，0.1.25~0.1.27**：复用既有 CLI 轮询链路（仅 provider/域名/回调路径参数化）；0.1.26 修非法 provider 静默回退，0.1.27 修 bigmodel 推理 401（`open.bigmodel.cn/api/anthropic` 不接受 ZCode JWT）。上游对生产 IP 有时段性 WAF/限流，属外部因素。
-
-- 会话（2026-10-14，已压缩）：**四插件定时探活降频至 4 小时并修失败账号节流缺陷**：**真实缺陷**：`recordActivePing` 原仅成功时刷新时间戳，失败账号不计时 → 每个 tick 被反复重测，比健康账号更耗配额；改为「无论成败都先刷新」。四插件各补回归用例，全链路发布生产、零容器重启。
+- 会话（2026-10-14，已压缩）：**四插件定时探活降频至 4 小时并修失败账号节流缺陷**：`recordActivePing` 原仅成功时刷新时间戳，失败账号不计时 → 每个 tick 被反复重测；改为「无论成败都先刷新」。
 
 - 会话（2026-10-14/15，已压缩）：**zcode-provider 0.1.22 领取指引**：改为如实 Start Plan 指引（`guideModal`）；根因：额度领取须官方客户端手动完成（claim 强制阿里云人机验证头，无头一律 `400 3007`）。
 

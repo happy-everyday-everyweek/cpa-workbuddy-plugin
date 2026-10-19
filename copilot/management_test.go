@@ -10,34 +10,34 @@ import (
 // TestAccountRoutable 校验账号可调度资格的各个否决条件。
 func TestAccountRoutable(t *testing.T) {
 	// 1. nil 账号不可调度。
-	if accountRoutable(nil) {
+	if accountRoutable(nil, "") {
 		t.Fatal("nil account must not be routable")
 	}
 
 	// 2. 无凭据不可调度。
-	if accountRoutable(&StoredAuth{AuthID: "copilot-a"}) {
+	if accountRoutable(&StoredAuth{AuthID: "copilot-a"}, "") {
 		t.Fatal("account without credential must not be routable")
 	}
 
 	// 3. 已禁用不可调度。
-	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t", Disabled: true}) {
+	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t", Disabled: true}, "") {
 		t.Fatal("disabled account must not be routable")
 	}
 
 	// 4. 测试失败标记不可调度。
-	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t", TestFailed: true}) {
+	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t", TestFailed: true}, "") {
 		t.Fatal("test-failed account must not be routable")
 	}
 
 	// 5. 冷却中不可调度，冷却解除后恢复。
 	noteAccountFailure("copilot-a", 429, "rate limit")
-	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t"}) {
+	if accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t"}, "") {
 		t.Fatal("cooling-down account must not be routable")
 	}
 	resetAccountFailover("copilot-a")
 
 	// 6. 正常账号可调度。
-	if !accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t"}) {
+	if !accountRoutable(&StoredAuth{AuthID: "copilot-a", GitHubToken: "t"}, "") {
 		t.Fatal("healthy account must be routable")
 	}
 }
@@ -55,7 +55,7 @@ func TestPickActiveAuthRoundRobin(t *testing.T) {
 
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
-		sa := pickActiveAuth()
+		sa := pickActiveAuth("")
 		if sa == nil {
 			t.Fatal("pickActiveAuth returned nil with 2 routable accounts")
 		}
@@ -77,7 +77,7 @@ func TestPickActiveAuthNoCandidate(t *testing.T) {
 	defer setAccountsDir("")
 
 	mustWriteAccount(t, tmpDir, &StoredAuth{AuthID: "copilot-a", GitHubToken: "gho_a", Disabled: true})
-	if sa := pickActiveAuth(); sa != nil {
+	if sa := pickActiveAuth(""); sa != nil {
 		t.Fatalf("expected nil when all accounts disabled, got %s", sa.AuthID)
 	}
 }
@@ -92,7 +92,7 @@ func TestPickNextAuth(t *testing.T) {
 	mustWriteAccount(t, tmpDir, &StoredAuth{AuthID: "copilot-b", GitHubToken: "gho_b"})
 
 	// 1. 从 a 换号应拿到 b。
-	next, ok := pickNextAuth("copilot-a")
+	next, ok := pickNextAuth("copilot-a", "")
 	if !ok || next == nil || next.AuthID != "copilot-b" {
 		t.Fatalf("pickNextAuth from a = %v/%v", next, ok)
 	}
@@ -101,7 +101,7 @@ func TestPickNextAuth(t *testing.T) {
 	tmpDir2 := t.TempDir()
 	setAccountsDir(tmpDir2)
 	mustWriteAccount(t, tmpDir2, &StoredAuth{AuthID: "copilot-a", GitHubToken: "gho_a"})
-	if _, ok := pickNextAuth("copilot-a"); ok {
+	if _, ok := pickNextAuth("copilot-a", ""); ok {
 		t.Fatal("single account must not yield a next candidate")
 	}
 
@@ -110,7 +110,7 @@ func TestPickNextAuth(t *testing.T) {
 	setAccountsDir(tmpDir3)
 	mustWriteAccount(t, tmpDir3, &StoredAuth{AuthID: "copilot-a", GitHubToken: "gho_a"})
 	mustWriteAccount(t, tmpDir3, &StoredAuth{AuthID: "copilot-b", GitHubToken: "gho_b", Disabled: true})
-	if _, ok := pickNextAuth("copilot-a"); ok {
+	if _, ok := pickNextAuth("copilot-a", ""); ok {
 		t.Fatal("disabled-only peer must not yield a next candidate")
 	}
 }

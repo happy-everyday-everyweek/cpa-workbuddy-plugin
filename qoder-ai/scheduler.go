@@ -1,8 +1,8 @@
-// scheduler.go implements the CPA scheduler.pick capability for qoderwork.
+// scheduler.go implements the CPA scheduler.pick capability for qoder-ai.
 //
 // Routing uses the panel-selected active account (region from that card's
 // domain). When the selection is exhausted/disabled/missing, randomly switch
-// to another non-exhausted qoderwork candidate. Non-qoderwork candidates are
+// to another non-exhausted qoder-ai candidate. Non-qoder-ai candidates are
 // always deferred so the built-in scheduler handles them.
 //
 // scheduler_mode=session additionally enables per-conversation routing: each
@@ -79,11 +79,11 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Collect qoderwork candidates only. Accounts in failover cooldown are
-	// skipped so new requests route to a healthy account instead — but only
-	// when at least one healthy candidate remains. If EVERY qoderwork account
-	// is cooling down, keep the full list so the picker falls back to the
-	// current pin (mirrors the all-exhausted fallback) instead of deferring.
+	// Collect qoder-ai candidates only. Accounts in failover cooldown are
+	// skipped so new requests route to a healthy account instead. If EVERY
+	// qoder-ai account is cooling down, defer (Handled: false) so the host's
+	// built-in scheduler can fail over to OTHER providers' accounts instead
+	// of pinning the request to a dead account.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
 		if c.Provider != providerName {

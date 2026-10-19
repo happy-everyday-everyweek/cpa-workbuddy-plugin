@@ -41,34 +41,34 @@ func TestScheduler_RoutableAndPick(t *testing.T) {
 	}
 	_ = writeAuthFileDirect(filepath.Join(tempDir, "zcode-acc3.json"), sa3)
 
-	if !accountRoutable(sa1) {
+	if !accountRoutable(sa1, "") {
 		t.Fatalf("sa1 should be routable")
 	}
-	if accountRoutable(sa2) {
+	if accountRoutable(sa2, "") {
 		t.Fatalf("sa2 (disabled) should not be routable")
 	}
-	if accountRoutable(sa3) {
+	if accountRoutable(sa3, "") {
 		t.Fatalf("sa3 (test failed) should not be routable")
 	}
 
-	picked := pickActiveAuth()
+	picked := pickActiveAuth("")
 	if picked == nil || picked.AuthID != "zcode-acc1" {
 		t.Fatalf("expected sa1 to be picked, got %+v", picked)
 	}
 
 	// 测试冷却状态排除
 	noteAccountFailure(sa1.AuthID, 429, "rate limited")
-	if accountRoutable(sa1) {
+	if accountRoutable(sa1, "") {
 		t.Fatalf("sa1 should be cooling down after failure")
 	}
-	pickedCooling := pickActiveAuth()
+	pickedCooling := pickActiveAuth("")
 	if pickedCooling != nil {
 		t.Fatalf("expected no active account when cooling down, got %+v", pickedCooling)
 	}
 
 	// 成功重置
 	resetAccountFailover(sa1.AuthID)
-	if !accountRoutable(sa1) {
+	if !accountRoutable(sa1, "") {
 		t.Fatalf("sa1 should be routable after reset")
 	}
 }
@@ -86,7 +86,7 @@ func TestScheduler_PickNextAuth(t *testing.T) {
 	_ = writeAuthFileDirect(filepath.Join(tempDir, "zcode-acc1.json"), sa1)
 	_ = writeAuthFileDirect(filepath.Join(tempDir, "zcode-acc2.json"), sa2)
 
-	next, ok := pickNextAuth("zcode-acc1")
+	next, ok := pickNextAuth("zcode-acc1", "")
 	if !ok || next == nil || next.AuthID != "zcode-acc2" {
 		t.Fatalf("expected zcode-acc2, got %+v, ok=%v", next, ok)
 	}

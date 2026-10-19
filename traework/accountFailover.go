@@ -4,7 +4,7 @@
 // 调度器路由的新请求一律跳过该账号，让会话改落到健康账号，而不是继续往同一个
 // 已耗尽的账号上堆失败。
 //
-// 冷却时长按连续失败次数阶梯递增：第 1 次 30s、第 2 次 60s、第 3 次 90s……
+// 冷却时长按连续失败次数阶梯递增：第 1 次 60s、第 2 次 120s、第 3 次 180s……
 // 封顶 10 分钟。瞬时过载类失败（429 无额度标记 / 软限流文案 / 上游零字节断流）
 // 与硬失败走同一条阶梯路径，不再单独豁免计数。连续失败计数同时用于面板
 // 「失败N次」展示；异常池隔离已于 2026-09-08 移除，计数不再触发任何冻结或停用。
@@ -13,7 +13,7 @@
 // 文件、不写 DB，进程重启即清空。可通过插件配置 `account_failover: false`
 // 整体关闭该机制。
 //
-// 最近修改时间：2026-10-16 23:29:50；改动原因：固定 15s 冷却改为 30s 递增阶梯、上限 10 分钟，软失败并入计数。
+// 最近修改时间：2026-10-19；改动原因：阶梯基数由 30s 调整为 60s（仍为 base × count、上限 10 分钟），软失败并入计数。
 package main
 
 import (
@@ -24,13 +24,13 @@ import (
 )
 
 // failoverCooldownBase 是阶梯基数：每次连续失败使冷却窗口增加一个基数，
-// 首次失败即冷却一个基数（30s），第 n 次失败冷却 n × 30s。
-const failoverCooldownBase = 30 * time.Second
+// 首次失败即冷却一个基数（60s），第 n 次失败冷却 n × 60s。
+const failoverCooldownBase = 60 * time.Second
 
 // failoverCooldownMax 是阶梯上限：连续失败再多也不超过 10 分钟。
 const failoverCooldownMax = 10 * time.Minute
 
-// failoverCooldownLadderCap 是达到上限所需的连续失败次数（10min / 30s = 20）。
+// failoverCooldownLadderCap 是达到上限所需的连续失败次数（10min / 60s = 10）。
 // 先比较次数再相乘，避免 count 极大时的乘法溢出。
 const failoverCooldownLadderCap = int(failoverCooldownMax / failoverCooldownBase)
 
@@ -50,9 +50,24 @@ var (
 )
 
 // authFailoverState tracks consecutive failures for one account.
+//
+// 双层冷却：账号级字段保持原语义（面板展示、全池让位），模型维度由
+// modelStates 承担。一次失败按 classifyUpstreamFailure 的判定落到其中一层，
+// 不再所有失败都写账号级——否则限流这类「只对某个模型成立」的失败会把整个
+// 账号从所有模型上摘掉，反而缩小可用池。
 type authFailoverState struct {
 	count         int       // consecutive failures; reset to 0 on success
 	cooldownUntil time.Time // zero means not cooling down
+	// lastModel 记录最近一次触发冷却的上游模型（已归一化），供冷却前探活回放。
+	lastModel string
+	// modelStates 保存账号×模型级冷却，键为归一化后的上游模型名。
+	modelStates map[string]*modelFailoverState
+}
+
+// modelFailoverState tracks consecutive failures for one account × model pair.
+type modelFailoverState struct {
+	count         int
+	cooldownUntil time.Time
 }
 
 func init() {
@@ -84,7 +99,7 @@ func setFailoverEnabled(on bool) {
 // count <= 0 返回零值表示不冷却。
 // [参数] count: 当前连续失败次数，由 recordAccountFailure 递增、成功后清零。
 // [返回] 本次失败应施加的冷却时长。
-// 最近修改时间：2026-10-16 23:29:50；改动原因：固定 15s 改为 30s 递增阶梯、上限 10 分钟。
+// 最近修改时间：2026-10-19；改动原因：阶梯基数由 30s 调整为 60s（仍为 base × count、上限 10 分钟）。
 func failoverCooldownFor(count int) time.Duration {
 	if count <= 0 {
 		return 0
@@ -180,7 +195,7 @@ func setCooldownRecordLocked(authID string, until time.Time, count int, bumpCoun
 // 瞬时过载类失败（429 无额度标记、软限流文案、上游零字节断流，见
 // isTransientThrottle）与硬失败（额度耗尽 / 401/403/404/405 / 5xx / 传输错误）
 // 共用同一条计数与阶梯路径：软失败不再豁免计数，网关抖动会让账号沿阶梯
-// 逐次冷却更久，直到出现一次成功请求才清零回落到 30s。
+// 逐次冷却更久，直到出现一次成功请求才清零回落到 60s。
 //
 // 异常池隔离已于 2026-09-08 移除：失败只延长冷却窗口，账号到期后自动重新
 // 进入路由，不冻结、不做每日刷新、不需要人工解冻。
@@ -188,39 +203,62 @@ func setCooldownRecordLocked(authID string, until time.Time, count int, bumpCoun
 // [返回] true 表示失败已计入冷却阶梯，false 表示按判定不予记账。
 // 最近修改时间：2026-10-16 23:29:50；改动原因：软失败并入阶梯计数，移除 coolDownAccount 旁路。
 func recordAccountFailure(authID string, status int, body string) bool {
+	return recordAccountFailureForModel(authID, "", status, body)
+}
+
+// recordAccountFailureForModel 按分类维度记账：账号级失败写账号层，
+// 账号×模型级失败写模型层并同时记录 lastModel。
+//
+// 模型维度必须由调用方传入已归一化的上游模型名（resolveModelOptions 的
+// config_name 或 circuitModel 的结果）；传空串时退化为纯账号级记账，
+// 与历史行为一致，供尚未改造的调用点继续工作。
+//
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// [返回] true 表示失败已计入冷却阶梯，false 表示按判定不予记账。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增账号×模型双层冷却。
+func recordAccountFailureForModel(authID, model string, status int, body string) bool {
 	if !failoverActive() {
 		return false
 	}
-	if !isAccountFailure(status, body) && !isTransientThrottle(status, body) {
-		return false
-	}
-	return bumpFailoverState(authID, body)
+	return recordFailureScoped(authID, model, classifyUpstreamFailure(status, body))
 }
 
-// recordForcedFailure records a failure for an account regardless of
-// isAccountFailure classification. Used by pseudo-completion detection: the
-// upstream returns a protocol-valid HTTP 200 + done with near-empty output
-// (silent per-account throttling) that does not match any normal failure
-// marker, yet must still drive failover so routing moves off the flagged
-// account.
-func recordForcedFailure(authID string, body string) bool {
-	if !failoverActive() {
+// recordFailureScoped 按给定维度写入冷却状态，是记账的唯一落点。
+// 调用方必须已完成分类与开关判定。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// scope：记账维度。
+// [返回] true 表示已写入；scope 为 none 时返回 false。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：抽出唯一写入落点，避免多处复制阶梯逻辑。
+func recordFailureScoped(authID, model string, scope failureScope) bool {
+	if scope == failureScopeNone {
 		return false
 	}
-	return bumpFailoverState(authID, body)
-}
-
-// bumpFailoverState 递增账号连续失败计数并按阶梯延长冷却窗口。
-// 返回 true 表示失败已计入。计数仅用于面板展示与诊断——不触发任何隔离：
-// 异常池已于 2026-09-08 移除，每次失败按 failoverCooldownFor 的阶梯值冷却，
-// 账号到期后自动重新进入路由。
-func bumpFailoverState(authID string, body string) bool {
+	model = strings.TrimSpace(model)
 	now := time.Now()
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
-	st := failoverStates[authID]
+
+	// 账号×模型级失败：只冷却该模型，不摘掉整个账号。
+	// 模型名为空时无维度可写，退化为账号级，避免失败被静默丢弃。
+	if scope == failureScopeAuthModel && model != "" {
+		for _, k := range failoverKeysLocked(authID) {
+			st := ensureFailoverStateLocked(k)
+			st.lastModel = model
+			ms := st.modelStates[model]
+			if ms == nil {
+				ms = &modelFailoverState{}
+				st.modelStates[model] = ms
+			}
+			ms.count++
+			ms.cooldownUntil = now.Add(failoverCooldownFor(ms.count))
+		}
+		return true
+	}
+
+	// 账号级失败：沿用既有阶梯与键别名逻辑，行为不变。
 	curCount := 0
-	if st != nil {
+	if st := failoverStates[authID]; st != nil {
 		curCount = st.count
 	} else if norm := normalizeFailoverKey(authID); norm != "" {
 		if stNorm := failoverStates[norm]; stNorm != nil {
@@ -230,7 +268,68 @@ func bumpFailoverState(authID string, body string) bool {
 	newCount := curCount + 1
 	until := now.Add(failoverCooldownFor(newCount))
 	setCooldownRecordLocked(authID, until, newCount, false)
+	if model != "" {
+		for _, k := range failoverKeysLocked(authID) {
+			if st := failoverStates[k]; st != nil {
+				st.lastModel = model
+			}
+		}
+	}
 	return true
+}
+
+// failoverKeysLocked 返回账号键及其归一化别名，供同一状态的多个键同步写入。
+// 调用方必须已持有 failoverMu。
+// [参数] authID：账号唯一标识。
+// [返回] 去重后的键切片，至少包含 authID 本身。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，消除重复的键别名构造。
+func failoverKeysLocked(authID string) []string {
+	keys := []string{authID}
+	if norm := normalizeFailoverKey(authID); norm != "" && norm != authID {
+		keys = append(keys, norm)
+	}
+	return keys
+}
+
+// ensureFailoverStateLocked 返回账号状态，不存在时创建并注册。
+// 调用方必须已持有 failoverMu。
+// [参数] key：failoverStates 的键。
+// [返回] 该键对应的状态指针。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供模型维度惰性初始化。
+func ensureFailoverStateLocked(key string) *authFailoverState {
+	st := failoverStates[key]
+	if st == nil {
+		st = &authFailoverState{modelStates: make(map[string]*modelFailoverState)}
+		failoverStates[key] = st
+	} else if st.modelStates == nil {
+		st.modelStates = make(map[string]*modelFailoverState)
+	}
+	return st
+}
+
+// recordForcedFailure records a failure for an account regardless of
+// isAccountFailure classification. Used by pseudo-completion detection: the
+// upstream returns a protocol-valid HTTP 200 + done with near-empty output
+// (silent per-account throttling) that does not match any normal failure
+// marker, yet must still drive failover so routing moves off the flagged
+// account.
+func recordForcedFailure(authID string, body string) bool {
+	return recordForcedFailureForModel(authID, "", body)
+}
+
+// recordForcedFailureForModel 在强制记账的基础上补记失败模型。
+//
+// 伪完成（HTTP 200 + done + 近空输出）本质是上游对账号的窗口性限流，仍归账号级；
+// 但记录模型名能让冷却前探活用正确的模型回放，否则这类冷却永远无法被探测。
+//
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；body：失败原因文本。
+// [返回] true 表示已计入冷却。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，让伪完成冷却也能被探活覆盖。
+func recordForcedFailureForModel(authID, model, body string) bool {
+	if !failoverActive() {
+		return false
+	}
+	return recordFailureScoped(authID, model, failureScopeAccount)
 }
 
 // isAccountCoolingDown reports whether the account is currently inside its
@@ -269,6 +368,45 @@ func isAccountCoolingDown(authID string) bool {
 	return false
 }
 
+// isAuthModelCoolingDown 判定账号在指定模型上是否处于冷却中。
+//
+// 路由与换号必须使用本函数而非 isAccountCoolingDown：账号级冷却会让该账号
+// 在所有模型上让位，而账号×模型级冷却只应让位给同一个模型。模型名为空时
+// 退化为账号级判定，保证调用方尚未传模型时行为与历史一致。
+//
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空。
+// [返回] true 表示该账号不应承载该模型的请求。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增账号×模型双层判定。
+func isAuthModelCoolingDown(authID, model string) bool {
+	if isAccountCoolingDown(authID) {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	if !failoverActive() {
+		return false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	now := time.Now()
+	for _, k := range failoverKeysLocked(authID) {
+		st := failoverStates[k]
+		if st == nil {
+			continue
+		}
+		if ms := st.modelStates[model]; ms != nil && now.Before(ms.cooldownUntil) {
+			return true
+		}
+	}
+	return false
+}
+
 // resetAccountFailover clears the failure counter and cooldown after a
 // successful request. Call it on every upstream success.
 func resetAccountFailover(authID string) {
@@ -277,14 +415,35 @@ func resetAccountFailover(authID string) {
 	}
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
-	keys := []string{authID}
-	if norm := normalizeFailoverKey(authID); norm != "" && norm != authID {
-		keys = append(keys, norm)
-	}
-	for _, k := range keys {
+	for _, k := range failoverKeysLocked(authID) {
 		if st := failoverStates[k]; st != nil {
 			st.count = 0
 			st.cooldownUntil = time.Time{}
+			st.lastModel = ""
+			// 一次成功只证明该账号整体可用；模型维度的残留冷却若不清，
+			// 已恢复的账号仍会被单个历史模型挡住。
+			st.modelStates = nil
+		}
+	}
+}
+
+// resetAuthModelFailover 只清除指定账号×模型的冷却，保留账号级状态。
+// 供冷却前探活确认「该模型已恢复」时调用，避免把其它模型的冷却一起抹掉。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供探活精确清除模型维度。
+func resetAuthModelFailover(authID, model string) {
+	if !failoverActive() {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	for _, k := range failoverKeysLocked(strings.TrimSpace(authID)) {
+		if st := failoverStates[k]; st != nil {
+			delete(st.modelStates, model)
 		}
 	}
 }
@@ -293,7 +452,13 @@ func pruneFailoverStates() {
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
 	for k, st := range failoverStates {
-		if st.count == 0 {
+		if st == nil {
+			delete(failoverStates, k)
+			continue
+		}
+		// 账号层已成功清零且没有模型维度残留时整体删除。模型维度与账号层同语义：
+		// 计数保留到一次成功为止，不按冷却到期清理——否则阶梯会反复回落到 60s。
+		if st.count == 0 && len(st.modelStates) == 0 {
 			delete(failoverStates, k)
 		}
 	}
@@ -310,6 +475,37 @@ func failoverStateSnapshot(authID string) (count int, cooldownUntil time.Time, o
 		return 0, time.Time{}, false
 	}
 	return st.count, st.cooldownUntil, true
+}
+
+// authModelFailoverSnapshot 返回账号×模型维度的冷却状态，供单测与诊断使用。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名。
+// [返回] 该模型的连续失败次数、冷却截止时间、是否存在记录。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增账号×模型双层诊断入口。
+func authModelFailoverSnapshot(authID, model string) (count int, cooldownUntil time.Time, ok bool) {
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	st := failoverStates[authID]
+	if st == nil {
+		return 0, time.Time{}, false
+	}
+	ms := st.modelStates[strings.TrimSpace(model)]
+	if ms == nil {
+		return 0, time.Time{}, false
+	}
+	return ms.count, ms.cooldownUntil, true
+}
+
+// lastFailoverModel 返回账号最近一次触发冷却的模型名，供冷却前探活回放。
+// [参数] authID：账号唯一标识。
+// [返回] 归一化后的上游模型名；无记录时为空串。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供冷却前探活读取失败模型。
+func lastFailoverModel(authID string) string {
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	if st := failoverStates[strings.TrimSpace(authID)]; st != nil {
+		return st.lastModel
+	}
+	return ""
 }
 
 // clearFailoverStates wipes all failover state. Test helper; never called in

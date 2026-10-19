@@ -20,13 +20,13 @@ import (
 // 把健康账号逐个冷却掉（既有插件踩过的坑）。
 
 const (
-	// failoverCooldownBase 是阶梯基数：第 n 次连续失败冷却 n × 基数。
-	failoverCooldownBase = 30 * time.Second
+	// failoverCooldownBase 是阶梯基数：第 n 次连续失败冷却 n × 基数（60s 起、每次 +60s）。
+	failoverCooldownBase = 60 * time.Second
 
 	// failoverCooldownMax 是阶梯上限，连续失败再多也不超过 10 分钟。
 	failoverCooldownMax = 10 * time.Minute
 
-	// failoverCooldownLadderCap 是达到上限所需的连续失败次数（600s / 30s = 20）。
+	// failoverCooldownLadderCap 是达到上限所需的连续失败次数（600s / 60s = 10）。
 	// 先比次数再相乘，避免次数极大时的乘法溢出。
 	failoverCooldownLadderCap = int(failoverCooldownMax / failoverCooldownBase)
 )

@@ -58,15 +58,17 @@ func streamClose(streamID string) {
 //  3. HTTP 200 下仍可能出现 `event: error` 业务错误帧，须识别并上报。
 //
 // [参数] ctx: 上下文；cancel: 取消函数；streamID: 宿主流标识；
-// resp: 上游响应；authID/accountLabel: 账号标识；startTime: 请求起始时间。
+// resp: 上游响应；authID/accountLabel: 账号标识；upstreamModel: 已归一化的上游
+// 模型名，用于成功时清除模型级熔断；startTime: 请求起始时间。
 // [返回] 无。
-// 最近修改时间：2026-10-15；改动原因：新增，Copilot 流式转发与终止契约。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增 upstreamModel 参数以支持模型级风控熔断。
 func pumpUpstreamStream(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	streamID string,
 	resp *http.Response,
 	authID, accountLabel string,
+	upstreamModel string,
 	startTime time.Time,
 ) {
 	defer func() {
@@ -92,6 +94,8 @@ func pumpUpstreamStream(
 			// 1. 终止哨兵：收到即结束，不再等待后续 Keep-Alive 空闲帧。
 			if trimmed == "data: [DONE]" || trimmed == "data:[DONE]" {
 				_ = streamEmit(streamID, line)
+				// 干净终止即证明该模型已恢复，清掉熔断残留。
+				resetModelCircuit(providerName, upstreamModel)
 				return
 			}
 
@@ -110,11 +114,16 @@ func pumpUpstreamStream(
 		if err != nil {
 			if err != io.EOF {
 				streamEmitError(streamID, err.Error())
-				noteAccountFailure(authID, resp.StatusCode, err.Error())
+				// 读到此处说明响应头已成功返回（StatusCode 恒为 2xx），失败发生在
+				// 流读取阶段，属传输层故障。必须按 status 0 记账：传 200 会被
+				// classifyUpstreamFailure 判为成功响应而不计入冷却，导致真实断流漏记。
+				noteAccountFailureForModel(authID, upstreamModel, 0, err.Error())
 				return
 			}
 			break
 		}
 	}
 	resetAccountFailover(authID)
+	// 读到干净 EOF 同样证明该模型已恢复，清掉熔断残留。
+	resetModelCircuit(providerName, upstreamModel)
 }

@@ -332,7 +332,7 @@
 ### 关键设计决策
 
 - 数据库/配置一律逻辑引用（无物理外键）。
-- failover：1/3/10 分钟阶梯退避；429/402/5xx/传输错误（status==0）计入，业务 400 不计；cooldown 期间跳过该账号。
+- failover：阶梯冷却 60s×连续失败次数、上限 10 分钟（cap 10 档），一次成功即清零回落；429/402/5xx/传输错误（status==0）计入，业务 400 不计；cooldown 期间跳过该账号。
 - 40x 换号重试（0.9.9+）：401/403/404/405 计入账号级故障，`retry_on_4xx` 预算默认 3（0-5）；**缺省键保持当前值**（kill switch 安全：无关 reconfigure 不得重置 `retry_on_4xx: 0`）。
 - 路由（0.12.0 起）：移除三池（priority/default/fallback），只留保号池（watchdog 积分阈值自动归池，默认 10m 刷新、阈值 50）；存量 auth 文件 `pool`/`priority` 字段忽略式读取不清理。
 - 版本三轨（qoderwork）：main.go 0.8.2 / VERSION 0.4.1 / registry 0.2.x 历史双轨，发版以 registry 为准。

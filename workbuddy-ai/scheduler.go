@@ -10,7 +10,9 @@
 // Only "available" accounts participate: 「测试」标签 (test_failed) and 冷却
 // (failover cooldown) are hard-excluded — they are unusable by product
 // definition, so there is no fallback that re-admits them. Survivors are
-// ordered LOW-CREDIT-FIRST so the soonest-to-exhaust accounts burn down first.
+// ordered HIGH-CREDIT-FIRST: the healthiest accounts (most remaining credits)
+// lead and unmeasured (-1) accounts rank last, so load spreads across healthy
+// accounts instead of burning the weakest down first.
 //
 // scheduler_mode=session additionally enables per-conversation routing: each
 // conversation is pinned to one account for up to 1h and conversations are
@@ -112,9 +114,13 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	// candidate is excluded we defer (Handled: false) so the host's built-in
 	// scheduler can fail over to OTHER providers instead of pinning the request
 	// to an account we just declared unusable.
+	// 冷却判定带模型维度：账号×模型级冷却只应挡住同一模型的请求，
+	// 否则一次限流就会把该账号从其它模型上一并摘掉。调度请求的 Model 是
+	// 客户端模型名，需与记账侧一样归一化后再比对。
+	upstreamModel := resolveUpstreamModel(req.Model, nil)
 	available := make([]pluginapi.SchedulerAuthCandidate, 0, len(wbCandidates))
 	for _, c := range wbCandidates {
-		if isTestFailed(c.ID) || isAccountCoolingDown(c.ID) {
+		if isTestFailed(c.ID) || isAuthModelCoolingDown(c.ID, upstreamModel) {
 			continue
 		}
 		remain, lowOrExhausted := cachedCreditsScore(c.ID)

@@ -80,10 +80,10 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 
 	// Collect qoderwork candidates only. Accounts in failover cooldown are
-	// skipped so new requests route to a healthy account instead — but only
-	// when at least one healthy candidate remains. If EVERY qoderwork account
-	// is cooling down, keep the full list so the picker falls back to the
-	// current pin (mirrors the all-exhausted fallback) instead of deferring.
+	// skipped so new requests route to a healthy account instead. If EVERY
+	// qoderwork account is cooling down, defer (Handled: false) so the host's
+	// built-in scheduler can fail over to OTHER providers' accounts instead
+	// of pinning the request to a dead account.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
 		if c.Provider != providerName {

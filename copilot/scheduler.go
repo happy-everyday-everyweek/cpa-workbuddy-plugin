@@ -14,25 +14,27 @@ var (
 )
 
 // accountRoutable 判断一个账号是否具备承载流量的资格。
-// [参数] sa: 账号凭据。
+// [参数] sa: 账号凭据；model: 已归一化的上游模型名，传空串时退化为纯账号维度判定。
 // [返回] true 表示可参与调度。
-func accountRoutable(sa *StoredAuth) bool {
+// 最近修改时间：2026-10-19 02:00:00；改动原因：冷却判定带模型维度。
+func accountRoutable(sa *StoredAuth, model string) bool {
 	if sa == nil || sa.Disabled || credentialOf(sa) == "" {
 		return false
 	}
 	if sa.TestFailed {
 		return false
 	}
-	if isAccountCoolingDown(sa.AuthID) {
+	if isAuthModelCoolingDown(sa.AuthID, model) {
 		return false
 	}
 	return true
 }
 
 // pickActiveAuth 从所有落盘账号中挑选一个可承载流量的可用账号。
-// [参数] 无。
+// [参数] model: 已归一化的上游模型名，可为空。
 // [返回] 目标账号；无可选账号时返回 nil。
-func pickActiveAuth() *StoredAuth {
+// 最近修改时间：2026-10-19 02:00:00；改动原因：冷却判定带模型维度。
+func pickActiveAuth(model string) *StoredAuth {
 	accounts, err := listAllAuthFiles()
 	if err != nil || len(accounts) == 0 {
 		return nil
@@ -40,7 +42,7 @@ func pickActiveAuth() *StoredAuth {
 
 	var candidates []*StoredAuth
 	for _, acc := range accounts {
-		if accountRoutable(acc) {
+		if accountRoutable(acc, model) {
 			candidates = append(candidates, acc)
 		}
 	}
@@ -57,9 +59,10 @@ func pickActiveAuth() *StoredAuth {
 }
 
 // pickNextAuth 在当前账号发生故障时，选取下一个可用候选账号进行换号重试。
-// [参数] currentAuthID: 当前失败账号标识。
+// [参数] currentAuthID: 当前失败账号标识；model: 已归一化的上游模型名，可为空。
 // [返回] 下一个候选账号与是否存在。
-func pickNextAuth(currentAuthID string) (*StoredAuth, bool) {
+// 最近修改时间：2026-10-19 02:00:00；改动原因：冷却判定带模型维度。
+func pickNextAuth(currentAuthID, model string) (*StoredAuth, bool) {
 	currentAuthID = strings.TrimSpace(currentAuthID)
 	accounts, err := listAllAuthFiles()
 	if err != nil || len(accounts) <= 1 {
@@ -68,7 +71,7 @@ func pickNextAuth(currentAuthID string) (*StoredAuth, bool) {
 
 	var candidates []*StoredAuth
 	for _, acc := range accounts {
-		if acc.AuthID != currentAuthID && accountRoutable(acc) {
+		if acc.AuthID != currentAuthID && accountRoutable(acc, model) {
 			candidates = append(candidates, acc)
 		}
 	}
@@ -117,6 +120,8 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 
 	// 2. 过滤出本 provider、未禁用且不在冷却期的候选。
+	// 冷却判定带模型维度：账号×模型级冷却只应挡住同一模型的请求。
+	upstreamModel := mappedModel(req.Model, currentConfig())
 	var candidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
 		if c.Provider != providerName {
@@ -125,7 +130,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		if candidateDisabled(c) {
 			continue
 		}
-		if isAccountCoolingDown(strings.TrimSuffix(c.ID, ".json")) {
+		if isAuthModelCoolingDown(strings.TrimSuffix(c.ID, ".json"), upstreamModel) {
 			continue
 		}
 		candidates = append(candidates, c)

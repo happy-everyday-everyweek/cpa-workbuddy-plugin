@@ -105,10 +105,10 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 	}
 }
 
-// TestSchedulerPick_PrefersLowCreditOverHighCredit is the low-credit-first
-// contract: the soonest-to-exhaust account absorbs traffic before a fat one,
-// so the fleet burns down to fewer accounts instead of spreading usage thin.
-// (Replaces the 0.14.40 healthy-tier rule, which preferred HIGH credits.)
+// TestSchedulerPick_PrefersLowCreditOverHighCredit guards the safety-floor
+// exclusion: an account below minRoutableCredits is hard-excluded, so the
+// remaining healthy account is routed. (The test name predates the
+// low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
 func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 	resetActiveAuth(t)
 	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 10, TotalUsed: 90, TotalSize: 100}})

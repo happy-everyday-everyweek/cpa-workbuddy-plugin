@@ -329,7 +329,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.2.8"
+var version = "0.2.9"
 
 func wbRegistration() registration {
 	return registration{
@@ -352,10 +352,10 @@ func wbRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelProvider: true,
-			AuthProvider:  true,
+			ModelProvider:        true,
+			AuthProvider:         true,
 			FrontendAuthProvider: false,
-			Executor:      true,
+			Executor:             true,
 			// 必须是 both 而不是 oauth：宿主只对 static/both 作用域在注册期调用
 			// StaticModels（internal/pluginhost/adapters.go:60 executorScopeAllowsStaticModels），
 			// 而 oauth-model-alias 的宿主级缓存正是从该回调的 HostConfigSummary 里
@@ -377,10 +377,17 @@ func wbRegistration() registration {
 // upstream call per account.
 const dynamicModelsCacheTTL = 5 * time.Minute
 
+// dynamicModelsFailCacheTTL 是模型发现「全账号扫描失败」后的负缓存窗口：
+// 在窗口内 fetchDynamicModels / fetchDynamicModelsFromStorage 直接返回 nil，
+// 不再逐账号重扫。上游失败若不设负缓存，会被宿主每次 auth 重写触发的
+// model.for_auth 放大成 N+1 请求风暴（生产 OOM 主因）。
+const dynamicModelsFailCacheTTL = 5 * time.Minute
+
 var dynamicModelsCache struct {
 	sync.RWMutex
-	models  []pluginapi.ModelInfo
-	fetched time.Time
+	models   []pluginapi.ModelInfo
+	fetched  time.Time
+	failedAt time.Time // 最近一次全量扫描失败的时间；零值表示无失败记录
 }
 
 //

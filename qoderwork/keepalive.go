@@ -198,7 +198,7 @@ func persistAuthTokens(authIndex string, sa *storedAuth) error {
 // markSessionDead logs the session-dead condition but does NOT write
 // disabled:true — the user explicitly requested that only manual panel
 // toggle controls the disabled flag. Auto-failover routing handles dead
-// accounts via the failure cooldown (laddered 30s..10min) without needing
+// accounts via the failure cooldown (laddered 60s..10min) without needing
 // disabled:true.
 func markSessionDead(authIndex, authID string, sa *storedAuth) error {
 	phys, err := hostAuthGetPhysical(authIndex)

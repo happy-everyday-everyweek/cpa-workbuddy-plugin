@@ -18,7 +18,7 @@ CLIProxyAPI（CPA）插件：把 **Notion AI**（`app.notion.com/ai`、`app.noti
 - **对话转发**：`/v1/chat/completions` 的流式与非流式两条路径，走真实的 NDJSON 增量。
 - **多工作空间**：Notion 一个账号可同时挂商业版与免费版空间，额度完全独立；
   导入时枚举全部空间并记录各自 `premiumCredits`，可随时切换。
-- **多账号**：阶梯冷却（30s 起、每次翻倍、封顶 10 分钟）+ 同请求换号。
+- **多账号**：阶梯冷却（60s 起、每次 +60s 线性递增、封顶 10 分钟）+ 同请求换号。
 - **会话复用**：同一账号+空间+模型复用上游 `threadId`，多轮上下文自动延续。
 - **Cookie 滚动**：上游下发的 `token_v2` 等会话 Cookie 会写回账号文件，重启后仍有效。
 
@@ -40,7 +40,7 @@ notion-provider:
   client_version: "23.13.20260313.1423"
   space_id: ""                 # 指定默认工作空间（空 = 自动选额度最高）
   retry_on_4xx: 3              # 401/403/404/405 的同请求换号预算（0 = 关闭）
-  cooldown_seconds: 30         # 冷却阶梯基数
+  cooldown_seconds: 60         # 冷却阶梯基数（n × 基数，封顶 10 分钟）
 ```
 
 `retry_on_4xx` 的缺省键**不会**在 reconfigure 时重置：这是 kill switch，

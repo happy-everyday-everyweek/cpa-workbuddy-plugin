@@ -69,7 +69,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.1.9"
+	version      = "0.1.10"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -77,6 +77,8 @@ var (
 
 func init() {
 	activeConfig.Store(defaultConfig())
+	// 冷却前探活需要 5s 粒度，与小时级定时探活分开跑。
+	go cooldownProbeLoop()
 }
 
 func main() {}

@@ -87,8 +87,9 @@ func TestSchedulerPick_AllTestFailed_Defers(t *testing.T) {
 }
 
 // TestSchedulerPick_LowCreditFirstAndUnknownLast pins the ordering contract:
-// the lowest-credit account wins, and an account with no cached snapshot (-1)
-// never jumps ahead of a measured one.
+// a below-floor account is hard-excluded, and an account with no cached
+// snapshot (-1) never jumps ahead of a measured one. (The test name predates
+// the low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
 func TestSchedulerPick_LowCreditFirstAndUnknownLast(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)

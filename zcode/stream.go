@@ -126,7 +126,10 @@ func pumpUpstreamStream(
 			if err != io.EOF {
 				streamEmitError(streamID, err.Error())
 				publishUsage(authID, accountLabel, model, upstreamModel, startTime, detail, durationMS, resp.StatusCode, true, err.Error(), ttftNS)
-				noteAccountFailure(authID, resp.StatusCode, err.Error())
+				// 读到此处说明响应头已成功返回（StatusCode 恒为 2xx），失败发生在
+				// 流读取阶段，属传输层故障。必须按 status 0 记账：传 200 会被
+				// classifyUpstreamFailure 判为成功响应而不计入冷却，导致真实断流漏记。
+				noteAccountFailureForModel(authID, upstreamModel, 0, err.Error())
 				return
 			}
 			break
@@ -143,4 +146,6 @@ func pumpUpstreamStream(
 	}
 	publishUsage(authID, accountLabel, model, upstreamModel, startTime, detail, durationMS, resp.StatusCode, false, "", ttftNS)
 	resetAccountFailover(authID)
+	// 一次真实成功即证明该模型已恢复，清掉熔断残留。
+	resetModelCircuit(providerName, upstreamModel)
 }

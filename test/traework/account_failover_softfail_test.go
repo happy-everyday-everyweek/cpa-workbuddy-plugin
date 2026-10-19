@@ -30,7 +30,7 @@ func resetSoftFailoverState(t *testing.T) {
 }
 
 // TestTransientThrottle_Soft429LadderCooldown 锁定软失败新语义：
-// 连续 12 次 429 计数逐次递增，冷却沿 30s×count 阶梯增长。
+// 连续 12 次 429 计数逐次递增，冷却沿 60s×count 阶梯增长。
 func TestTransientThrottle_Soft429LadderCooldown(t *testing.T) {
 	resetSoftFailoverState(t)
 	for i := 0; i < 12; i++ {

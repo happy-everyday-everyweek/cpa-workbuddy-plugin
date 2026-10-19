@@ -32,7 +32,7 @@ func writeFailoverAccount(t *testing.T, dir, authID string, disabled bool) {
 	}
 }
 
-// TestFailoverCooldownFor 校验阶梯冷却时长：30s × 次数，封顶 600s。
+// TestFailoverCooldownFor 校验阶梯冷却时长：60s × 次数，封顶 600s。
 // [参数] t: 测试上下文。
 // [返回] 无。
 // 最近修改时间：2026-10-17；改动原因：新增，测试点①阶梯计算。
@@ -43,10 +43,10 @@ func TestFailoverCooldownFor(t *testing.T) {
 	}{
 		{0, 0},
 		{-1, 0},
-		{1, 30 * time.Second},
-		{2, 60 * time.Second},
-		{19, 570 * time.Second},
-		{20, 600 * time.Second},
+		{1, 60 * time.Second},
+		{2, 120 * time.Second},
+		{9, 540 * time.Second},
+		{10, 600 * time.Second},
 		{100, 600 * time.Second},
 	}
 	for _, c := range cases {

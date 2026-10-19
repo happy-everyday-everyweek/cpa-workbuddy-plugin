@@ -5,6 +5,7 @@
 package main
 
 import (
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -53,6 +54,41 @@ func nextKeepaliveTime(now time.Time) time.Time {
 	return earliest
 }
 
+// schedulerJitterMax 是槽位触发时刻的随机抖动上限。
+//
+// 各插件的槽位都对齐本地整点（00/04/08/12/16/20），所有插件会在同一秒
+// 一起醒来，账号规模上来后形成整点尖峰。给每个插件、每一轮叠加一段
+// 不大于该值的随机偏移，把尖峰摊平到数分钟窗口内。
+//
+// 上界取 5 分钟：远小于 4 小时槽位间隔（不会跨槽串位），也远小于
+// shouldRunKeepaliveNow 的 1 小时窗口（抖动后仍落在同一窗口内）。
+const schedulerJitterMax = 5 * time.Minute
+
+// schedulerJitterFn 是可替换的抖动源，单测注入确定值；生产用 [0, max) 均匀分布。
+var schedulerJitterFn = func() time.Duration {
+	return time.Duration(rand.N(int64(schedulerJitterMax)))
+}
+
+// nextKeepaliveFireTime 在纯函数 nextKeepaliveTime 的结果上叠加抖动。
+//
+// nextKeepaliveTime 保持无副作用，供既有调度断言继续验证绝对槽位；抖动只在
+// 真正创建定时器时施加，避免把随机性带进可测的排期计算。
+//
+// [参数] now：当前时间。
+// [返回] 实际唤醒时刻，严格晚于 now。
+func nextKeepaliveFireTime(now time.Time) time.Time {
+	next := nextKeepaliveTime(now)
+	jitter := schedulerJitterFn()
+	if jitter > 0 {
+		next = next.Add(jitter)
+	}
+	// 抖动不得把唤醒时刻推到 now 之前（极小概率出现在槽位前一瞬间抖动越界）。
+	if !next.After(now) {
+		return now.Add(time.Second)
+	}
+	return next
+}
+
 // schedulerLoop 到达保活时刻后执行 token 刷新，并顺带跑一次生命周期对账。
 //
 // [参数] stop 关闭信号通道，收到后停止定时器并退出循环。
@@ -60,7 +96,9 @@ func nextKeepaliveTime(now time.Time) time.Time {
 // 最近修改时间：2026-10-18 00:28:00；改动原因：签到调度删除后重建保活循环。
 func schedulerLoop(stop chan struct{}) {
 	for {
-		next := nextKeepaliveTime(time.Now())
+		// 叠加随机抖动：各插件槽位同刻对齐时会形成整点尖峰，抖动把全机
+		// 唤醒摊平到数分钟窗口内。
+		next := nextKeepaliveFireTime(time.Now())
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-stop:

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -122,8 +123,8 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 
 	// 前置冷却拦截：如果宿主分配的初始账号当前正在冷却中（如上一请求刚失败 403），
 	// 绝对不要对它发起自杀式的上游调用！在 attempt=0 之前立即换号到可用的健康候选。
-	if isAccountCoolingDown(curAuthID) || isAccountCoolingDown(curAuthUID) {
-		if nextID, nextSA, hasNext := pickNextAuth(curAuthID); hasNext && nextSA != nil {
+	if isAuthModelCoolingDown(curAuthID, upstreamModel) || isAuthModelCoolingDown(curAuthUID, upstreamModel) {
+		if nextID, nextSA, hasNext := pickNextAuthForModel(curAuthID, upstreamModel); hasNext && nextSA != nil {
 			if nextReq, rebErr := rebuildRequestWithSA(curReq, nextSA); rebErr == nil {
 				curReq = nextReq
 				curAuthID = nextID
@@ -136,11 +137,21 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		}
 	}
 
+	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时，
+	// 直接短路返回，不再向任何账号发起上游调用——这是本机制真正的收益点，
+	// 避免每个账号各赔一次往返后仍然失败。
+	if isModelCircuitOpen(providerName, upstreamModel) {
+		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
+		log.Printf("[workbuddy] %s (auth=%s)", msg, curAuthID)
+		streamEmitError(streamID, msg)
+		return
+	}
+
 	for attempt := 0; attempt <= budget; attempt++ {
 		stream, statusCode, _, err := hostHTTPDoStream(curReq)
 		if err != nil {
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, 0, err.Error(), reasoningEffort, 0, curAccountLabel, sessionKey)
-			noteAccountFailure(curAuthID, 0, err.Error())
+			noteAccountFailureForModel(curAuthID, upstreamModel, 0, err.Error())
 			streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 			return
 		}
@@ -150,9 +161,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			stream.Close()
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, statusCode, errPayload, reasoningEffort, 0, curAccountLabel, sessionKey)
 			if curAuthUID != "" {
-				go reconcileByUID(curAuthUID, statusCode, errPayload)
+				go reconcileByUIDForModel(curAuthUID, upstreamModel, statusCode, errPayload)
 			}
-			noteAccountFailure(curAuthID, statusCode, errPayload)
+			noteAccountFailureForModel(curAuthID, upstreamModel, statusCode, errPayload)
 
 			// Retry policy (v0.14.2 — 429 included):
 			//   account-level 4xx (401/403/404/405) and 429 soft rate limit
@@ -164,6 +175,14 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			//   5xx, so we don't burn budget on it.
 			//   Business 400 is request-shaped and would fail identically
 			//   on every account, so we propagate it immediately.
+			//
+			// 模型级风控（11128「请求被拦截」）：跨 3 个账号命中即判定为上游
+			// 拦截的是模型而非账号，立即短路，不再消耗其余账号的往返时间。
+			if isModelCircuitError(statusCode, errPayload) {
+				if noteModelCircuitHit(providerName, upstreamModel, curAuthID) {
+					log.Printf("[workbuddy] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, curAuthID)
+				}
+			}
 			if !isAccountLevel4xx(statusCode) {
 				streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errPayload, 200)))
 				return
@@ -175,7 +194,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// Pick the next account and rebuild the request against
 			// its endpoint + auth headers. If nothing else is
 			// usable, surface the original error.
-			nextID, nextSA, hasNext := pickNextAuth(curAuthID)
+			nextID, nextSA, hasNext := pickNextAuthForModel(curAuthID, upstreamModel)
 			if !hasNext || nextSA == nil {
 				streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errPayload, 200)))
 				return
@@ -252,7 +271,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// 2. 正文零泄漏且预算允许时换号重建请求
 			if !contentEmitted && attempt < budget && curReq.GetBody != nil {
 				evictSessionBindingsForAuth(curAuthID)
-				nextID, nextSA, hasNext := pickNextAuth(curAuthID)
+				nextID, nextSA, hasNext := pickNextAuthForModel(curAuthID, upstreamModel)
 				if shouldRotateOnStreamReadError(emitted, contentEmitted, attempt, budget, curReq.GetBody != nil, hasNext && nextSA != nil) {
 					nextReq, rebErr := rebuildRequestWithSA(curReq, nextSA)
 					if rebErr != nil {
@@ -290,7 +309,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// regardless of whether we rotate or surface the error. Remap
 			// to 403 so isAccountFailure classifies it as account-level
 			// and the account gets its laddered cooldown.
-			noteAccountFailure(curAuthID, http.StatusForbidden, sseErr)
+			noteSSEErrorFailure(curAuthID, upstreamModel, sseErr)
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, statusCode, sseErr, reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
 			// 200 内业务错误帧与 HTTP 4xx 同责：零泄漏（emitted=false）且账号级
 			// 分类命中且预算允许时换号续试；已泄漏分片时换号会造成输出重复或
@@ -300,7 +319,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 				return
 			}
 			evictSessionBindingsForAuth(curAuthID)
-			nextID, nextSA, hasNext := pickNextAuth(curAuthID)
+			nextID, nextSA, hasNext := pickNextAuthForModel(curAuthID, upstreamModel)
 			if !hasNext || nextSA == nil {
 				streamEmitError(streamID, sseErr)
 				return
@@ -329,12 +348,15 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// failures count toward the ladder too; no freeze), not a success.
 			const emptyStreamErr = "upstream stream closed before first payload"
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, statusCode, emptyStreamErr, reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
-			noteAccountFailure(curAuthID, statusCode, emptyStreamErr)
+			noteAccountFailureForModel(curAuthID, upstreamModel, statusCode, emptyStreamErr)
 			return
 		}
 		publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), false, 0, "", reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
 		invalidateAccountCredits(curAuthID, curAuthUID)
 		resetAccountFailover(curAuthID)
+		// 一次真实成功即证明该模型已恢复，清掉熔断残留，避免抑制窗口
+		// 在恢复后仍拦住正常流量。
+		resetModelCircuit(providerName, upstreamModel)
 		return
 	}
 }
@@ -354,7 +376,10 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 // can route around a per-account rate limit without waiting for the laddered
 // cooldown to expire; cross-request cooldown continues to apply
 // via isAccountFailure / recordAccountFailure on the failing account.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector) ([]pluginapi.ExecutorStreamChunk, int, error) {
+// [参数] body：上游请求体；sa：初始账号凭据；sseFramed：是否需自带 SSE 帧前缀；
+// collector：用量采集器；model：已归一化的上游模型名，用于模型级熔断判定。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增 model 参数以支持模型级风控熔断。
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector, model string) ([]pluginapi.ExecutorStreamChunk, int, error) {
 	budget := loadedRetryOn4xx()
 	curSA := sa
 	var lastStatus int
@@ -366,20 +391,35 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 		if currentID == "" {
 			currentID = strings.TrimSpace(curSA.Account.UID)
 		}
-		if isAccountCoolingDown(currentID) || (curSA.Account.UID != "" && isAccountCoolingDown(curSA.Account.UID)) {
-			if _, nextSA, hasNext := pickNextAuth(currentID); hasNext && nextSA != nil {
+		if isAuthModelCoolingDown(currentID, model) || (curSA.Account.UID != "" && isAuthModelCoolingDown(curSA.Account.UID, model)) {
+			if _, nextSA, hasNext := pickNextAuthForModel(currentID, model); hasNext && nextSA != nil {
 				curSA = nextSA
 			}
 		}
 	}
 
 	for attempt := 0; attempt <= budget; attempt++ {
-		chunks, statusCode, errOnce := collectUpstreamStreamOnce(body, curSA, sseFramed, collector)
+		chunks, statusCode, errOnce := collectUpstreamStreamOnce(body, curSA, sseFramed, collector, model)
 		if errOnce == nil {
+			// 真实成功即证明模型已恢复，清掉熔断残留。
+			resetModelCircuit(providerName, model)
 			return chunks, statusCode, nil
 		}
 		lastStatus = statusCode
 		lastErr = errOnce
+
+		// 模型级风控：跨账号命中即熔断，后续同类请求直接短路，
+		// 不再把剩余账号逐个赔进一次上游往返。
+		if isModelCircuitError(statusCode, errOnce.Error()) && curSA != nil {
+			currentID := strings.TrimSpace(curSA.Auth.AccessToken)
+			if currentID == "" {
+				currentID = strings.TrimSpace(curSA.Account.UID)
+			}
+			noteModelCircuitHit(providerName, model, currentID)
+		}
+		if isModelCircuitOpen(providerName, model) {
+			return chunks, statusCode, fmt.Errorf("upstream model circuit open: %s", model)
+		}
 
 		// 1. 已收集分片即视为已下发；其中是否含正文由 streamChunksHaveContent 判定
 		if isStreamReadError(errOnce.Error()) {
@@ -393,7 +433,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 				}
 				if currentID != "" {
 					evictSessionBindingsForAuth(currentID)
-					_, nextSA, hasNext := pickNextAuth(currentID)
+					_, nextSA, hasNext := pickNextAuthForModel(currentID, model)
 					if shouldRotateOnStreamReadError(emitted, contentEmitted, attempt, budget, true, hasNext && nextSA != nil) {
 						curSA = nextSA
 						continue
@@ -425,7 +465,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 		if currentID == "" {
 			return chunks, statusCode, errOnce
 		}
-		_, nextSA, hasNext := pickNextAuth(currentID)
+		_, nextSA, hasNext := pickNextAuthForModel(currentID, model)
 		if !hasNext || nextSA == nil {
 			return chunks, statusCode, errOnce
 		}
@@ -438,7 +478,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 // against sa: build the request, route via host.http.do_stream, decide
 // success vs 4xx/5xx. Pulled out of collectUpstreamStream so the retry
 // loop can rebuild the request against a different account on failure.
-func collectUpstreamStreamOnce(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector) ([]pluginapi.ExecutorStreamChunk, int, error) {
+func collectUpstreamStreamOnce(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector, model string) ([]pluginapi.ExecutorStreamChunk, int, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, err
@@ -454,7 +494,7 @@ func collectUpstreamStreamOnce(body []byte, sa *storedAuth, sseFramed bool, coll
 	if statusCode >= 400 {
 		errPayload, _ := io.ReadAll(reader)
 		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, string(errPayload))
+			go reconcileByUIDForModel(sa.Account.UID, model, statusCode, string(errPayload))
 		}
 		return nil, statusCode, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(errPayload), 200))
 	}
@@ -471,7 +511,7 @@ func collectUpstreamStreamOnce(body []byte, sa *storedAuth, sseFramed bool, coll
 // request against a different account on failure. Returns a non-nil error
 // in the canonical "upstream N: ..." or "http_error: ..." shape that
 // parseUpstreamStatusFromErr understands.
-func doExecuteOnce(body []byte, sa *storedAuth, requestedModel string) ([]byte, error) {
+func doExecuteOnce(body []byte, sa *storedAuth, requestedModel, upstreamModel string) ([]byte, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -486,7 +526,7 @@ func doExecuteOnce(body []byte, sa *storedAuth, requestedModel string) ([]byte, 
 	if statusCode >= 400 {
 		payload, _ := io.ReadAll(reader)
 		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, string(payload))
+			go reconcileByUIDForModel(sa.Account.UID, upstreamModel, statusCode, string(payload))
 		}
 		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(payload), 200))
 	}

@@ -4,11 +4,11 @@ template_version: implementation-overview-v1
 doc_id: IMPL-QODERWORK-CHECKIN-CAMPAIGN-20261011
 doc_type: implementation_overview
 source_ids: [BUG-QODERWORK-CHECKIN-CAMPAIGN-20261011]
-status: accepted
-version: v1.0
+status: completed
+version: v1.1
 complexity: L1
-current_slice: 本地修复与回归完成；发布链与生产验收进行中
-updated_at: 2026-10-11 07:06:00
+current_slice: TASK-001 至 TASK-008 发布部署与生产验收已全部完成
+updated_at: 2026-10-11 08:30:00
 reader_level: business_general
 writing_style: plain_chinese
 appendix_policy: preserve_existing_or_one_terminal_appendix
@@ -57,8 +57,8 @@ style_regression: required_after_tests
 | `TASK-004` | checkin 流程/统计 + campaign_id | completed |
 | `TASK-005` | 面板文案与批量统计对齐 | completed |
 | `TASK-006` | 回归测试 + 双反证 + 提交态独立编译 | completed |
-| `TASK-007` | 发布链：commit、push、CI、assets、registry、远端验证 | in_progress |
-| `TASK-008` | 生产部署与账号 u09a5b6ab 行为验收 | pending |
+| `TASK-007` | 发布链：commit、push、CI、assets、registry、远端验证 | completed |
+| `TASK-008` | 生产部署与账号 u09a5b6ab 行为验收 | completed |
 
 ## 4. 真实测试安排
 

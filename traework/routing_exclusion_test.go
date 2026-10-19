@@ -74,10 +74,11 @@ func TestSchedulerPick_AllTestFailed_Defers(t *testing.T) {
 	}
 }
 
-// TestSchedulerPick_LowCreditFirst: the soonest-to-exhaust account absorbs
-// traffic before a fat one. The pick request carries no session signal, so the
-// picker falls back to the candidate order built by handleSchedulerPick —
-// which is exactly the LOW-CREDIT-FIRST contract under test.
+// TestSchedulerPick_LowCreditFirst: a below-floor account is hard-excluded,
+// so the remaining healthy account is routed. The pick request carries no
+// session signal, so the picker falls back to the candidate order built by
+// handleSchedulerPick. (The test name predates the low-credit-first reversal;
+// current routing is HIGH-CREDIT-FIRST.)
 func TestSchedulerPick_LowCreditFirst(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)

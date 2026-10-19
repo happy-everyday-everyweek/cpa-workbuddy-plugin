@@ -524,19 +524,31 @@ func reconcileAllAccounts(force bool) []map[string]any {
 // instead; a background resolve backfills the canonical key so pick still
 // skips the account. Returns true when the failure was counted.
 func noteAccountFailure(authID string, status int, body string) bool {
+	return noteAccountFailureForModel(authID, "", status, body)
+}
+
+// noteAccountFailureForModel 是带模型维度的记账入口。
+// 模型级失败只冷却该模型并驱逐该账号的会话绑定；账号级失败行为与历史一致。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// [返回] true 表示失败已计入冷却阶梯。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增账号×模型双层冷却。
+func noteAccountFailureForModel(authID, model string, status int, body string) bool {
 	if !failoverActive() || strings.TrimSpace(authID) == "" {
 		return false
 	}
-	if !recordAccountFailure(authID, status, body) {
+	if !recordAccountFailureForModel(authID, model, status, body) {
 		return false
 	}
+	// 会话绑定一律驱逐：无论记到哪一层，绑定到该账号的会话都应重新选号，
+	// 否则亲和会把同一个会话反复送回刚失败的位置。
 	evictSessionBindingsForAuth(authID)
 	go func() {
 		_, id := resolveAuthIndexAndID(authID)
 		if id == "" || id == authID {
 			return
 		}
-		if recordAccountFailure(id, status, body) {
+		if recordAccountFailureForModel(id, model, status, body) {
 			evictSessionBindingsForAuth(id)
 		}
 	}()
@@ -547,13 +559,22 @@ func noteAccountFailure(authID string, status int, body string) bool {
 // AuthID from the executor may be the credential ID (UID) rather than runtime auth_index;
 // we resolve via host.auth.list when direct get fails.
 func reconcileAfterExecutorError(authID string, status int, body string) {
+	reconcileAfterExecutorErrorForModel(authID, "", status, body)
+}
+
+// reconcileAfterExecutorErrorForModel 带模型维度的执行器错误收尾。
+// 除按维度记账外，其余（硬额度生命周期）行为与历史一致。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增账号×模型双层冷却。
+func reconcileAfterExecutorErrorForModel(authID, model string, status int, body string) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
 	}
 	// Failover first — independent of lifecycle_auto: any upstream failure
 	// (429/402/5xx/transport) counts toward cooldown and evicts bindings.
-	noteAccountFailure(authID, status, body)
+	noteAccountFailureForModel(authID, model, status, body)
 	// Hard credit errors additionally trigger the disable/delete lifecycle.
 	if !lifecycleEnabled() || !isHardCreditError(status, body) {
 		return
@@ -614,8 +635,34 @@ func resolveAuthIndexAndID(authID string) (string, string) {
 	return "", ""
 }
 
+// noteSSEErrorFailure 记录 HTTP 200 承载的业务错误帧，按模型维度记账并驱逐绑定。
+// 与 noteAccountFailureForModel 的分工：SSE 帧没有可用的状态码，不能走
+// classifyUpstreamFailure 的状态码判据，必须由调用方明确指出「这是一次值得
+// 记账的业务失败」。
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名；body：错误帧文本。
+// [返回] true 表示已计入冷却。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增，避免 SSE 帧被状态码判据漏记。
+func noteSSEErrorFailure(authID, model, body string) bool {
+	if !failoverActive() || strings.TrimSpace(authID) == "" {
+		return false
+	}
+	if !recordSSEErrorFailureForModel(authID, model, body) {
+		return false
+	}
+	evictSessionBindingsForAuth(authID)
+	return true
+}
+
 // reconcileByUID finds workbuddy auth by account UID and applies executor-error lifecycle.
 func reconcileByUID(uid string, status int, body string) {
+	reconcileByUIDForModel(uid, "", status, body)
+}
+
+// reconcileByUIDForModel 带模型维度的 UID 侧收尾，供流式路径按实际失败模型记账。
+// [参数] uid：账号 UID；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// 最近修改时间：2026-10-18 23:40:00；改动原因：新增账号×模型双层冷却。
+func reconcileByUIDForModel(uid, model string, status int, body string) {
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
 		return
@@ -623,7 +670,7 @@ func reconcileByUID(uid string, status int, body string) {
 	// Failover first — independent of lifecycle_auto. reconcileByUID receives
 	// the account UID; noteAccountFailure resolves it to the auth.ID key the
 	// scheduler uses and evicts bindings when cooldown triggers.
-	noteAccountFailure(uid, status, body)
+	noteAccountFailureForModel(uid, model, status, body)
 	if !lifecycleEnabled() || !isHardCreditError(status, body) {
 		return
 	}

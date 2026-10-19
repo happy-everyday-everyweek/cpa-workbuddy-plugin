@@ -91,7 +91,12 @@ CPA 的 `gin_logger` 取 `c.Writer.Status()`。首字节前断开时 `WriteHeade
 
 ⇒ **只要打开关卡①（`ping_interval_enabled = true`），new-api 就会在等待上游首帧的 40~50 秒里，每 `ping_interval_seconds` 秒向调用方写 `: PING\n\n`（`relay/helper/common.go:110-123`），静默窗口即被打通。**
 
-该开关在 new-api 管理面板**有可视化入口**：系统设置 → 全局设置卡片（`web/src/features/system-settings/models/global-settings-card.tsx:323`），字段名 `general_setting.ping_interval_enabled` / `general_setting.ping_interval_seconds`。
+该开关在 new-api 管理面板**有可视化入口，但位置隐蔽**：
+
+- **精确路径**：系统设置 → **模型与路由** → **全局模型配置** → **页面最底部**。
+- **为什么容易找不到**：① 它不在「站点与品牌 / 系统信息」组，而在「模型与路由」组；② 即使进对页面，它是该页**最后两个控件**（前面是三个大 JSON 编辑器：透传开关 + 思考模型黑名单 + Chat→Responses 策略），中间隔了一条 `Separator`，**不滚到底看不到**。
+- **源码锚点**：`web/src/features/system-settings/models/global-settings-card.tsx:319`（`Separator`）→ `:321-342`（`Keep-alive Ping` 开关，字段 `general_setting.ping_interval_enabled`）→ `:344-...`（`Ping Interval (seconds)`，字段 `general_setting.ping_interval_seconds`）；中文界面标题分别为「保持连接心跳」「Ping 间隔（秒）」。
+- **导航注册**：`web/src/features/system-settings/models/section-registry.tsx:39-67`（`id: 'global'`，`titleKey: 'Global Model Configuration'`），由 `system-settings.config.ts:69-72` 挂到「Models & Routing」组；导航项**无条件全量渲染**（`utils/section-registry.ts:66-74`），不存在「按版本隐藏该项」的逻辑。
 
 **旁证**：`stream_scanner.go:250` 的 `ticker.Reset(streamingTimeout)` 位于行过滤之前，故 new-api 收到 CPA 的 `: keep-alive` 也能重置其 300s 空闲超时；但 `: PING` 是 new-api **自己**发往调用方的心跳，才是解决「调用方先走」的关键。
 
@@ -101,7 +106,31 @@ CPA 的 `gin_logger` 取 `c.Writer.Status()`。首字节前断开时 `WriteHeade
 
 ### 方案 A（推荐，零代码改动，立即生效）—— 打开 new-api ping 保活
 
-**操作**：new-api 管理面板 → 系统设置 → 全局设置 → 开启 `ping_interval_enabled`，`ping_interval_seconds` 设 10~15。
+**操作（面板路径）**：new-api 管理面板 → 系统设置 → **模型与路由** → **全局模型配置** → 滚到页面最底部 → 打开「保持连接心跳」（`Keep-alive Ping`），并把「Ping 间隔（秒）」设为 10（保存后即生效，**无需重启**）。
+
+**操作（面板找不到时的等价 API 写法）**：该开关本质是一次 option 写入，面板与 API 完全等价（`controller/option.go:123-146` 的 `PUT /api/option/`，请求体 `{"key":...,"value":...}`，value 会被 `Interface2String` 归一为字符串）：
+
+```bash
+# 开总开关
+curl -X PUT '<new-api 地址>/api/option/' \
+  -H 'Authorization: Bearer <root token>' -H 'Content-Type: application/json' \
+  -d '{"key":"general_setting.ping_interval_enabled","value":true}'
+# 设间隔（秒）
+curl -X PUT '<new-api 地址>/api/option/' \
+  -H 'Authorization: Bearer <root token>' -H 'Content-Type: application/json' \
+  -d '{"key":"general_setting.ping_interval_seconds","value":10}'
+```
+
+> 生产 DB `options` 表当前**无该项** ⇒ 走 `general_setting.go:28` 的默认 `false`，这正是故障未被兜住的原因。若面板确无该项，说明部署的前端产物早于当前源码（本仓库 2026-07-20 `31d70fca3` 已同时引入 7 个 section，本地 `web/dist` 产物中可 grep 到 `Keep-alive Ping` / `保持连接心跳`），此时用上面的 API 写入即可，**后端 `general_setting` 注册与 `stream_scanner.go:108` 的读取逻辑不依赖前端**。
+
+**Ping 间隔取值（关键，决定这个开关有没有用）**：**建议 `10`（可接受 10~15），不要沿用默认的 `60`。**
+
+- 本故障的静默窗口 = 「上游首字 40~50 秒」。若间隔取 `60`，**第一个 ping 要等到第 60 秒才发出，而调用方在 45 秒左右就已经断开** —— 间隔设 60 等于没开。
+- 取 `10` 秒时，40~50 秒窗口内可发出 4~5 个 ping（`: PING\n\n`，8 字节），足以持续重置调用方的「首字节超时」。
+- `10` 非拍脑袋：它就是源码兜底值 `relay/helper/stream_scanner.go:28` 的 `DefaultPingInterval = 10 * time.Second`（当配置项 ≤0 时回落到该值）。
+- 上界约束：必须明显小于「调用方首字节超时」与「上游首字延迟」。实测 31/35 次失败发生在 >45 秒，故 10~15 秒安全。
+
+> ⚠️ **面板上「建议保持此值较高，以避免上游限流」这条提示对本场景是误导**：`PingData` 写入的是 `c.Writer`（`relay/helper/common.go:110-123`），是**发往下游调用方**的 SSE 注释帧，**从不到达上游**（全仓仅两处 ping 调用——`api_request.go:442`、`stream_scanner.go:176`——都经 `PingData` → `c.Writer`；源码中不存在任何周期性写上游连接的路径）。因此 ping 频率不可能造成上游限流。该提示疑似 v1.0 前端重写（`a42b39760`）引入的通用文案，v1.0 之前的老版设置页（`git show a42b39760^:web/src/pages/Setting/Model/SettingGlobalModel.jsx`）并无此提示。
 
 **为什么它是正解**：
 - 故障发生在「调用方 ↔ new-api」这一段（调用方先走，new-api 才记 `client_gone`）；

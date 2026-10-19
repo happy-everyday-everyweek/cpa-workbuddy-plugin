@@ -233,7 +233,7 @@ func handleTestActiveWithAuth(sa *StoredAuth, model string) testActiveResponse {
 	if !ok {
 		sa.TestFailed = true
 		saveAuthTestStatus(sa)
-		noteAccountFailure(sa.AuthID, statusCode, errMsg)
+		noteAccountFailureForModel(sa.AuthID, upstreamModel, statusCode, errMsg)
 		publishUsage(sa.AuthID, sa.Label, model, upstreamModel, start, usageTokensDetail{InputTokens: 1, OutputTokens: 0, TotalTokens: 1}, latency, statusCode, true, errMsg, ttftNS)
 		return testActiveResponse{
 			OK:        false,

@@ -26,7 +26,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// failoverBackoff 是同请求换号前的最小退避：上游容量类故障（403/5xx 风暴）时，
+// 无退避的连续换号会把单请求放大成瞬时 11 连发，多个并发请求叠加即成请求风暴
+// （生产 OOM 次级放大器）。50ms 足以把风暴斜率压低一个数量级，
+// 对端到端时延的影响上限为预算 × 50ms（默认 10 次 → 500ms）。
+const failoverBackoff = 50 * time.Millisecond
 
 // pickNextAuth returns the next qoderwork account to retry on after
 // currentAuthID failed. It is best-effort: any error reading the host's
@@ -89,6 +96,10 @@ func pickNextAuth(currentAuthID string) (nextAuthID string, nextSA *storedAuth, 
 			continue
 		}
 
+		// 选定换号目标后、返回给调用方之前统一退避：所有换号路径（执行器
+		// 循环、流式循环、前置冷却拦截）都经过本函数，单点收口避免上游
+		// 容量故障时被 1+N 连发放大成请求风暴。
+		time.Sleep(failoverBackoff)
 		return id, sa, true
 	}
 	return "", nil, false
@@ -128,11 +139,13 @@ func rebuildRequestWithQoderAuth(sa *storedAuth, encodedBody, modelKey string, c
 //
 // We intentionally read via the same host stream bridge as the success
 // path so the framing behavior (chunked, capped) stays consistent.
+// 上限对齐仓库惯例 1MiB：错误体只需前几百字节可读信息，无上限读取在
+// 上游异常吐大 body 时会造成内存放大（OOM 次级放大器之一）。
 func readAllUpstreamErr(r io.Reader) string {
 	if r == nil {
 		return ""
 	}
-	buf, err := io.ReadAll(r)
+	buf, err := io.ReadAll(io.LimitReader(r, 1<<20))
 	if err != nil {
 		return ""
 	}

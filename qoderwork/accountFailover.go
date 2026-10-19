@@ -4,7 +4,7 @@
 // 调度器路由的新请求一律跳过该账号，让会话改落到健康账号，而不是继续往同一个
 // 已耗尽的账号上堆失败。
 //
-// 冷却时长按连续失败次数阶梯递增：第 1 次 30s、第 2 次 60s、第 3 次 90s……
+// 冷却时长按连续失败次数阶梯递增：第 1 次 60s、第 2 次 120s、第 3 次 180s……
 // 封顶 10 分钟。瞬时过载类失败（429 无额度标记 / 软限流文案 / 上游零字节断流）
 // 与硬失败走同一条阶梯路径，不再单独豁免计数。连续失败计数同时用于面板
 // 「失败N次」展示；异常池隔离已于 2026-09-08 移除，计数不再触发任何冻结或停用。
@@ -17,7 +17,7 @@
 // 文件、不写 DB，进程重启即清空。可通过插件配置 `account_failover: false`
 // 整体关闭该机制。
 //
-// 最近修改时间：2026-10-16 23:29:50；改动原因：固定 15s 冷却改为 30s 递增阶梯、上限 10 分钟，软失败并入计数。
+// 最近修改时间：2026-10-19；改动原因：阶梯基数由 30s 调整为 60s（仍为 base × count、上限 10 分钟），软失败并入计数。
 package main
 
 import (
@@ -28,13 +28,13 @@ import (
 )
 
 // failoverCooldownBase 是阶梯基数：每次连续失败使冷却窗口增加一个基数，
-// 首次失败即冷却一个基数（30s），第 n 次失败冷却 n × 30s。
-const failoverCooldownBase = 30 * time.Second
+// 首次失败即冷却一个基数（60s），第 n 次失败冷却 n × 60s。
+const failoverCooldownBase = 60 * time.Second
 
 // failoverCooldownMax 是阶梯上限：连续失败再多也不超过 10 分钟。
 const failoverCooldownMax = 10 * time.Minute
 
-// failoverCooldownLadderCap 是达到上限所需的连续失败次数（10min / 30s = 20）。
+// failoverCooldownLadderCap 是达到上限所需的连续失败次数（10min / 60s = 10）。
 // 先比较次数再相乘，避免 count 极大时的乘法溢出。
 const failoverCooldownLadderCap = int(failoverCooldownMax / failoverCooldownBase)
 
@@ -88,7 +88,7 @@ func setFailoverEnabled(on bool) {
 // count <= 0 返回零值表示不冷却。
 // [参数] count: 当前连续失败次数，由 recordAccountFailure 递增、成功后清零。
 // [返回] 本次失败应施加的冷却时长。
-// 最近修改时间：2026-10-16 23:29:50；改动原因：固定 15s 改为 30s 递增阶梯、上限 10 分钟。
+// 最近修改时间：2026-10-19；改动原因：阶梯基数由 30s 调整为 60s（仍为 base × count、上限 10 分钟）。
 func failoverCooldownFor(count int) time.Duration {
 	if count <= 0 {
 		return 0
@@ -140,7 +140,7 @@ func isAccountFailure(status int, body string) bool {
 // ok=false signal once the pool is exhausted.
 func isAccountLevel4xx(status int) bool {
 	switch status {
-	case http.StatusUnauthorized,    // 401
+	case http.StatusUnauthorized, // 401
 		http.StatusForbidden,        // 403
 		http.StatusNotFound,         // 404
 		http.StatusMethodNotAllowed, // 405
@@ -201,7 +201,7 @@ func setCooldownRecordLocked(authID string, until time.Time, count int, bumpCoun
 // 瞬时过载类失败（429 无额度标记、软限流文案、上游零字节断流，见
 // isTransientThrottle）与硬失败（额度耗尽 / 401/403/404/405 / 5xx / 传输错误）
 // 共用同一条计数与阶梯路径：软失败不再豁免计数，网关抖动会让账号沿阶梯
-// 逐次冷却更久，直到出现一次成功请求才清零回落到 30s。
+// 逐次冷却更久，直到出现一次成功请求才清零回落到 60s。
 //
 // Qoder 系专属红线（不改）：排队帧 isQueueFrame 是上游容量状态而非账号故障，
 // 保持「不计数不冷却」；110 日限额 isDailyCountExceeded 走独立 24h 持久化冷却

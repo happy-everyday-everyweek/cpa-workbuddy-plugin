@@ -80,7 +80,7 @@ const (
 	// See /root/qoderwork/KNOWLEDGE.md §1-§5.
 	upstreamBase = "https://openapi.qoder.sh"
 	gatewayBase  = "https://openapi.qoder.sh"
-	clientUA       = "Go-http-client/2.0"
+	clientUA     = "Go-http-client/2.0"
 
 	// Auth endpoints (PAT → jobToken exchange + refresh).
 	endpointJobTokenExchange = upstreamBase + "/api/v1/jobToken/exchange"
@@ -345,7 +345,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.1.26"
+var version = "0.1.27"
 
 func wbRegistration() registration {
 	return registration{
@@ -389,10 +389,17 @@ func wbRegistration() registration {
 // upstream call per account.
 const dynamicModelsCacheTTL = 5 * time.Minute
 
+// dynamicModelsFailCacheTTL 是模型发现「全账号扫描失败」后的负缓存窗口：
+// 在窗口内 fetchDynamicModels / fetchDynamicModelsFromStorage 直接返回 nil，
+// 不再逐账号重扫。上游签名/风控类失败若不设负缓存，会被宿主每次 auth 重写
+// 触发的 model.for_auth 放大成 N+1 请求风暴（生产 OOM 主因）。
+const dynamicModelsFailCacheTTL = 5 * time.Minute
+
 var dynamicModelsCache struct {
 	sync.RWMutex
-	models  []pluginapi.ModelInfo
-	fetched time.Time
+	models   []pluginapi.ModelInfo
+	fetched  time.Time
+	failedAt time.Time // 最近一次全量扫描失败的时间；零值表示无失败记录
 }
 
 //

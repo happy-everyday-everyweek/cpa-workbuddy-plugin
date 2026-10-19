@@ -179,7 +179,7 @@ func persistAuthTokens(authIndex string, sa *storedAuth) error {
 // markSessionDead logs the session-dead condition but does NOT write
 // disabled:true — the user explicitly requested that only manual panel
 // toggle controls the disabled flag. Auto-failover routing handles dead
-// accounts via the failure cooldown (laddered 30s..10min) without needing
+// accounts via the failure cooldown (laddered 60s..10min) without needing
 // disabled:true.
 func markSessionDead(authIndex, authID string, sa *storedAuth) error {
 	phys, err := hostAuthGetPhysical(authIndex)
@@ -363,7 +363,9 @@ func ensureScheduler() {
 
 func schedulerLoop(stop <-chan struct{}) {
 	for {
-		next := nextCheckinTime(time.Now())
+		// 叠加随机抖动：各插件槽位同刻对齐时会形成整点尖峰，抖动把全机
+		// 唤醒摊平到数分钟窗口内。
+		next := nextCheckinFireTime(time.Now())
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-stop:

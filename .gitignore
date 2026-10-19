@@ -34,3 +34,14 @@ tmp_probe_*.py
 
 # local release asset cache (binaries are published to GitHub Releases)
 release-assets/
+
+# runtime usage feed produced by the plugins at run time (not source)
+data/
+cursor/internal/plugin/data/
+
+# local Go scratch module and embedded Python runtime (environment-specific)
+.p5/
+Python/
+
+# AI-host session scratch dirs
+.workbuddy-ai/

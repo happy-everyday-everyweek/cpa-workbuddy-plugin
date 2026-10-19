@@ -54,8 +54,10 @@ description: 当开发、优化或排查 cpa-workbuddy-plugin 仓库下任意服
 1. **流式首包即停（First-Output Early Exit）**：
    - 所有插件的 `sendActivePing*` / `handleTestActiveWithAuth` 必须发起**流式请求**（`stream: true, max_tokens: 1`）；
    - 逐帧读取响应流：一旦收到**首个有效业务输出帧**（正文片段、思考片段 `reasoning_content` 或有效 chunk），立即判定模型与账号可用，退出扫描并在后台 goroutine 中异步关闭底层流与 Context（`go func() { stream.Close(); cancel() }()`），实现 **TTFT 级（0.3s~1.5s）即时返回**。
-2. **拦截 HTTP 200 下的业务错误帧**：
-   - 在收到首个有效输出前，若扫描到 `event: error` 或 JSON `error` 字段，必须如实提取错误信息并返回失败，严禁凭 HTTP 200 盲判成功。
+2. **拦截 HTTP 200 下的业务错误帧（严禁盲判首包成功）**：
+   - **严禁仅凭 `reader.Read(buf) > 0` 盲判流建立成功**！
+   - 生产实证（2026-10-11）：阿里 Qoder 面对受限或排队模型（如 `qfmodel` / Qwen3.8-Flash、`qmodel_38max`）在 HTTP 200 下首包吐出 `data: {"code":"403","message":"...10605...isQueued:true..."}`，若只读 512 字节不验内容，测试探活会误报 `ok: true, 219ms` 假成功，而真实推理会因上游长连接死等 60 秒超时崩溃。
+   - 在收到首个有效输出前，若首包或帧内容包含 `event: error`、`"code":"403"`、`"code":"10605"`、`"isQueued":true` 或 JSON `error` 字段，必须如实解析错误信息并返回失败，严禁凭首包有字节流出或 HTTP 200 盲判成功。
 3. **TLS Keep-Alive 连接池后台预热（消除跨境 1s 握手）**：
    - 当面板点击「测试」按钮打开模型选择弹窗（触发 `GET /models?auth_index=`）以及每次测试请求结束关闭流后，在生产宿主环境下（`hostBridgeAvailable() == true`）通过后台 goroutine 向对应上游域名发送一次轻量 `HEAD /` 请求并读尽关闭 `resp.Body`，将热连接放入 `streamHTTPClient` 的 `idleConn` 池；
    - 单测环境下（`hostBridgeAvailable() == false`）直接跳过预热，避免单测发起真实外网请求。
@@ -64,7 +66,38 @@ description: 当开发、优化或排查 cpa-workbuddy-plugin 仓库下任意服
 
 ---
 
-## 4. 核心规则三：OAuth / Device Flow 登录轮询防“未授权自动成功”
+## 4. 核心规则三：全链路流式不缓冲（Proxy Buffering）与推理延迟判读规范
+
+### 4.1 根因机理
+全链路拓扑：`Agent/客户端 -> Nginx (443) -> New-API (5566) -> CPA (8317) -> 上游插件`。
+1. **Nginx 反代缓冲盲区**：
+   - Nginx 默认开启 `proxy_buffering on`，会把数据积攒到 4KB/8KB 缓冲区满才一次性推给下游；大模型每吐一个字仅几十字节，导致客户端出现长达数秒甚至几十秒的“假死转圈”；
+   - 误区：在外层写 `proxy_set_header X-Accel-Buffering no;` 不会关闭 Nginx 自身缓冲（该头属于上游下发给 Nginx 的响应头，且会被子级 `location` 的 `proxy_set_header` 全部覆盖失效）。
+2. **New-API 渠道测试与用量统计感知陷阱**：
+   - **陷阱 1（测试机制）**：New-API 渠道列表的「测试」按钮底层强制发送非流式请求（`stream: false`），测的是服务端全量生成与 Blocking Aggregation 聚合的总耗时，绝不能用来评估流式打字机效果；
+   - **陷阱 2（统计指标）**：Token 用量插件（`token-usage-feed.ndjson`）的 `ttft_ns` 记录的是收到第一个 SSE 分块的时间。当上游快速返回一个业务报错帧（如 403 10605 耗时 334ms）后进入长连接挂起 60 秒时，用量插件表格中的 TTFT 仅显示 334ms，容易被误以为“响应不慢”，但实际请求 `failed: true`、`latency_ms: 60100` 且 `total_tokens: 0`。
+
+### 4.2 强制实现契约
+1. **Nginx 反代配置规范**：
+   - 反代 New-API 或 CPA 的 `location` 块必须显式配置：
+     ```nginx
+     proxy_buffering off;
+     proxy_cache off;
+     proxy_connect_timeout 60s;
+     proxy_read_timeout 600s;
+     proxy_send_timeout 600s;
+     proxy_http_version 1.1;
+     chunked_transfer_encoding on;
+     proxy_set_header Connection "";
+     ```
+   - Docker Nginx 每次变更配置文件后，必须先通过 `docker exec nginx nginx -t` 语法检测，通过后再执行 `docker exec nginx nginx -s reload`。
+2. **推理断开与慢响应排查判读法**：
+   - 验证流式是否通畅，必须使用终端 `curl -N -i`（禁用终端缓冲）直测，严禁使用 New-API 渠道测试按钮判定；
+   - 查断开或卡顿，必须交叉比对 `ttft_ns`、`latency_ms`、`failed` 与 `total_tokens` 四个字段：`total_tokens == 0` 且 `latency_ms >> ttft_ns` 且 `failed: true` 即为典型的“首包假响应、后段死等超时”特征。
+
+---
+
+## 5. 核心规则四：OAuth / Device Flow 登录轮询防“未授权自动成功”
 
 ### 4.1 根因机理
 宿主文件监控器（`fsnotify`）与插件后台巡检在调用 `writeAuthFileDirect`（写临时文件后原子 rename 覆盖）刷新存量账号的积分与令牌时，会触发文件系统的 `CREATE` 事件，使宿主将存量账号的 `HostAuthFileEntry.CreatedAt` 重置为 `time.Now()`。

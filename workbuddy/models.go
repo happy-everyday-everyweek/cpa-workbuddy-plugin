@@ -194,10 +194,30 @@ func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
 	return nil, false
 }
 
+// inDynamicModelsFailWindow 判断当前是否处于模型发现负缓存窗口内。
+// [返回] true 表示窗口内，调用方应直接放弃本次逐账号扫描。
+func inDynamicModelsFailWindow() bool {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return !dynamicModelsCache.failedAt.IsZero() && time.Since(dynamicModelsCache.failedAt) < dynamicModelsFailCacheTTL
+}
+
+// callModelsAPIFn 是 callModelsAPI 的可替换入口（探活模块同款惯例），
+// 供负缓存行为单测注入假上游，避免真实网络与宿主 RPC 依赖。
+var callModelsAPIFn = callModelsAPI
+
+// markDynamicModelsFailed 记录一次「全部账号尝试失败」，开启负缓存窗口。
+func markDynamicModelsFailed() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.failedAt = time.Now()
+	dynamicModelsCache.Unlock()
+}
+
 func storeDynamicModels(models []pluginapi.ModelInfo) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.models = models
 	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.failedAt = time.Time{} // 成功即清除负缓存窗口
 	dynamicModelsCache.Unlock()
 }
 
@@ -209,10 +229,15 @@ func storeDynamicModels(models []pluginapi.ModelInfo) {
 // 导致新增模型被静默遮蔽且无任何可观测信号。
 // [参数] storageJSON：宿主传入的账号凭据 JSON
 // [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-09-12（取消静默回退 wbModels，改由 resolveModels 统一兜底）
+// 最近修改时间 2026-10-19 13:10:00；改动原因：新增失败负缓存窗口拦截与失败标记
 func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
 		return models
+	}
+	// 负缓存窗口内直接返回 nil，让上层走 resolveModels 静态兜底；
+	// 防止每次 auth 事件都重复向上游发起注定失败的请求（OOM 风暴防护）。
+	if inDynamicModelsFailWindow() {
+		return nil
 	}
 	accessToken := ""
 	if len(storageJSON) > 0 {
@@ -226,13 +251,15 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 		log.Printf("[workbuddy] models: dynamic discovery skipped, no access token in StorageJSON (len=%d)", len(storageJSON))
 		return nil
 	}
-	dyn, err := callModelsAPI(accessToken)
+	dyn, err := callModelsAPIFn(accessToken)
 	if err != nil {
 		log.Printf("[workbuddy] models: dynamic discovery failed: %v", err)
+		markDynamicModelsFailed()
 		return nil
 	}
 	if len(dyn) == 0 {
 		log.Printf("[workbuddy] models: dynamic discovery returned 0 models")
+		markDynamicModelsFailed()
 		return nil
 	}
 	log.Printf("[workbuddy] models: dynamic discovery ok: %d models", len(dyn))
@@ -655,11 +682,19 @@ func dynamicModelsFromCacheOrAuth() []pluginapi.ModelInfo {
 
 // fetchDynamicModelsFromAnyAuth 在没有显式传入凭据的场景下（如 model.static），
 // 尝试通过宿主 auth 列表读取任意可用 workbuddy 账号的 AccessToken 拉取动态模型并写入缓存。
+// [参数] 无
+// [返回] 动态模型列表；负缓存窗口内或全部失败时返回 nil
+// 最近修改时间 2026-10-19 13:10:00（新增失败负缓存：窗口内不重扫，全败后开窗口）
 func fetchDynamicModelsFromAnyAuth() []pluginapi.ModelInfo {
+	// 负缓存窗口内直接放弃逐账号重扫（OOM 风暴防护）。
+	if inDynamicModelsFailWindow() {
+		return nil
+	}
 	files, err := hostAuthList()
 	if err != nil || len(files) == 0 {
 		return nil
 	}
+	attempted := 0
 	// 优先挑选未禁用的账号
 	for _, f := range files {
 		if f.Disabled {
@@ -669,7 +704,8 @@ func fetchDynamicModelsFromAnyAuth() []pluginapi.ModelInfo {
 		if err != nil || sa == nil || sa.Auth.AccessToken == "" {
 			continue
 		}
-		dyn, err := callModelsAPI(sa.Auth.AccessToken)
+		attempted++
+		dyn, err := callModelsAPIFn(sa.Auth.AccessToken)
 		if err == nil && len(dyn) > 0 {
 			storeDynamicModels(dyn)
 			return dyn
@@ -684,11 +720,15 @@ func fetchDynamicModelsFromAnyAuth() []pluginapi.ModelInfo {
 		if err != nil || sa == nil || sa.Auth.AccessToken == "" {
 			continue
 		}
-		dyn, err := callModelsAPI(sa.Auth.AccessToken)
+		attempted++
+		dyn, err := callModelsAPIFn(sa.Auth.AccessToken)
 		if err == nil && len(dyn) > 0 {
 			storeDynamicModels(dyn)
 			return dyn
 		}
+	}
+	if attempted > 0 {
+		markDynamicModelsFailed()
 	}
 	return nil
 }

@@ -128,6 +128,8 @@ func init() {
 	// documented in checkin.go:31 from closing stop channels during plugin
 	// teardown.
 	go watchdogLoop()
+	// 冷却前探活：独立于 watchdog 的 5s 粒度循环，见 cooldown_probe.go。
+	go cooldownProbeLoop()
 	go func() {
 		ticker := time.NewTicker(loginStatesPruneInterval)
 		defer ticker.Stop()
@@ -335,7 +337,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.16.7"
+var version = "0.16.8"
 
 func wbRegistration() registration {
 	return registration{
@@ -379,10 +381,16 @@ func wbRegistration() registration {
 // upstream call per account.
 const dynamicModelsCacheTTL = 5 * time.Minute
 
+// dynamicModelsFailCacheTTL 是模型发现「全部账号尝试失败」后的负缓存窗口：
+// 窗口内动态发现入口直接返回 nil，不再逐账号重扫。上游失败若不设负缓存，
+// 会被宿主每次 auth 重写触发的 model.for_auth 放大成 N+1 请求风暴（生产 OOM 主因）。
+const dynamicModelsFailCacheTTL = 5 * time.Minute
+
 var dynamicModelsCache struct {
 	sync.RWMutex
-	models  []pluginapi.ModelInfo
-	fetched time.Time
+	models   []pluginapi.ModelInfo
+	fetched  time.Time
+	failedAt time.Time // 最近一次全量尝试失败的时间；零值表示无失败记录
 }
 
 //
@@ -741,8 +749,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			initID = strings.TrimSpace(curSA.Account.UID)
 		}
 	}
-	if initID != "" && (isAccountCoolingDown(initID) || (curSA != nil && curSA.Account.UID != "" && isAccountCoolingDown(curSA.Account.UID))) {
-		if nextID, nextSA, hasNext := pickNextAuth(initID); hasNext && nextSA != nil {
+	if initID != "" && (isAuthModelCoolingDown(initID, upstreamModel) || (curSA != nil && curSA.Account.UID != "" && isAuthModelCoolingDown(curSA.Account.UID, upstreamModel))) {
+		if nextID, nextSA, hasNext := pickNextAuthForModel(initID, upstreamModel); hasNext && nextSA != nil {
 			curSA = nextSA
 			curBody = prepareUpstreamBody(req.Payload, req.OriginalRequest, curSA, upstreamModel)
 			reasoningEffort = reasoningEffortFromBody(curBody)
@@ -756,7 +764,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 
 	for attempt := 0; attempt <= budget; attempt++ {
-		completion, completionErr = doExecuteOnce(curBody, curSA, req.Model)
+		completion, completionErr = doExecuteOnce(curBody, curSA, req.Model, upstreamModel)
 		if completionErr == nil {
 			authUID = curSA.Account.UID
 			accountLabel = strings.TrimSpace(curSA.Account.Nickname)
@@ -769,6 +777,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			if usedAuthID == "" {
 				usedAuthID = strings.TrimSpace(curSA.Account.UID)
 			}
+			resetModelCircuit(providerName, upstreamModel)
 			break
 		}
 		// Decide whether to retry on the next account. Account-level 4xx
@@ -778,6 +787,18 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// 5xx/0/402 keep the cooldown-only path (cross-request rotation
 		// via recordAccountFailure) and skip this loop.
 		statusCode := parseUpstreamStatusFromErr(completionErr)
+		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
+		if isModelCircuitError(statusCode, completionErr.Error()) && curSA != nil {
+			currentID := strings.TrimSpace(curSA.Auth.AccessToken)
+			if currentID == "" {
+				currentID = strings.TrimSpace(curSA.Account.UID)
+			}
+			noteModelCircuitHit(providerName, upstreamModel, currentID)
+		}
+		if isModelCircuitOpen(providerName, upstreamModel) {
+			completionErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+			break
+		}
 		if !shouldRotateOnUpstreamErr(statusCode, completionErr.Error()) || attempt >= budget || curSA == nil {
 			break
 		}
@@ -785,7 +806,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		if currentID == "" {
 			currentID = strings.TrimSpace(curSA.Account.UID)
 		}
-		_, nextSA, hasNext := pickNextAuth(currentID)
+		_, nextSA, hasNext := pickNextAuthForModel(currentID, upstreamModel)
 		if !hasNext || nextSA == nil {
 			break
 		}
@@ -801,14 +822,14 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// the historical accounting path: note the failure on the LAST
 		// account actually contacted and propagate the error.
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, parseUpstreamStatusFromErr(completionErr), completionErr.Error(), reasoningEffort, 0, accountLabel, sessionKey)
-		reconcileAfterExecutorError(usedAuthID, parseUpstreamStatusFromErr(completionErr), completionErr.Error())
+		reconcileAfterExecutorErrorForModel(usedAuthID, upstreamModel, parseUpstreamStatusFromErr(completionErr), completionErr.Error())
 		statusCode := parseUpstreamStatusFromErr(completionErr)
 		if statusCode == 0 {
-			noteAccountFailure(usedAuthID, 0, completionErr.Error())
+			noteAccountFailureForModel(usedAuthID, upstreamModel, 0, completionErr.Error())
 		} else if statusCode == 200 {
 			// SSE error frame on HTTP 200: remap to 403 so isAccountFailure
 			// correctly triggers the laddered failover cooldown.
-			noteAccountFailure(usedAuthID, http.StatusForbidden, completionErr.Error())
+			noteSSEErrorFailure(usedAuthID, upstreamModel, completionErr.Error())
 		}
 		return nil, completionErr
 	}
@@ -867,7 +888,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
 		collector := &sseUsageCollector{}
-		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector)
+		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector, upstreamModel)
 		if errCollect != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error(), reasoningEffort, collector.ttftNS(started), accountLabel, sessionKey)
 			// statusCode >= 400 already went through reconcileByUID inside
@@ -876,9 +897,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			// so isAccountFailure classifies it as an account-level failure and
 			// the account enters its laddered cooldown.
 			if statusCode == 0 {
-				noteAccountFailure(req.AuthID, 0, errCollect.Error())
+				noteAccountFailureForModel(req.AuthID, upstreamModel, 0, errCollect.Error())
 			} else if statusCode < 400 {
-				noteAccountFailure(req.AuthID, http.StatusForbidden, errCollect.Error())
+				noteSSEErrorFailure(req.AuthID, upstreamModel, errCollect.Error())
 			}
 			return nil, errCollect
 		}

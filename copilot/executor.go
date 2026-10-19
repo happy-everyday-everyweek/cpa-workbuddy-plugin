@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -37,11 +38,19 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	cfg := currentConfig()
 	upstreamModel := mappedModel(req.Model, cfg)
 
-	sa := resolveTargetAuth(req.AuthID, req.StorageJSON)
+	sa := resolveTargetAuth(req.AuthID, req.StorageJSON, upstreamModel)
 	curPayload := mutateModel(req.Payload, upstreamModel)
 
 	var lastErr error
 	var finalRespBytes []byte
+
+	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时直接短路，
+	// 不再向任何账号发起上游调用——这是本机制真正的收益点。
+	if isModelCircuitOpen(providerName, upstreamModel) {
+		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
+		log.Printf("[copilot] exec %s", msg)
+		return nil, fmt.Errorf("%s", msg)
+	}
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if sa == nil {
@@ -53,17 +62,30 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		if err == nil {
 			finalRespBytes = respBytes
 			lastErr = nil
+			// 一次真实成功即证明该模型已恢复，清掉熔断残留。
+			resetModelCircuit(providerName, upstreamModel)
 			break
 		}
 
 		lastErr = err
-		noteAccountFailure(sa.AuthID, status, err.Error())
+		noteAccountFailureForModel(sa.AuthID, upstreamModel, status, err.Error())
+
+		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
+		if isModelCircuitError(status, err.Error()) {
+			if noteModelCircuitHit(providerName, upstreamModel, sa.AuthID) {
+				log.Printf("[copilot] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, sa.AuthID)
+			}
+		}
+		if isModelCircuitOpen(providerName, upstreamModel) {
+			lastErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+			break
+		}
 
 		if !shouldRotateOnUpstreamErr(status, err.Error()) {
 			break
 		}
 
-		nextSA, hasNext := pickNextAuth(sa.AuthID)
+		nextSA, hasNext := pickNextAuth(sa.AuthID, upstreamModel)
 		if !hasNext || nextSA == nil {
 			break
 		}
@@ -90,12 +112,21 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	upstreamModel := mappedModel(req.Model, cfg)
 	startTime := time.Now()
 
-	sa := resolveTargetAuth(req.AuthID, req.StorageJSON)
+	sa := resolveTargetAuth(req.AuthID, req.StorageJSON, upstreamModel)
 	curPayload := mutateModel(req.Payload, upstreamModel)
 
 	var lastStreamErr error
 	var finalResp *http.Response
 	var finalCancel context.CancelFunc
+
+	// 模型级风控熔断前置检查：被拦模型的请求直接短路，不再消耗任何账号。
+	if isModelCircuitOpen(providerName, upstreamModel) {
+		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
+		log.Printf("[copilot] exec stream %s", msg)
+		streamEmitError(req.StreamID, msg)
+		streamClose(req.StreamID)
+		return okEnvelope(streamResponse{Headers: streamHeaders()})
+	}
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if sa == nil {
@@ -115,8 +146,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		if err != nil {
 			cancel()
 			lastStreamErr = err
-			noteAccountFailure(sa.AuthID, 0, err.Error())
-			nextSA, hasNext := pickNextAuth(sa.AuthID)
+			noteAccountFailureForModel(sa.AuthID, upstreamModel, 0, err.Error())
+			nextSA, hasNext := pickNextAuth(sa.AuthID, upstreamModel)
 			if !hasNext || nextSA == nil {
 				break
 			}
@@ -130,10 +161,21 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			cancel()
 			errMsg := fmt.Sprintf("upstream status %d: %s", resp.StatusCode, string(body))
 			lastStreamErr = fmt.Errorf("%s", errMsg)
-			noteAccountFailure(sa.AuthID, resp.StatusCode, errMsg)
+			noteAccountFailureForModel(sa.AuthID, upstreamModel, resp.StatusCode, errMsg)
+
+			// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
+			if isModelCircuitError(resp.StatusCode, errMsg) {
+				if noteModelCircuitHit(providerName, upstreamModel, sa.AuthID) {
+					log.Printf("[copilot] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, sa.AuthID)
+				}
+			}
+			if isModelCircuitOpen(providerName, upstreamModel) {
+				lastStreamErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+				break
+			}
 
 			if shouldRotateOnUpstreamErr(resp.StatusCode, errMsg) {
-				nextSA, hasNext := pickNextAuth(sa.AuthID)
+				nextSA, hasNext := pickNextAuth(sa.AuthID, upstreamModel)
 				if hasNext && nextSA != nil {
 					sa = nextSA
 					continue
@@ -165,23 +207,24 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 
 	// 异步读取并逐块推送
-	go pumpUpstreamStream(context.Background(), finalCancel, req.StreamID, finalResp, authID, accountLabel, startTime)
+	go pumpUpstreamStream(context.Background(), finalCancel, req.StreamID, finalResp, authID, accountLabel, upstreamModel, startTime)
 
 	return okEnvelope(streamResponse{Headers: streamHeaders()})
 }
 
 // resolveTargetAuth 按请求指定的 auth_id 解析目标账号，缺失时回退调度器选号。
-// [参数] reqAuthID: 宿主指定的账号标识；storageJSON: 宿主随请求下发的凭据快照。
+// [参数] reqAuthID: 宿主指定的账号标识；storageJSON: 宿主随请求下发的凭据快照；
+// model: 已归一化的上游模型名，用于模型维度冷却判定，可为空。
 // [返回] 目标账号；无可选账号时返回 nil。
-// 最近修改时间：2026-10-15；改动原因：新增，Copilot 账号解析与兜底选号。
-func resolveTargetAuth(reqAuthID string, storageJSON []byte) *StoredAuth {
+// 最近修改时间：2026-10-19 02:00:00；改动原因：冷却判定带模型维度。
+func resolveTargetAuth(reqAuthID string, storageJSON []byte, model string) *StoredAuth {
 	if len(storageJSON) > 0 {
 		var sa StoredAuth
 		if err := json.Unmarshal(storageJSON, &sa); err == nil && credentialOf(&sa) != "" {
 			if sa.AuthID == "" {
 				sa.AuthID = authIDFor(sa.GitHubToken)
 			}
-			if accountRoutable(&sa) {
+			if accountRoutable(&sa, model) {
 				return &sa
 			}
 		}
@@ -195,7 +238,7 @@ func resolveTargetAuth(reqAuthID string, storageJSON []byte) *StoredAuth {
 			for _, acc := range accounts {
 				if acc.AuthID == reqAuthID || acc.AuthID == cleanAuthID ||
 					authFileNameFor(acc.GitHubToken) == cleanAuthID+".json" {
-					if accountRoutable(acc) {
+					if accountRoutable(acc, model) {
 						return acc
 					}
 				}
@@ -204,7 +247,7 @@ func resolveTargetAuth(reqAuthID string, storageJSON []byte) *StoredAuth {
 	}
 
 	// 从调度器选取健康账号
-	if sa := pickActiveAuth(); sa != nil {
+	if sa := pickActiveAuth(model); sa != nil {
 		return sa
 	}
 

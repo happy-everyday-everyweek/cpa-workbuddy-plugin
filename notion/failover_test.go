@@ -24,7 +24,7 @@ func TestFailoverCooldownLadder(t *testing.T) {
 		{count: 19, base: 30, want: 570 * time.Second},
 		{count: 20, base: 30, want: 600 * time.Second},
 		{count: 100, base: 30, want: 600 * time.Second},
-		{count: 1, base: 0, want: 30 * time.Second},
+		{count: 1, base: 0, want: 60 * time.Second},
 		{count: 1, base: 120, want: 120 * time.Second},
 		{count: 10, base: 120, want: 600 * time.Second},
 	}

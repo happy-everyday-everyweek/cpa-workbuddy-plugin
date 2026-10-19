@@ -222,6 +222,7 @@ func traeToolsFromOpenAI(tools []map[string]any) []map[string]any {
 //   - "none"（字符串或对象）→ 返回 suppress=true，调用方必须删除 tools
 //     （上游实测：tool_choice:none 带非空 tools 时仍会输出 tool_calls）；
 //   - 其它未知形态 → 返回 suppress=true（删除该字段最安全）。
+//
 // [参数] tc: 客户端请求的 tool_choice 原始值（可为 nil）。
 // [返回] choice: 规范化后的字符串（空串表示不设置）；suppress: 是否要求删除 tools。
 // 最近修改时间：2026-09-03；改动原因：P0-①——tool_choice 上行 schema 适配。
@@ -302,10 +303,28 @@ func apiHostFor(a *traeAuth) string {
 	return strings.TrimRight(loadedConfig().APIHost, "/")
 }
 
+// modelKeyFromPayload 从已构造的上游负载中取归一化模型键，供账号×模型级记账使用。
+//
+// payload 由 buildTraePayload 生成：有精确 config_name 时同时写入 config_name 与
+// model；auto 或空模型时两者都缺省，此时返回空串退化为账号级记账。
+//
+// [参数] payload：即将发往上游的请求体。
+// [返回] 归一化后的上游模型名；无模型维度时为空串。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供 callLLM 记账带模型维度。
+func modelKeyFromPayload(payload map[string]any) string {
+	if v, ok := payload["config_name"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if v, ok := payload["model"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
 // callLLM 通过宿主普通 HTTP 桥执行需要完整响应体的 llm_utils_chat 请求。
 // [参数] a: Trae 账号；payload: 上游请求体；authID: 故障核算使用的账号标识。
 // [返回] hostHTTPResponse: 完整缓冲响应；error: 请求构造、传输或 HTTP 状态错误。
-// 最近修改时间：2026-08-30 23:40:18；改动原因：同步路径不再凭 HTTP 2xx 提前复位账号，业务成功改由 SSE done 确认。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：记账带模型维度，限流类失败只冷却该模型。
 func callLLM(a *traeAuth, payload map[string]any, authID string) (*hostHTTPResponse, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -317,15 +336,16 @@ func callLLM(a *traeAuth, payload map[string]any, authID string) (*hostHTTPRespo
 		return nil, err
 	}
 	req.Header = buildTraeAuthHeaders(a)
+	modelKey := modelKeyFromPayload(payload)
 	resp, err := hostHTTPDo(req)
 	if err != nil {
 		// Transport error counts as an account-level failure (status 0).
-		noteAccountFailure(authID, 0, err.Error())
+		noteAccountFailureForModel(authID, modelKey, 0, err.Error())
 		return nil, fmt.Errorf("llm_utils_chat transport: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := truncateRedacted(string(resp.Body), 300)
-		noteAccountFailure(authID, resp.StatusCode, string(resp.Body))
+		noteAccountFailureForModel(authID, modelKey, resp.StatusCode, string(resp.Body))
 		return nil, &UpstreamError{Status: resp.StatusCode, Body: body}
 	}
 	// HTTP 2xx 只代表传输成功，SSE 业务终止必须由调用方收到 done 后确认。
@@ -335,7 +355,7 @@ func callLLM(a *traeAuth, payload map[string]any, authID string) (*hostHTTPRespo
 // callLLMStream 通过宿主流桥打开 llm_utils_chat，并保留响应体的实时读取能力。
 // [参数] a: Trae 账号；payload: 上游请求体；authID: 故障核算使用的账号标识；hostCallbackID: CPA 异步执行的 callback 标识。
 // [返回] hostHTTPStream: 实时响应流；statusCode: HTTP 状态码；error: 请求构造、传输或非 2xx 错误。
-// 最近修改时间：2026-08-30 23:40:18；改动原因：异步聊天透传 callback context，并边读边下发，避免长回答期间客户端收不到分片。
+// 最近修改时间：2026-10-19 01:20:00；改动原因：记账带模型维度，限流类失败只冷却该模型。
 func callLLMStream(a *traeAuth, payload map[string]any, authID, hostCallbackID string) (*hostHTTPStream, int, error) {
 	// 1. 复用同步路径的请求体和认证头构造，确保两条路径只在响应读取方式上不同。
 	raw, err := json.Marshal(payload)
@@ -348,21 +368,22 @@ func callLLMStream(a *traeAuth, payload map[string]any, authID, hostCallbackID s
 		return nil, 0, err
 	}
 	req.Header = buildTraeAuthHeaders(a)
+	modelKey := modelKeyFromPayload(payload)
 
 	// 2. 非 2xx 响应读取有限正文后关闭流，沿用现有账号故障分类与脱敏错误结构。
 	stream, statusCode, _, err := hostHTTPDoStream(req, hostCallbackID)
 	if err != nil {
-		noteAccountFailure(authID, 0, err.Error())
+		noteAccountFailureForModel(authID, modelKey, 0, err.Error())
 		return nil, 0, fmt.Errorf("llm_utils_chat stream transport: %w", err)
 	}
 	if statusCode < 200 || statusCode >= 300 {
 		defer stream.Close()
 		body, readErr := io.ReadAll(io.LimitReader(newHostStreamReader(stream), maxBodyBytes))
 		if readErr != nil {
-			noteAccountFailure(authID, statusCode, readErr.Error())
+			noteAccountFailureForModel(authID, modelKey, statusCode, readErr.Error())
 			return nil, statusCode, fmt.Errorf("read llm_utils_chat error body: %w", readErr)
 		}
-		noteAccountFailure(authID, statusCode, string(body))
+		noteAccountFailureForModel(authID, modelKey, statusCode, string(body))
 		return nil, statusCode, &UpstreamError{Status: statusCode, Body: truncateRedacted(string(body), 300)}
 	}
 	return stream, statusCode, nil
@@ -418,10 +439,10 @@ func scanSSE(r io.Reader, fn func(ev sseEvent) error, hasPayload func() bool) er
 				if event == "" {
 					ev.Event = "message"
 				}
-					if err := fn(ev); err != nil {
-						if err == errTraeStreamDone {
-							return nil
-						}
+				if err := fn(ev); err != nil {
+					if err == errTraeStreamDone {
+						return nil
+					}
 					return err
 				}
 			default:

@@ -35,6 +35,12 @@ const (
 	checkinRetryMax = 60
 	// checkinRetryTick bounds how often the retry loop scans for due work.
 	checkinRetryTick = 15 * time.Second
+	// checkinRetryConcurrency 是单轮重试的并发上限。
+	//
+	// 原实现给每个到期账号直接起一个 goroutine，账号规模上来后一次 tick
+	// 可能瞬时打出 N 个上游请求。取 4 与签到本身（runAutoCheckin 的 sem=4）
+	// 对齐：重试只是补签，没必要比正常签到更激进。
+	checkinRetryConcurrency = 4
 )
 
 // checkinRetryEntry tracks one account's retry state.
@@ -52,6 +58,10 @@ var (
 	checkinRetryMu    sync.Mutex
 	checkinRetryQueue = make(map[string]*checkinRetryEntry)
 )
+
+// processCheckinRetryFn 是单条重试的可替换入口，供单测注入阻塞式假处理
+// 以验证并发上限；生产默认指向真实实现。
+var processCheckinRetryFn = processCheckinRetry
 
 // checkinRetryable reports whether a failure message is worth retrying.
 // Credential-less accounts can never succeed, so they are excluded.
@@ -137,14 +147,43 @@ func checkinRetrySnapshot() []map[string]any {
 
 // checkinRetryLoop pops due entries and re-attempts their check-in until
 // success or the attempt cap. Started once from init().
+//
+// 每轮用信号量把并发压到 checkinRetryConcurrency，并等本轮全部结束后再进入
+// 下一个 tick：重试是补签，不该在账号多时把上游打成瞬时尖峰，也不该让
+// 慢请求无限堆积。
 func checkinRetryLoop() {
 	ticker := time.NewTicker(checkinRetryTick)
 	defer ticker.Stop()
 	for range ticker.C {
-		for _, e := range popDueCheckinRetries() {
-			go processCheckinRetry(e)
-		}
+		runCheckinRetryRound()
 	}
+}
+
+// runCheckinRetryRound 处理当前所有到期条目，并发上限 checkinRetryConcurrency。
+//
+// 条目在 popDueCheckinRetries 中已移出队列，因此必须等待本轮全部完成，
+// 否则未处理的条目会在下一轮被重新排期前处于「既不在队列也不在处理」
+// 的悬空状态。
+//
+// [参数] 无。
+// [返回] 无（阻塞至本轮结束）。
+func runCheckinRetryRound() {
+	due := popDueCheckinRetries()
+	if len(due) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, checkinRetryConcurrency)
+	for _, e := range due {
+		wg.Add(1)
+		go func(entry *checkinRetryEntry) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			processCheckinRetryFn(entry)
+		}(e)
+	}
+	wg.Wait()
 }
 
 // popDueCheckinRetries removes every entry whose NextAt has passed and

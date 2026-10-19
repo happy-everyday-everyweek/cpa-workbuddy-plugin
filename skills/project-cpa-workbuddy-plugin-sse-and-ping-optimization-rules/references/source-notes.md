@@ -10,6 +10,16 @@
   4. `traework` 0.2.8：定位并修复面板「测试」按钮（`sendActivePingTrae`）使用非流式 `hostHTTPDo` 被迫等待思考模型（如 `glm-5.3-flash`）生成全部 264 个 `reasoning_content` token（耗时 5.6~8.1s）及未拦截 HTTP 200 `event: error` 的问题；改为流式首包即停（`verifyActivePingTraeStream`）+ `prewarmStreamHTTPClient` 后台预热 TLS Keep-Alive 连接 + 过滤内部非对话子代理占位项，生产同账号实测 `glm-5.3-flash` 从 `5.615s` 降至 `1.543s`、`deepseek-v4.1-flash` 降至 `943ms`、`qwen3.8-max` 降至 `1.388s`。
 - **同域冗余扫描**：与 `project-cpa-workbuddy-plugin-trae-local-verify-rules`（只管本地解密 storage.json 直连验证脚本）、`project-cpa-workbuddy-plugin-release-rules`（只管 CI 发布与生产部署链路）职责正交，无逐字重复与门控冲突。
 
+## 2026-10-11 补充：HTTP 200 首包业务报错帧假成功与全链路流式不缓冲规范
+
+- **触发原因**：用户排查 New-API 接入 Qwen-3.8-Flash 慢卡死但 CPA 面板测试很快（219ms）、Token 用量插件显示响应不慢（334ms）的故障。
+- **根因沉淀**：
+  1. 阿里 Qoder 上游对受限/排队模型返回 HTTP 200 下的 `data: {"code":"403",... "10605"}`，`active_ping` 盲读 512 字节未验内容致 219ms 假成功，而真实推理因上游长连接挂起 60s 超时；
+  2. 用量插件 `ttft_ns` 记录到首包 334ms，但实际 `failed: true`、`latency_ms: 60100` 且 `total_tokens: 0`；
+  3. New-API 渠道测试强制 `stream: false`，不能用于流式验证；
+  4. Nginx 必须显式配置 `proxy_buffering off; proxy_cache off;` 并通过 `docker exec nginx nginx -t && nginx -s reload` 重载。
+- **落点**：更新 `project-cpa-workbuddy-plugin-sse-and-ping-optimization-rules/SKILL.md` 的核心规则二与核心规则三。
+
 ## 2026-10-12 补充：顶层 code 排队帧必须在解析器侧识别（数据面根因，非探活侧）
 
 - **触发原因**：用户报告「还是不能从 new-api 请求 cpa 的 qwen-3.8-flash、qwen-3.8 模型，但是 cpa 本身测试是可以的」。上一轮（2026-10-11）已把该现象沉淀为「探活侧首包盲判」，但**数据面解析器侧的根因当时未收敛**——本轮补齐。
