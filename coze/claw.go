@@ -58,6 +58,13 @@ const (
 	// message/list 只返回已落库的完整消息，实测约 4 秒才出现；
 	// 500ms 是「不漏首次出现」与「不打爆上游」之间的折中。
 	clawPollInterval = 500 * time.Millisecond
+
+	// clawMaxContentBytes 是 message/chat 的 content 硬上限。
+	//
+	// 上游把消息落库时按 65536 字节截断边界判定，越界直接返回
+	// code=1000003「数据库错误」而不是参数错误。二分实测（2026-10-19）：
+	// 65535 字节成功、65536 字节失败。
+	clawMaxContentBytes = 65535
 )
 
 // clawEnvelope 是 claw 接口的通用响应外壳。
@@ -334,12 +341,59 @@ func (c *clawClient) fetchMainSession(clawID string) (string, error) {
 	return sessionID, nil
 }
 
+// verifyChatContent 校验待提交内容是否在上游体积上限内。
+//
+// 为什么必须在发请求前拦：上游对超限内容返回 code=1000003「数据库错误」，
+// 宿主会把它当账号级失败把账号打入冷却，一次超长请求会让整个账号池
+// 在冷却期内全部返回 auth_unavailable（2026-10-19 生产实证）。
+// 提前拦成请求级错误，既不让上游白跑，也不污染账号可用性。
+// [参数] content: 待提交的用户文本。
+// [返回] 超限时返回带字节数的错误。
+// 最近修改时间：2026-10-19；改动原因：新增，64KB 超限的前置拦截。
+func verifyChatContent(content string) error {
+	size := len(content)
+	if size <= clawMaxContentBytes {
+		return nil
+	}
+	return &chatContentTooLongError{size: size, limit: clawMaxContentBytes}
+}
+
+// chatContentTooLongError 表示请求正文超出上游体积上限。
+//
+// 实现 StatusCode 让宿主把它归入请求级故障（413 在
+// IsRequestFault 的白名单内），从而跳过账号冷却与换号重试。
+// [参数] 无。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，请求级故障语义。
+type chatContentTooLongError struct {
+	size  int
+	limit int
+}
+
+// Error 返回可直接展示给下游的错误说明。
+// [参数] 无。
+// [返回] 错误文案。
+// 最近修改时间：2026-10-19；改动原因：新增，超限文案。
+func (e *chatContentTooLongError) Error() string {
+	return fmt.Sprintf("请求内容过长：%d 字节，扣子上限 %d 字节（约 64KB），请缩短对话历史后重试", e.size, e.limit)
+}
+
+// StatusCode 返回 HTTP 413，供宿主判定为请求级故障。
+// [参数] 无。
+// [返回] 413。
+// 最近修改时间：2026-10-19；改动原因：新增，避免超限请求冷却账号。
+func (e *chatContentTooLongError) StatusCode() int {
+	return http.StatusRequestEntityTooLarge
+}
+
 // sendChat 提交一条用户消息，返回其 message_id。
 //
 // 该调用是异步的：返回时上游只完成了入队，回复内容随后经 WS 推送。
+// 体积校验由调用方的同步入口完成（见 executor.go）：只有那里能把
+// 413 经 RPC 信封回传宿主，让宿主判为请求级故障而不是账号故障。
 // [参数] sessionID: 目标会话；content: 用户文本。
 // [返回] 用户消息 ID 与错误。
-// 最近修改时间：2026-10-18；改动原因：新增，消息提交入口。
+// 最近修改时间：2026-10-19；改动原因：体积上限收敛到同步入口校验。
 func (c *clawClient) sendChat(sessionID, content string) (string, error) {
 	payload := map[string]any{
 		"session_id": sessionID,
@@ -353,6 +407,9 @@ func (c *clawClient) sendChat(sessionID, content string) (string, error) {
 		return "", err
 	}
 	if !env.isSuccess() {
+		// 兜底：本地预检放行但上游仍报该码时，按上游服务端故障处理，
+		// 保留原始码值。不能在这里猜成「内容过长」——体积正常时该码
+		// 也可能出现，误标会让用户反复删内容却毫无改善。
 		return "", fmt.Errorf("提交消息失败：%s", env.describe())
 	}
 

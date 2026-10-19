@@ -537,6 +537,12 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		model = chatReq.Model
 	}
 
+	// 与流式入口同样的体积预检：超限内容在上游只换来 code=1000003，
+	// 却会被宿主记成账号故障并冷却账号。
+	if errSize := verifyChatContent(prompt); errSize != nil {
+		return nil, errSize
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
 	defer cancel()
 
@@ -610,6 +616,13 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	model := req.Model
 	if chatReq.Model != "" {
 		model = chatReq.Model
+	}
+
+	// 体积预检必须在同步入口完成：这里是唯一能把 413 经 RPC 信封
+	// 回传宿主的位置。后台协程里的失败只能走 stream.emit 的纯文本
+	// error 字段，宿主看不到状态码，会把它当账号级故障冷却整个池。
+	if errSize := verifyChatContent(prompt); errSize != nil {
+		return nil, errSize
 	}
 
 	headers := streamHeaders()

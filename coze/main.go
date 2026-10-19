@@ -48,6 +48,7 @@ import "C"
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -65,7 +66,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.4.5"
+	version      = "0.4.6"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -145,7 +146,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 
 	raw, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
+		writeExecutionError(response, err)
 		return 1
 	}
 	writeResponse(response, raw)
@@ -216,6 +217,13 @@ type envelope struct {
 type envelopeError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Retryable 与 HTTPStatus 是宿主 rpc_client 解读请求级故障的字段。
+	//
+	// 缺失时宿主把插件错误一律按 5xx 处理：会冷却账号并换号重试，
+	// 对「请求本身非法」的失败既浪费配额又让整个账号池不可用
+	// （2026-10-19 生产实证：超长内容把两个账号同时打入冷却）。
+	Retryable  bool `json:"retryable,omitempty"`
+	HTTPStatus int  `json:"http_status,omitempty"`
 }
 
 type identifierResponse struct {
@@ -406,6 +414,56 @@ func marshalNoHTMLEscape(v any) ([]byte, error) {
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
 	return raw
+}
+
+// requestFaultEnvelope 构造请求级故障信封。
+//
+// 带上 http_status 才能让宿主按 4xx 归类：宿主的请求级判定只认
+// 状态码白名单（400/409/413/422），缺失时一律当 5xx，会冷却账号
+// 并换号重试——对「请求本身非法」的失败这是错的（2026-10-19 实证）。
+// [参数] status: HTTP 状态码；code: 错误码；message: 错误说明。
+// [返回] 信封 JSON。
+// 最近修改时间：2026-10-19；改动原因：新增，请求级故障不冷却账号。
+func requestFaultEnvelope(status int, code, message string) []byte {
+	raw, errMarshal := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}})
+	if errMarshal != nil {
+		return errorEnvelope(code, message)
+	}
+	return raw
+}
+
+// statusCoder 是可自报 HTTP 状态码的错误。
+//
+// 只有实现了该接口的错误才会被当作请求级故障回传：普通上游失败仍走
+// 5xx 通道，保持「账号可能有问题、应当换号」的原语义。
+// [参数] 无。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，状态码识别契约。
+type statusCoder interface {
+	StatusCode() int
+}
+
+// writeExecutionError 按错误类型回写执行器失败信封。
+//
+// 带状态码的请求级错误用 requestFaultEnvelope（宿主据此跳过冷却与换号）；
+// 其余错误保持原有的通用错误信封，语义不变。
+// [参数] response: 宿主缓冲区指针；err: 执行错误。
+// [返回] 无。
+// 最近修改时间：2026-10-19；改动原因：新增，执行器错误分类回写。
+func writeExecutionError(response *C.cliproxy_buffer, err error) {
+	var coder statusCoder
+	if errors.As(err, &coder) {
+		status := coder.StatusCode()
+		if status >= 400 && status < 500 {
+			writeResponse(response, requestFaultEnvelope(status, "invalid_request", err.Error()))
+			return
+		}
+	}
+	writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 }
 
 // writeResponse 把响应字节写入宿主提供的缓冲区。
