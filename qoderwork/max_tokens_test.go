@@ -55,7 +55,7 @@ func TestAdaptiveMaxTokens(t *testing.T) {
 }
 
 func TestWbModels_OfficialSpecs(t *testing.T) {
-	models := wbModels()
+	models := exposeModelIDs(wbModels())
 	for _, m := range models {
 		if m.ID == "GLM-5.3" && m.MaxCompletionTokens != 128000 {
 			t.Fatalf("GLM-5.3 MaxCompletionTokens = %d, want 128000", m.MaxCompletionTokens)

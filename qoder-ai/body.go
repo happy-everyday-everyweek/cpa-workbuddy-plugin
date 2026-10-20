@@ -27,6 +27,15 @@ func cpaToUpstreamKey(cpaModel string) string {
 	// Cantus
 	case "cantus", "cmodel":
 		return "cmodel"
+	// 国际版套餐档位代号
+	case "ultimate":
+		return "ultimate"
+	case "performance":
+		return "performance"
+	case "efficient":
+		return "efficient"
+	case "sonus", "smodel":
+		return "smodel"
 	// Qwen
 	case "qwen3.8-max", "qwen3.8-max-preview", "qmodel_38max", "qmodel_preview":
 		return "qmodel_38max"

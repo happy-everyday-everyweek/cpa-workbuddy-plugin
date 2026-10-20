@@ -1,5 +1,20 @@
 # QoderWork Plugin Changelog
 
+## 0.9.49
+
+### Fix - 模型对外 ID 改用官方展示名，并补齐执行链回译
+
+- 变更要点:
+  1. 根因：上游 `model/list` 只返回内部代号（`qmodel_38max`/`qfmodel`），插件原样把它当模型 ID 注册给宿主；而客户端下拉展示的是官方名（`Qwen3.8-Max`/`Qwen3.8-Flash`）。宿主 `/v1/models` 只渲染 `id` 字段，插件的 `Name`（官方名）被丢弃，于是生产模型表里全是代号，用户按客户端名字找不到模型。
+  2. 对外暴露：新增 `exposeModelIDs`，把每个内部代号展开成「官方名主条目（ID/DisplayName 均为官方名）+ 兼容代号条目」两份。宿主按完整模型名反查 provider 与匹配账号，兼容条目必须真实注册，否则旧调用方请求 `qmodel_38max` 会 400 `unknown provider for model`。
+  3. 静态兜底：`wbModels()` 改为**只存内部代号**，对外口径统一由 `exposeModelIDs` 生成，避免「静态表已含官方名 + 展开再加一份」造成重复条目。
+  4. 执行链补齐：暴露官方名后，`cpaToUpstreamKey` 必须能把官方名回译成上游 key，否则请求会静默落到 `auto`。新增 `Qwen3.7-Flash → q37fmodel`；修正 `GLM-5.2` 由 `gmodel`（实际是 GLM-5.3）改为 `gm51model`。
+  5. 排除规则：`filterExcludedModels` 改为按「完整 ID / 官方名 / 内部代号」三形态匹配，任一命中即排除，避免 ID 改写后 `excluded-models` 静默失效。
+- 验证: 新增 `models_expose_test.go`（官方名主条目、代号兼容条目、未知 ID 透传、provider 前缀剥离、去重、**全量代号回译不变量**、排除多形态匹配、过滤不污染输入切片）；两次变异反证精确捕获（删除 `Qwen3.7-Flash` 映射 → 回译用例 FAIL；主条目改用内部代号 → 展开与对齐用例共 5 例 FAIL）；cgo-shim build/vet/test 全绿；gofmt 干净。
+- 边界说明: 用户原选的「插件侧加 provider 前缀区分同名模型」经生产实测不可行 —— 宿主按模型名反查 provider，`qoderwork-provider/Qwen3.8-Max` 直接 400 `unknown provider for model`。因此 qoderwork 与 qoder-ai 仍共享一个全局模型名空间，同名模型由宿主 `GetModelProviders` 返回多 provider 并按调用账号择路。
+- 依据: 用户报障「客户端能看到很多模型，插件接口一个都没有」；外部参考 `shuishuipingan/qoder2api-hub` 的官方 `display_name` 用作模型 id 的做法。
+- 涉及文件: qoderwork/models.go、qoderwork/body.go、qoderwork/models_expose_test.go、qoderwork/models_config_test.go、qoderwork/max_tokens_test.go、qoderwork/VERSION、qoderwork/CHANGELOG.md
+
 ## 0.9.48
 
 ### Fix - 模型清单按账号分片 + 发现顺序改为额度优先

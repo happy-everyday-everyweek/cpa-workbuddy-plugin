@@ -222,14 +222,17 @@ func TestNoConfiguredModels_FallsBackToStatic(t *testing.T) {
 		t.Fatalf("handleModelStatic: %v", err)
 	}
 	resp := decodeModelResponse(t, raw)
-	if len(resp.Models) != len(wbModels()) {
-		t.Fatalf("fallback model count = %d, want %d", len(resp.Models), len(wbModels()))
+	// 静态表存内部代号，handler 对外统一经 exposeModelIDs 展开成
+	// 「官方名主条目 + 兼容代号条目」，断言基准必须用同一口径。
+	want := exposeModelIDs(wbModels())
+	if len(resp.Models) != len(want) {
+		t.Fatalf("fallback model count = %d, want %d", len(resp.Models), len(want))
 	}
 }
 
 // TestWBModels_AlignmentWithClient 验证静态兜底模型列表与 Qoder 客户端权威配置一致。
 func TestWBModels_AlignmentWithClient(t *testing.T) {
-	models := wbModels()
+	models := exposeModelIDs(wbModels())
 	if len(models) == 0 {
 		t.Fatalf("wbModels must not be empty")
 	}

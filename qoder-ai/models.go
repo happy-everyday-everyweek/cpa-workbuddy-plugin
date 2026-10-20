@@ -18,37 +18,131 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// internalKeyDisplayNames 映射上游内部模型代号到官方展示名。
+//
+// 官方名取自 Qoder 客户端模型目录（与 qoder2api-hub 的 qoder_catalog_intl.json
+// 逐项一致）。国际版独有 ultimate / performance / efficient / smodel / cmodel，
+// 国内版独有 q37fmodel / gm51model，两边都列在这里：同一个代号在两区代表的
+// 型号可能不同（如 mmodel 国际版是 MiniMax-M3、国内版是 MiniMax-M2.7），
+// 各插件按自己的区维护这份表。
+var internalKeyDisplayNames = map[string]string{
+	"auto":          "Auto",
+	"ultimate":      "Ultimate",
+	"performance":   "Performance",
+	"efficient":     "Efficient",
+	"smodel":        "Sonus",
+	"cmodel":        "Cantus",
+	"qmodel_38max":  "Qwen3.8-Max",
+	"qfmodel":       "Qwen3.8-Flash",
+	"qmodel_latest": "Qwen3.7-Max",
+	"qmodel":        "Qwen3.7-Plus",
+	"gmodel":        "GLM-5.3",
+	"gfmodel":       "GLM-5.3-Flash",
+	"kmodel_latest": "Kimi-K3",
+	"kmodel":        "Kimi-K2.8-Preview",
+	"dmodel":        "DeepSeek-V4-Pro",
+	"dfmodel":       "DeepSeek-Flash",
+	"mmodel":        "MiniMax-M3",
+}
+
+// modelDisplayName 返回模型的官方展示名：内部代号查表，已是官方名则原样返回。
+// [参数] modelID：模型标识（内部代号或官方名，允许带 provider/ 前缀）
+// [返回] 官方展示名；无法识别时返回去掉前缀后的原值
+// 最近修改时间 2026-10-20（新增，模型对外 ID 改用官方名）
+func modelDisplayName(modelID string) string {
+	id := strings.TrimSpace(modelID)
+	if i := strings.Index(id, "/"); i >= 0 {
+		id = strings.TrimSpace(id[i+1:])
+	}
+	if id == "" {
+		return ""
+	}
+	if name, ok := internalKeyDisplayNames[strings.ToLower(id)]; ok {
+		return name
+	}
+	return id
+}
+
+// exposeModelIDs 把上游内部代号改写成客户端可读的官方模型名。
+//
+// 每个已知内部代号产出两个条目，共用同一份元数据（Name 恒为内部代号）：
+//  1. 主条目 ID = 官方名（Qwen3.8-Max），DisplayName 同步为官方名：客户端
+//     下拉里显示的就是它，与 Qoder 官方客户端一致；
+//  2. 兼容条目 ID = 内部代号（qmodel_38max），仅当两者不同时追加。
+//
+// 兼容条目必须真实注册而不能只做映射：宿主用模型名反查 provider
+// （internal/util/provider.go GetProviderName → registry.GetModelProviders），
+// 未注册的名字直接回 `unknown provider for model` 400；选号侧同样按完整模型名
+// 匹配账号（sdk/cliproxy/auth/conductor_selection.go authSupportsRouteModel）。
+//
+// 无法识别的 ID（用户配置的模型、上游新增但未登记官方名的代号）原样透传。
+// [参数] models：内部代号列表
+// [返回] 主条目在前、兼容条目随后的新切片
+// 最近修改时间 2026-10-20（新增）
+func exposeModelIDs(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	out := make([]pluginapi.ModelInfo, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+	add := func(m pluginapi.ModelInfo, id, displayName, internalKey string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		m.ID = id
+		m.DisplayName = displayName
+		m.Name = internalKey
+		out = append(out, m)
+	}
+	for _, m := range models {
+		base := strings.TrimSpace(m.ID)
+		if i := strings.Index(base, "/"); i >= 0 {
+			base = strings.TrimSpace(base[i+1:])
+		}
+		if base == "" {
+			continue
+		}
+		display, known := internalKeyDisplayNames[strings.ToLower(base)]
+		if !known {
+			add(m, base, m.DisplayName, base)
+			continue
+		}
+		add(m, display, display, base)
+		// 兼容条目按原始写法注册：auto / ultimate 这类代号与官方名只差大小写，
+		// EqualFold 判等会漏注册，而宿主反查 provider 区分大小写之外的精确名字，
+		// 用 add 内部的 seen 精确比较即可，这里不跳过。
+		add(m, base, "", base)
+	}
+	return out
+}
+
 // wbModels is the static fallback model list for Qoder AI Global. Keys mirror
 // /root/qoderwork/models_list.json (KNOWLEDGE §6.2). Aliases use the qoder/
 // prefix in AuthAttributes; bare IDs work too. Dynamic refresh via
 // /algo/api/v2/model/list replaces this at runtime when an account is present.
+//
+// 只放上游内部代号，所有对外暴露统一由 exposeModelIDs 展开成官方名主条目
+// + 兼容代号条目，保证静态兜底与动态发现的对外口径完全一致。
 func wbModels() []pluginapi.ModelInfo {
 	list := []pluginapi.ModelInfo{
-		{ID: "auto", Name: "Auto", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Cantus", Name: "Cantus", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Qwen3.8-Max", Name: "Qwen3.8-Max", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Qwen3.8-Flash", Name: "Qwen3.8-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Qwen3.7-Max", Name: "Qwen3.7-Max", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Qwen3.7-Plus", Name: "Qwen3.7-Plus", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "GLM-5.3", Name: "GLM-5.3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "GLM-5.3-Flash", Name: "GLM-5.3-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Kimi-K3", Name: "Kimi-K3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "Kimi-K2.8-Preview", Name: "Kimi-K2.8-Preview", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "DeepSeek-V4-Pro", Name: "DeepSeek-V4-Pro", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "DeepSeek-Flash", Name: "DeepSeek-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "MiniMax-M3", Name: "MiniMax-M3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "cmodel", Name: "Cantus", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel_38max", Name: "Qwen3.8-Max", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qfmodel", Name: "Qwen3.8-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel_latest", Name: "Qwen3.7-Max", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel", Name: "Qwen3.7-Plus", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "gmodel", Name: "GLM-5.3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "gfmodel", Name: "GLM-5.3-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "kmodel_latest", Name: "Kimi-K3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "kmodel", Name: "Kimi-K2.8-Preview", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "dmodel", Name: "DeepSeek-V4-Pro", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "dfmodel", Name: "DeepSeek-Flash", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "mmodel", Name: "MiniMax-M3", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "auto", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "ultimate", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "performance", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "efficient", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "smodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "cmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel_38max", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qfmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel_latest", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "gmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "gfmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kmodel_latest", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "dmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "dfmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "mmodel", Name: "", ContextLength: 1000000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 	}
 	for i := range list {
 		spec := resolveOfficialModelSpec(list[i].ID)
@@ -584,9 +678,11 @@ func callModelsAPI(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
 		if m.MaxInputTokens > 0 {
 			ctx2 = m.MaxInputTokens
 		}
+		// 缓存只存内部代号；对外官方名与兼容代号条目统一由 exposeModelIDs
+		// 生成，保证动态/配置/静态三条来源的暴露口径完全一致。
 		out = append(out, pluginapi.ModelInfo{
 			ID:            m.Key,
-			Name:          m.DisplayName,
+			Name:          modelDisplayName(m.Key),
 			ContextLength: ctx2,
 			MaxCompletionTokens: func() int64 {
 				spec := resolveOfficialModelSpec(m.Key)
@@ -638,6 +734,11 @@ func cacheModelAliases(host pluginapi.HostConfigSummary) {
 var defaultModelAliasMap = map[string]string{
 	// Cantus
 	"cantus": "cmodel",
+	// 国际版套餐档位代号
+	"ultimate":    "ultimate",
+	"performance": "performance",
+	"efficient":   "efficient",
+	"sonus":       "smodel",
 	// Qwen 3.8
 	"qwen3.8-max":         "qmodel_38max",
 	"qwen3.8-max-preview": "qmodel_38max",
@@ -764,6 +865,21 @@ func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfi
 	for _, m := range excluded {
 		excludeSet[strings.ToLower(strings.TrimSpace(m))] = struct{}{}
 	}
+	// ID 已带 provider 前缀且主条目用官方名，排除规则可能是官方名、内部代号或
+	// 完整 ID 任一形态，三者都要能命中，否则清空/配置排除项的行为会随 ID
+	// 改写而静默失效。
+	isExcluded := func(m pluginapi.ModelInfo) bool {
+		candidates := []string{m.ID, modelDisplayName(m.ID)}
+		if m.Name != "" {
+			candidates = append(candidates, m.Name)
+		}
+		for _, c := range candidates {
+			if _, skip := excludeSet[strings.ToLower(strings.TrimSpace(c))]; skip {
+				return true
+			}
+		}
+		return false
+	}
 	// Use a fresh slice — models[:0] would alias the input's backing array,
 	// which may be the dynamicModelsCache's own slice. Mutating it in place
 	// would corrupt the cache for subsequent callers (P0 bug: after one
@@ -771,7 +887,7 @@ func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfi
 	// "full" list on the next fetch).
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
-		if _, skip := excludeSet[strings.ToLower(m.ID)]; skip {
+		if isExcluded(m) {
 			continue
 		}
 		out = append(out, m)
@@ -795,6 +911,7 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 	}
 	cacheModelAliases(req.Host)
 	models := resolveModels(fetchDynamicModels(), getConfiguredModels(), wbModels())
+	models = exposeModelIDs(models)
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
@@ -814,6 +931,7 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// auth file carries a non-canonical provider string.
 	cacheModelAliases(req.Host)
 	models := resolveModelsFromStorage(req.AuthID, req.StorageJSON)
+	models = exposeModelIDs(models)
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
@@ -845,6 +963,7 @@ func authModelsForIndex(authIndex string) []string {
 	if len(models) == 0 {
 		models = resolveModels(nil, getConfiguredModels(), wbModels())
 	}
+	models = exposeModelIDs(models)
 	seen := make(map[string]struct{}, len(models)+1)
 	out := make([]string, 0, len(models)+1)
 	for _, m := range models {

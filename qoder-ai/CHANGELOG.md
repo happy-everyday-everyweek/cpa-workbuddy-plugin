@@ -1,5 +1,20 @@
 # Qoder AI Plugin Changelog
 
+## 0.1.29
+
+### Fix - 模型对外 ID 改用官方展示名，并补齐执行链回译
+
+- 变更要点:
+  1. 根因：上游 `model/list` 只返回内部代号（`qmodel_38max`/`qfmodel`），插件原样把它当模型 ID 注册给宿主；客户端下拉展示的却是官方名（`Qwen3.8-Max`/`Qwen3.8-Flash`）。宿主 `/v1/models` 只渲染 `id` 字段，插件的 `Name`（官方名）被丢弃，生产模型表里因此全是代号。
+  2. 对外暴露：新增 `exposeModelIDs`，把每个内部代号展开成「官方名主条目 + 兼容代号条目」。宿主按完整模型名反查 provider 与匹配账号，兼容条目必须真实注册，否则旧调用方请求 `qmodel_38max` 会 400 `unknown provider for model`。
+  3. 静态兜底：`wbModels()` 改为**只存内部代号**，对外口径统一由 `exposeModelIDs` 生成。
+  4. 执行链补齐：暴露官方名后 `cpaToUpstreamKey` 必须能回译，否则请求静默落到 `auto`。国际版新增 `Ultimate`/`Performance`/`Efficient`/`Sonus` 四个档位映射（分别对应 `ultimate`/`performance`/`efficient`/`smodel`）。
+  5. 排除规则：`filterExcludedModels` 改为按「完整 ID / 官方名 / 内部代号」三形态匹配，避免 ID 改写后 `excluded-models` 静默失效。
+- 验证: 新增 `models_expose_test.go`（含仅大小写差异的档位代号用例、**全量代号回译不变量**、排除多形态匹配、过滤不污染输入切片）；变异反证精确捕获（删除四个档位映射 → 回译用例报出 4 条 FAIL）；cgo-shim build/vet/test 全绿；gofmt 干净。
+- 边界说明: 与 qoderwork 同源同修。用户原选的「插件侧加 provider 前缀区分同名模型」经生产实测不可行 —— 宿主按模型名反查 provider，带前缀的 ID 直接 400 `unknown provider for model`。
+- 依据: 用户报障「生产 Qoder AI 插件自动获取模型不对」；外部参考 `shuishuipingan/qoder2api-hub` 的官方 `display_name` 用作模型 id 的做法。
+- 涉及文件: qoder-ai/models.go、qoder-ai/body.go、qoder-ai/models_expose_test.go、qoder-ai/models_config_test.go、qoder-ai/max_tokens_test.go、qoder-ai/VERSION、qoder-ai/CHANGELOG.md
+
 ## 0.1.28
 
 ### Fix - 模型清单按账号分片 + 发现顺序改为额度优先

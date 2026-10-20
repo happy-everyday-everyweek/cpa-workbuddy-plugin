@@ -36,9 +36,13 @@ func cpaToUpstreamKey(cpaModel string) string {
 		return "qmodel_latest"
 	case "qwen3.7-plus", "qmodel":
 		return "qmodel"
+	case "qwen3.7-flash", "q37fmodel":
+		return "q37fmodel"
 	// GLM
-	case "glm-5.3", "gmodel", "glm-5.2", "gm51model":
+	case "glm-5.3", "gmodel":
 		return "gmodel"
+	case "glm-5.2", "gm51model":
+		return "gm51model"
 	case "glm-5.3-flash", "gfmodel":
 		return "gfmodel"
 	// Kimi
