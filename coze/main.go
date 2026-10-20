@@ -65,7 +65,7 @@ const (
 
 var (
 	// version 当前插件版本号。
-	version      = "0.5.1"
+	version      = "0.5.2"
 	hostAPI      *C.cliproxy_host_api
 	hostAPIMu    sync.RWMutex
 	activeConfig atomic.Value
@@ -83,16 +83,26 @@ type Config struct {
 	TimeoutSeconds int `yaml:"timeout_seconds" json:"timeout_seconds"`
 	// RenewIntervalSeconds 会话续期巡检间隔（秒）。
 	RenewIntervalSeconds int `yaml:"renew_interval_seconds" json:"renew_interval_seconds"`
+	// MinRoutableCredits 是积分路由红线，低于该值的账号不再承载新请求。
+	//
+	// 用指针区分「未配置」与「显式配 0」：0 是关闭闸门的 kill switch，
+	// 若用值类型，缺省键会把红线一起归零，闸门会静默失效。
+	MinRoutableCredits *int64 `yaml:"min_routable_credits,omitempty" json:"min_routable_credits,omitempty"`
+	// CreditRefreshSeconds 是后台积分刷新间隔（秒）。
+	CreditRefreshSeconds int `yaml:"credit_refresh_interval_seconds" json:"credit_refresh_interval_seconds"`
 }
 
 // defaultConfig 返回插件默认配置。
 // [参数] 无。
 // [返回] 带默认值的配置结构。
-// 最近修改时间：2026-10-18；改动原因：新增，扣子插件骨架默认配置；续期巡检间隔对齐其他插件改 4 小时。
+// 最近修改时间：2026-10-20；改动原因：新增积分路由红线与刷新间隔默认值。
 func defaultConfig() Config {
+	redline := defaultMinRoutableCredits
 	return Config{
 		TimeoutSeconds:       30,
 		RenewIntervalSeconds: 4 * 3600,
+		MinRoutableCredits:   &redline,
+		CreditRefreshSeconds: creditRefreshDefaultSeconds,
 	}
 }
 
@@ -124,6 +134,9 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	// 续期定时器必须在宿主装配完成后启动：init() 早于 cliproxy_plugin_init，
 	// 此刻 hostAPI 仍为 nil，循环会先等宿主就绪再跑首轮（见 renew_loop.go）。
 	startRenewLoop()
+	// 积分刷新循环同理：执行入口的积分闸门只读缓存，
+	// 没有后台刷新时缓存会一直为空，闸门等于不存在。
+	startCreditLoop()
 	return 0
 }
 
@@ -163,6 +176,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	stopRenewLoop()
+	stopCreditLoop()
 	hostAPIMu.Lock()
 	hostAPI = nil
 	hostAPIMu.Unlock()
@@ -370,12 +384,31 @@ func configurePlugin(raw []byte) error {
 		if decoded.RenewIntervalSeconds > 0 {
 			cfg.RenewIntervalSeconds = decoded.RenewIntervalSeconds
 		}
+		// 只有显式出现该键才覆盖：缺省键保持默认红线，
+		// 显式 0 表示关闭积分闸门。
+		if decoded.MinRoutableCredits != nil {
+			cfg.MinRoutableCredits = decoded.MinRoutableCredits
+		}
+		if decoded.CreditRefreshSeconds > 0 {
+			cfg.CreditRefreshSeconds = decoded.CreditRefreshSeconds
+		}
 	}
 	activeConfig.Store(cfg)
+	applyCreditConfig(cfg)
 	// 间隔可能在本次 reconfigure 里被改小：让循环立即重排，避免旧 timer
 	// 继续按旧间隔睡满一整轮。
 	requestRenewTick()
+	requestCreditTick()
 	return nil
+}
+
+// applyCreditConfig 把配置里的积分策略落到运行时状态。
+// [参数] cfg: 已解析的配置。
+// [返回] 无。
+func applyCreditConfig(cfg Config) {
+	if cfg.MinRoutableCredits != nil {
+		applyMinRoutableCredits(*cfg.MinRoutableCredits)
+	}
 }
 
 // okEnvelope 包装成功信封。

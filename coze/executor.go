@@ -523,6 +523,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, errParse
 	}
 
+	// 积分闸门必须在触达上游前完成：低额账号打上游只会换来
+	// 1000521 积分耗尽，白白消耗一次往返和一次失败记账。
+	// 返回 403 让宿主按账号级故障换号，与上游耗尽同一条通道。
+	if errCredits := verifyAccountCredits(sa); errCredits != nil {
+		return nil, errCredits
+	}
+
 	// 标准图片端点与对话端点共用同一个 executor，必须按来源格式分流：
 	// images 请求没有 messages，按 chat 解析必然报「请求缺少 messages」。
 	if isImagesExecution(req) {
@@ -608,6 +615,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	sa, errParse := parseStoredAuth(req.StorageJSON)
 	if errParse != nil {
 		return nil, errParse
+	}
+
+	// 与 Execute 入口同一道积分闸门：流式请求同样不该白打上游。
+	if errCredits := verifyAccountCredits(sa); errCredits != nil {
+		return nil, errCredits
 	}
 
 	chatReq, errChat := parseChatRequest(executorRequestBody(req.ExecutorRequest))

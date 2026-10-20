@@ -396,6 +396,8 @@ async function api(path, opts={}){
 function stateBadge(a){
   if(a.disabled) return '<span class="badge off">已禁用</span>';
   if(a.auth_state==="expired") return '<span class="badge warn">待重新授权</span>';
+  // 低额账号仍能登录，但已不再承载新请求，必须与「可用」区分开。
+  if(a.low_credits) return '<span class="badge warn">低额保护</span>';
   return '<span class="badge ok">可用</span>';
 }
 

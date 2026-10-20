@@ -237,6 +237,8 @@ type accountSummary struct {
 	UpdatedAt   string `json:"updated_at"`
 	// Credits 是积分摘要；查询失败时 Error 非空，面板据此显示「未知」。
 	Credits *creditSummary `json:"credits,omitempty"`
+	// LowCredits 表示剩余积分低于路由红线，该账号不再承载新请求。
+	LowCredits bool `json:"low_credits"`
 }
 
 // handleListAccounts 返回全部扣子账号摘要。
@@ -279,6 +281,9 @@ func handleListAccounts() ([]byte, error) {
 				return
 			}
 			list[slot].Credits = summary
+			// 低额标记与闸门同源：都读同一份缓存和同一个红线，
+			// 避免面板显示「够用」而实际已被拦截。
+			list[slot].LowCredits = !sa.Disabled && summary.Remain < loadedMinRoutableCredits()
 		}(i, acc)
 	}
 	wg.Wait()
