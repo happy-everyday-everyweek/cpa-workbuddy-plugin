@@ -32,6 +32,28 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-20）：**coze 0.5.3：修复「生图全部失败但积分被烧光」**：
+  - 用户报障（附 new-api 日志 + CPA 用量面板截图）：`coze/doubao-seedream-5-0-260128` 请求几乎全部 502/403 失败，账号 7840 积分却耗尽。
+  - **根因（收尾时序错配）**：WS 的 `event_final` 帧 6–9 秒就到达，正文只有 `[图片](computer:///...)` 占位符（非空），真实图片附件要晚十几秒到几分钟才落库 `message/list` 的 `files`。旧逻辑只在「正文为空」时兜底轮询 → 生图路径不轮询、不报错 → 空 images → `buildImagesResponse` 报「上游未返回任何图片」。**上游已出图并扣额度**。
+  - **放大链（额度成倍烧）**：该错误无状态码 → 兜底 502 → 宿主判账号故障、冷却并换号；new-api `AutomaticRetryStatusCodes` 含 502 且 `RetryTimes=5` → 同一笔额度反复烧。两层重试同时叠加。
+  - **修复**：① `runConversation` 收口统一调 `awaitImages`（不用 `waitForReply` 的分支，因为它有三个成功返回分支，分支内处理必漏路径）；② `pollImagesUntilAvailable` 1 秒间隔、**4 分钟**上限（生产实测成功生图端到端 24s~3m6s，90 秒会误判成功为失败）；③ 只在附件非空时 `accept`（去重键 `turn|seq|phase`，先 accept 空附件会把后续带附件同帧判重丢弃）；④ 取不到时返回 `imagesUnavailableError`（**400**）——命中宿主请求级白名单（400/409/413/422）不冷却不换号，且不在 new-api 自动重试区间，两层重试同时止住；⑤ `wantImages` 标记区分生图/对话，文本路径不为等附件变慢。
+  - **超时链路核实**：nginx `proxy_read_timeout 600s` > 4 分钟上限；宿主无额外插件 RPC 超时；生产有 3m6s 成功实测。
+  - **验证**：cgo-shim build+vet+test 全绿；新增 6 用例（晚到附件、第 3 轮才出现、取不到须 400、对话路径不长等、错误状态码、穿过真实入口的端到端）；**5 项变异反证全 FAIL**（禁用等附件 / 状态码退化 / 只查一次 / 工厂指向对话执行器 / `awaitImages` 直接放行）。其中「工厂指向对话执行器」首轮**存活**——所有用例都直接构造执行器、无一条穿过 `handleImagesExecute`，是「纯函数单测通过 ≠ 调用点被覆盖」的典型形态，补端到端用例 + 生产侧注入点后才捕获。
+  - **发布链**：提交 `5535ec3` → CI run `39464339820` 首轮 darwin/arm64 job 排队超时被取消（其余 19 job 全 success）→ `rerun-failed-jobs` 重跑。
+  - 文档：`coze/CHANGELOG.md` 0.5.3 章节。
+
+- 当前会话（2026-10-20）：**coze 0.5.2 发布生产：新增积分路由红线（默认 100 分）**：
+  - 用户需求：「要补（低积分跳过路由），但是 coze 的积分消耗速度和其他的不一样，应该要改成 100」。
+  - **关键前提（宿主源码取证，决定方案形态）**：① `internal/pluginhost/scheduler.go:37` 的 `schedulerRecord()` 只返回排序后**第一个** scheduler 插件（全局单例），生产在任者 copilot-provider；coze 抢槽会顶掉 workbuddy 系调度内核；② 插件账号 auth 文件的 `priority` 不被读取（watcher 走 `PluginAuthParser`，只解析 `disabled`）；③ `model.for_auth` 只影响模型注册表。故**放弃声明 Scheduler**，改用**执行入口闸门**。
+  - **实现**：`coze/policy.go`（红线常量 100 + 缓存判定 + `creditsBelowRedlineError` 带 `StatusCode()=403`）、`coze/credit_loop.go`（后台积分刷新，默认 300s、并发 4、shutdown 停止、reconfigure 重排、刷新后 `publishCreditPool` 发布快照）、两个执行入口在 `parseStoredAuth` 后加闸门、面板 `low_credits` + 「低额保护」徽标；配置项 `min_routable_credits`（`*int64`，缺省保持 100、显式 0 关闭）与 `credit_refresh_interval_seconds`。
+  - **性能红线**：闸门只读内存快照 `creditPoolSnapshot`，**禁止**在请求路径调 `host.auth.list`（列目录 + 每账号读取的 RPC 扇出会拖慢首字）。此约束由 `TestVerifyAccountCreditsUsesMemorySnapshotOnly`（清空账号目录后仍须拦截）守护。
+  - **兜底语义**：仅当池里还有其他可用账号时才拦截；全池低额或积分未知时放行。
+  - **验证**：cgo-shim build+vet+test 全绿；新增 12 用例；**8 项变异反证全部精确 FAIL**（红线改回 20 / 去掉全池兜底 / 403 改 500 / 删入口闸门 / 闸门改回实时 RPC 扫描 / 删快照发布 / 去掉可用性过滤 / 未知积分当 0）。其中「删快照发布」与「未知积分当 0」首轮**存活**，据此补强用例后才捕获——证明初版用例只覆盖了判定函数、没覆盖真正的放行与更新路径。
+  - **发布链**：提交 `b46969c`（feat）+ `b07d209`（registry）→ CI run `39452488433` success → 6/6 assets ALL CHECKSUMS OK → 产物内嵌 `min_routable_credits`/`credit_refresh_interval_seconds`/`0.5.2` 探针命中、`0.5.1` 归零 → 远端 raw 200 且字节数一致 → 生产 `plugin-store install` 热重载（`active_version=0.5.2 retired_version=0.5.1`，**零容器重启**）→ 落盘 `.so` sha256 `1b13157e6549722aceac8d5a8744b385d6922ec3f40bc3e4619e06b7bed3663e` 与本地 zip 逐字节一致。
+  - **生产验收（request_id 86564019，2026-10-21 00:20:22）**：生产 5 个 coze 号中 4 个为 0 分、1 个 437 分。同一请求先被 `coze-1185dd0`（**10ms**）与 `coze-75c7448`（**2ms**）以 403「账号积分不足：剩余 0 分，低于路由红线 100 分，正在切换账号」拦截，**零上游消耗**，随后换到健康号成功返回 200；连续 3 次真实对话全部 200。面板 `low_credits` 正确标出 4 个 0 分号。
+  - **待办**：① 生产日志出现 `source=Ld@588588`（token-usage-tracker 把管理密钥当作 usage source 打印），属凭据回显违规，需在 token-usage-tracker 侧修复；② coze 的 `min_routable_credits` 目前未写入生产配置，走默认 100。
+  - 文档：`coze/CHANGELOG.md` 0.5.2 章节。
+
 - 当前会话（2026-10-19）：**coze 0.4.6 发布生产：64KB 内容超限不再拖垮账号池**：
   - 用户报障：`doubao-seed-2-0-lite` 持续 `503 auth_unavailable ... last upstream error: 提交消息失败：数据库错误（code=1000003）`。
   - **根因（直连上游二分实测）**：`message/chat` 的 content 有 **65535 字节硬上限**（65536 即失败），越界返回的是 `1000003 数据库错误` 而非参数错误。插件原样上抛，宿主因无状态码按 5xx 判定为账号级故障，依次冷却两个账号 → 此后所有请求 3–5ms 短路 503。**单次超长请求放大成整池故障**。
