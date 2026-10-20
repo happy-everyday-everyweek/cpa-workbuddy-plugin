@@ -71,7 +71,7 @@
       "name": "QoderWork Provider",
       "description": "QoderWork CN (qoder.com.cn) provider for CLIProxyAPI: dual login (OAuth device authorization with auto pro-pack claim + PAT import), COSY-signed chat executor, dynamic model list, daily check-in with credit snapshot, token keepalive (deviceToken/jobToken prefix-routed, PAT fallback), accounts panel.",
       "author": "Sliverkiss",
-      "version": "0.9.48",
+      "version": "0.9.49",
       "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
       "logo": "https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/QoderWork.png",
       "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/qoderwork",
@@ -89,44 +89,44 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_darwin_amd64.zip",
-            "sha256": "3ba49b89aced654c3979503a08a5e74b4ec75408571e02b97efe316d4ef0deb9",
-            "size": 3071257
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_darwin_amd64.zip",
+            "sha256": "b9a3a24d45b275cefdd476b3b3f3d45c63789eecd8195fab97bf3ade06259740",
+            "size": 3072909
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_darwin_arm64.zip",
-            "sha256": "659aedf74ee29837f7bc28cf0d2fab3e1cf3332fac258d3a9d4f9d3b0ac073fc",
-            "size": 2837055
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_darwin_arm64.zip",
+            "sha256": "b8a1cd0c01389f3aa795f1ca06d819443e431c329f5449b3d7249437a02221da",
+            "size": 2839820
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_linux_amd64.zip",
-            "sha256": "5d71621d10670a0c3960268a604aa873b06ea0915764c2c02d6a6eb69606f32d",
-            "size": 3227073
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_linux_amd64.zip",
+            "sha256": "beec1490cc311c8f3dac476922265282b1f479838b30cbac2fe6eba9132c0365",
+            "size": 3228200
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_linux_arm64.zip",
-            "sha256": "7574b515e379d715ed5b92c1a9fe85cec8b5144be0e4e98a9903af0aa8dc313b",
-            "size": 2933517
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_linux_arm64.zip",
+            "sha256": "e61e82d71e7ee79eb6125f0b20f53b08f8096dab14bdbb704ff4642d10f5df6b",
+            "size": 2934413
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_windows_amd64.zip",
-            "sha256": "652048ae918c9e5549bc1ccef72634d0bd3131dbfc49d12822c86c9b1be2f3f6",
-            "size": 3157255
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_windows_amd64.zip",
+            "sha256": "03a93ec13074607d472a985cede917128a6a47187d36a617477581ee9c87e8ff",
+            "size": 3159621
           },
           {
             "goos": "windows",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.48/qoderwork-provider_0.9.48_windows_arm64.zip",
-            "sha256": "6322333638261c7ed643d3eafc50c493c262ec775d84bd53144f0fc8c7c693c6",
-            "size": 2923482
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoderwork-provider-v0.9.49/qoderwork-provider_0.9.49_windows_arm64.zip",
+            "sha256": "193c9c0d272aa1323388be71ad585ea78d2e1f16f9702254d1d81510694b2fdc",
+            "size": 2927186
           }
         ]
       }
@@ -389,7 +389,7 @@
       "name": "Qoder AI",
       "description": "Qoder AI (qoder.com) provider for CLIProxyAPI: OAuth PKCE device flow & PAT import, COSY-signed chat executor, dynamic models, daily check-in (+100 credits), accounts panel.",
       "author": "luode0320",
-      "version": "0.1.28",
+      "version": "0.1.29",
       "repository": "https://github.com/luode0320/cpa-workbuddy-plugin",
       "logo": "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/assets/icons/QoderAI.png",
       "homepage": "https://github.com/luode0320/cpa-workbuddy-plugin/tree/main/qoder-ai",
@@ -407,44 +407,44 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_darwin_amd64.zip",
-            "sha256": "c62e59dc81563f4580f2e3ba38055fd09a6aeec73fc03175c9071bffe3b4ff89",
-            "size": 3107590
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_darwin_amd64.zip",
+            "sha256": "07cba3b7224a7fe03c4cdccec4ff6fe1a5a07da3eb8bc9ab7d37483657120e29",
+            "size": 3108865
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_darwin_arm64.zip",
-            "sha256": "51e97f3cbf9a6a152d000644067c17ded32435c3bba18cc7b77f0dafe3201e63",
-            "size": 2871063
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_darwin_arm64.zip",
+            "sha256": "d32b95eed7a362cd65bab4ffba4cffeb619d2b0efce598b13b9267a694e5e6d2",
+            "size": 2872721
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_linux_amd64.zip",
-            "sha256": "ecb69d10f4afc89a8112a0926fe43ca8ab5291e3d089f26fe30117b4a76dc385",
-            "size": 3262868
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_linux_amd64.zip",
+            "sha256": "d5e1443a6bc5448cc9fc8daf45cc5ae9b51ed2ad4214f54f04b4ea09d8e23762",
+            "size": 3264800
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_linux_arm64.zip",
-            "sha256": "ea6eb26415cb934a9f82a976db8e0df3f359a8161b5b1d0ebdb6a5b52b9e8330",
-            "size": 2967074
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_linux_arm64.zip",
+            "sha256": "83d6c68001d35742c8086c7292a28d4eb9961fe03188872aa949654f2ccb0c45",
+            "size": 2968657
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_windows_amd64.zip",
-            "sha256": "c8d6e1c25afa7ae8ac596e1dd46093a0b4afa9db19ebadb5e9c30ccf430f2e16",
-            "size": 3192859
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_windows_amd64.zip",
+            "sha256": "e87ec8d0670bb34961b07af47d44b09c08cd1c083353db9dd0f2943337d79cc9",
+            "size": 3195701
           },
           {
             "goos": "windows",
             "goarch": "arm64",
-            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.28/qoder-ai-provider_0.1.28_windows_arm64.zip",
-            "sha256": "3c168a0d54c55c710f52ccb58647b6e168529f778799628cf01c329d26e795a5",
-            "size": 2958926
+            "url": "https://github.com/luode0320/cpa-workbuddy-plugin/releases/download/qoder-ai-provider-v0.1.29/qoder-ai-provider_0.1.29_windows_arm64.zip",
+            "sha256": "8d461f2722277aceb1f218a66c47c0e574b9bcf9f3591ee6638943a1019f6c4b",
+            "size": 2960154
           }
         ]
       }
