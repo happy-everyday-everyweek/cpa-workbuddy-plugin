@@ -1,21 +1,26 @@
+// model_circuit_test.go 验证 11128「请求被拦截」的记账落点。
+//
+// 历史：本文件曾覆盖独立熔断状态机（跨账号聚合、60 秒闸门、窗口清理）。
+// 2026-10-20 起重构为「11128 直接写账号×模型冷却」，状态全部由
+// accountFailover 持有，因此这里的用例聚焦三件事：
+//  1. 判据边界（11128 / 11140 / 6004 不能混淆）；
+//  2. 命中后确实写入模型级冷却，路由会跳过该组合；
+//  3. 冷却探活成功后才解除，失败则续期——这正是取代熔断的那条闭环。
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
 
-// resetModelCircuitState 清空熔断状态并在用例结束后复位，保证用例互不干扰。
-func resetModelCircuitState(t *testing.T) {
-	t.Helper()
-	clearModelCircuits()
-	t.Cleanup(clearModelCircuits)
-}
+// errFakeProbeFailed 是探活失败的注入错误，用于验证续期路径。
+var errFakeProbeFailed = errors.New("fake probe failed")
 
-// TestIsModelCircuitErrorClassifiesUpstreamRiskControl 验证风控错误分类边界：
-// 11128 是模型级、11140 是账号级、6004 是频率限制，三者必须区分开。
-func TestIsModelCircuitErrorClassifiesUpstreamRiskControl(t *testing.T) {
+// TestIsModelBlockedErrorClassifiesUpstreamRiskControl 验证风控错误分类边界：
+// 11128 是被拦截、11140 是账号级封禁、6004 是频率限制，三者必须区分开。
+func TestIsModelBlockedErrorClassifiesUpstreamRiskControl(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
@@ -23,13 +28,13 @@ func TestIsModelCircuitErrorClassifiesUpstreamRiskControl(t *testing.T) {
 		want   bool
 	}{
 		{
-			name:   "11128 请求被拦截属模型级",
+			name:   "11128 请求被拦截",
 			status: 400,
 			body:   `{"code":11128,"msg":"request illegal","displayMsg":{"zh":"请求被拦截，请重新发送"}}`,
 			want:   true,
 		},
 		{
-			name:   "11128 以 403 返回同样属模型级",
+			name:   "11128 以 403 返回同样命中",
 			status: 403,
 			body:   `{"code":11128,"msg":"request illegal"}`,
 			want:   true,
@@ -47,7 +52,7 @@ func TestIsModelCircuitErrorClassifiesUpstreamRiskControl(t *testing.T) {
 			want:   false,
 		},
 		{
-			name:   "6004 频率限制不属模型级",
+			name:   "6004 频率限制不属拦截",
 			status: 400,
 			body:   `{"code":6004,"msg":"usage exceeds frequency limit"}`,
 			want:   false,
@@ -67,218 +72,179 @@ func TestIsModelCircuitErrorClassifiesUpstreamRiskControl(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isModelCircuitError(tc.status, tc.body); got != tc.want {
-				t.Fatalf("isModelCircuitError(%d, %q) = %v, want %v", tc.status, tc.body, got, tc.want)
+			if got := isModelBlockedError(tc.status, tc.body); got != tc.want {
+				t.Fatalf("isModelBlockedError(%d, %q) = %v, want %v", tc.status, tc.body, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestModelCircuitOpensOnlyAcrossDistinctAuths 验证熔断按「不同账号数」而非
-// 失败次数触发：同一账号反复失败属账号故障，不应升级成模型级熔断。
-func TestModelCircuitOpensOnlyAcrossDistinctAuths(t *testing.T) {
-	resetModelCircuitState(t)
-
-	const provider = "traework-provider"
-	const model = "deepseek-v4.1-flash"
-
-	// 1. 单账号连续命中多次：不熔断
-	for i := 0; i < 10; i++ {
-		if open := noteModelCircuitHit(provider, model, "auth-a"); open {
-			t.Fatalf("同一账号第 %d 次命中不应开启熔断", i+1)
-		}
+// TestClassifyUpstreamFailureBlocks11128AtModelScope 验证 11128 被归到账号×模型
+// 冷却，而不是「不记账」。这是整个方案的根因修复点：旧实现把它判成
+// failureScopeNone，导致被拦截的组合永远不会冷却、也不会被探活验证。
+func TestClassifyUpstreamFailureBlocks11128AtModelScope(t *testing.T) {
+	body := `{"code":11128,"msg":"request illegal"}`
+	if got := classifyUpstreamFailure(400, body); got != failureScopeAuthModel {
+		t.Fatalf("11128 应归入账号×模型冷却, got %v", got)
 	}
-	if isModelCircuitOpen(provider, model) {
-		t.Fatal("单账号重复失败不应熔断")
+	// 11140 仍是账号级：封号换模型也不可用。
+	if got := classifyUpstreamFailure(403, `{"code":11140}`); got != failureScopeAccount {
+		t.Fatalf("11140 应归入账号级冷却, got %v", got)
 	}
-
-	// 2. 第二个账号命中：仍未达阈值（阈值 3）
-	if open := noteModelCircuitHit(provider, model, "auth-b"); open {
-		t.Fatal("第二个账号命中不应开启熔断")
-	}
-
-	// 3. 第三个账号命中：达到阈值，开启熔断
-	if open := noteModelCircuitHit(provider, model, "auth-c"); !open {
-		t.Fatal("第三个不同账号命中应开启熔断")
-	}
-	if !isModelCircuitOpen(provider, model) {
-		t.Fatal("跨三个账号命中后应处于熔断状态")
-	}
-
-	// 4. 熔断只作用于该 provider × 模型
-	if isModelCircuitOpen(provider, "other-model") {
-		t.Fatal("熔断不应影响其他模型")
-	}
-	if isModelCircuitOpen("other-provider", model) {
-		t.Fatal("熔断不应影响其他 provider")
+	// 普通业务 400 不记账：换账号同样失败。
+	if got := classifyUpstreamFailure(400, `{"code":1234,"msg":"bad request"}`); got != failureScopeNone {
+		t.Fatalf("普通 400 不应记账, got %v", got)
 	}
 }
 
-// TestModelCircuitKeyNormalizesInput 验证聚合键对大小写与空白归一，
-// 避免同一模型因写法差异被拆成两个熔断域。
-func TestModelCircuitKeyNormalizesInput(t *testing.T) {
-	left := modelCircuitKey("TraeWork-Provider", "DeepSeek-V4.1-Flash")
-	right := modelCircuitKey(" traework-provider ", "deepseek-v4.1-flash")
-	if left == "" || left != right {
-		t.Fatalf("归一化失败: %q vs %q", left, right)
-	}
-	if modelCircuitKey("", "m") != "" || modelCircuitKey("p", "") != "" {
-		t.Fatal("provider 或 model 为空时应返回空键")
-	}
-}
+// TestNoteModelBlockedHitWritesModelCooldown 验证一次 11128 命中就把该账号的
+// 这个模型放进冷却，进而被路由跳过。
+func TestNoteModelBlockedHitWritesModelCooldown(t *testing.T) {
+	resetFailover(t)
 
-// TestModelCircuitResetOnSuccess 验证一次真实成功会清掉熔断残留，
-// 避免恢复后抑制窗口继续拦截正常流量。
-func TestModelCircuitResetOnSuccess(t *testing.T) {
-	resetModelCircuitState(t)
+	const (
+		authA = "workbuddyai-auth-a.json"
+		model = "deepseek-v4.1-flash"
+	)
 
-	const provider = "traework-provider"
-	const model = "deepseek-v4.1-flash"
-
-	for _, id := range []string{"auth-a", "auth-b", "auth-c"} {
-		noteModelCircuitHit(provider, model, id)
+	if !noteModelBlockedHit(authA, model) {
+		t.Fatal("命中 11128 应写入冷却")
 	}
-	if !isModelCircuitOpen(provider, model) {
-		t.Fatal("前置条件不成立：应已熔断")
+	if !isAuthModelCoolingDown(authA, model) {
+		t.Fatal("写入后该账号应在该模型上处于冷却，路由才会跳过它")
 	}
-
-	resetModelCircuit(provider, model)
-
-	if isModelCircuitOpen(provider, model) {
-		t.Fatal("成功后应解除熔断")
+	// 只影响该模型：同账号的其它模型不受牵连。
+	if isAuthModelCoolingDown(authA, "glm-5") {
+		t.Fatal("11128 只应冷却命中的模型，不应牵连同账号的其它模型")
 	}
-	if _, _, ok := modelCircuitSnapshot(provider, model); ok {
-		t.Fatal("成功后应清除熔断记录")
+	// 只影响该账号：其它账号的同模型不受牵连。
+	if isAuthModelCoolingDown("workbuddyai-auth-b.json", model) {
+		t.Fatal("11128 只应冷却命中账号，不应牵连其它账号")
 	}
 }
 
-// TestModelCircuitWindowExpires 验证窗口外的账号记录会被清理，
-// 不会让历史失败长期占位导致误熔断。
-func TestModelCircuitWindowExpires(t *testing.T) {
-	resetModelCircuitState(t)
+// TestModelBlockedCooldownProbedBeforeExpiry 验证被 11128 冷却的组合会进入
+// 冷却探活候选——这是「复用冷却探活」而非另建一套的核心断言。
+//
+// 旧实现只挑账号级冷却，模型级记录到期后自动失效且从不验证，等于把
+// 「是否恢复」交给运气。本用例锁住模型级冷却必须被探到。
+func TestModelBlockedCooldownProbedBeforeExpiry(t *testing.T) {
+	resetFailover(t)
 
-	const provider = "traework-provider"
-	const model = "deepseek-v4.1-flash"
-	key := modelCircuitKey(provider, model)
+	const (
+		authA = "workbuddyai-auth-a.json"
+		model = "deepseek-v4.1-flash"
+	)
 
-	// 1. 直接注入两条已过期的账号记录
-	modelCircuitMu.Lock()
-	st := &modelCircuitState{auths: map[string]time.Time{
-		"stale-a": time.Now().Add(-2 * modelCircuitWindow),
-		"stale-b": time.Now().Add(-2 * modelCircuitWindow),
-	}}
-	modelCircuitStates[key] = st
-	modelCircuitMu.Unlock()
-
-	// 2. 新账号命中时应先清掉过期记录，仅剩 1 个有效账号 → 不熔断
-	if open := noteModelCircuitHit(provider, model, "fresh-c"); open {
-		t.Fatal("过期账号记录不应计入熔断阈值")
+	noteModelBlockedHit(authA, model)
+	_, until, ok := authModelFailoverSnapshot(authA, model)
+	if !ok || until.IsZero() {
+		t.Fatal("前置条件不成立：应已写入模型级冷却")
 	}
-	count, _, ok := modelCircuitSnapshot(provider, model)
-	if !ok || count != 1 {
-		t.Fatalf("窗口清理后有效账号数 = %d, want 1", count)
+
+	// 1. 远未到提前量窗口：不探测。
+	if targets := cooldownProbeTargets(until.Add(-cooldownProbeLeadTime - time.Second)); len(targets) != 0 {
+		t.Fatalf("未进入提前量窗口不应探测, got %d 个候选", len(targets))
 	}
-}
 
-// TestModelCircuitBlockedTillAdvances 验证熔断期间继续命中会续期，
-// 使持续拦截的模型不会在 60 秒后立刻放行一次再失败。
-func TestModelCircuitBlockedTillAdvances(t *testing.T) {
-	resetModelCircuitState(t)
-
-	const provider = "traework-provider"
-	const model = "deepseek-v4.1-flash"
-
-	for _, id := range []string{"auth-a", "auth-b", "auth-c"} {
-		noteModelCircuitHit(provider, model, id)
+	// 2. 进入提前量窗口：必须探测，且回放的就是当初失败的模型。
+	targets := cooldownProbeTargets(until.Add(-cooldownProbeLeadTime + time.Millisecond))
+	if len(targets) != 1 {
+		t.Fatalf("进入提前量窗口应探测 1 个候选, got %d", len(targets))
 	}
-	_, firstTill, _ := modelCircuitSnapshot(provider, model)
-
-	// Windows 时间分辨率下连续两次 Now() 可能取到同一刻度，
-	// 先推进时间再命中，才能稳定观察到续期效果。
-	time.Sleep(2 * time.Millisecond)
-	noteModelCircuitHit(provider, model, "auth-d")
-	_, secondTill, _ := modelCircuitSnapshot(provider, model)
-
-	if !secondTill.After(firstTill) {
-		t.Fatalf("熔断期间命中应续期: first=%v second=%v", firstTill, secondTill)
+	if targets[0].model != model {
+		t.Fatalf("探活必须回放失败的模型 %q, got %q", model, targets[0].model)
 	}
-	if !isModelCircuitOpen(provider, model) {
-		t.Fatal("续期后应仍处于熔断状态")
+
+	// 3. 已探测过同一周期：不重复探测。
+	//    用候选自身的 cooldownUntil 标记，而不是外部快照：冷却状态可能同时
+	//    存在原始键与归一化别名两条记录，它们的到期时间未必逐位相同，
+	//    拿外部值标记会让去重判定落空（真实缺陷，曾导致用例偶发失败）。
+	markCooldownProbed(targets[0].authID, targets[0].cooldownUntil)
+	if again := cooldownProbeTargets(until.Add(-cooldownProbeLeadTime + time.Millisecond)); len(again) != 0 {
+		t.Fatalf("同一冷却周期不应重复探测, got %d", len(again))
 	}
 }
 
-// TestModelCircuitErrorBodyMarkersCoverProductionShape 用生产实测报文做回归，
-// 防止上游文案变化后分类静默失效。
-func TestModelCircuitErrorBodyMarkersCoverProductionShape(t *testing.T) {
+// TestProbeSuccessClearsOnlyModelCooldown 验证探活成功只清模型维度：
+// 账号级冷却代表账号整体不可用，与单个模型的恢复无关。
+func TestProbeSuccessClearsOnlyModelCooldown(t *testing.T) {
+	resetFailover(t)
+
+	const (
+		authA = "workbuddyai-auth-a.json"
+		model = "deepseek-v4.1-flash"
+	)
+
+	// 账号级冷却 + 模型级冷却并存。
+	recordFailureScoped(authA, "", failureScopeAccount)
+	noteModelBlockedHit(authA, model)
+	if !isAuthModelCoolingDown(authA, model) {
+		t.Fatal("前置条件不成立：应处于冷却")
+	}
+
+	// 注入成功的探活。
+	stubProbePing(t, func(*traeAuth, string) error { return nil })
+
+	candidate := cooldownProbeCandidate{authID: authA, model: model, scope: failureScopeAuthModel}
+	if !probeCoolingAccount(candidate, &traeAuth{}) {
+		t.Fatal("探活成功应返回 true")
+	}
+	// 模型级冷却必须已清除——这是本用例的核心断言。注意不能用
+	// isAuthModelCoolingDown 判定：它会先看账号级冷却，而账号级在本例中
+	// 刻意保留着，会把「模型级已清」这个事实掩盖掉。
+	if _, until, ok := authModelFailoverSnapshot(authA, model); ok && !until.IsZero() {
+		t.Fatal("探活成功后应清除该模型的冷却")
+	}
+	// 账号级冷却必须保留。
+	if !isAccountCoolingDown(authA) {
+		t.Fatal("探活成功不应清除账号级冷却")
+	}
+}
+
+// TestProbeFailureExtendsModelCooldown 验证探活失败沿模型维度续期，
+// 并且不会误写 test_failed（该标签硬排除、永不自动过期）。
+func TestProbeFailureExtendsModelCooldown(t *testing.T) {
+	resetFailover(t)
+
+	const (
+		authA = "workbuddyai-auth-a.json"
+		model = "deepseek-v4.1-flash"
+	)
+
+	noteModelBlockedHit(authA, model)
+	_, firstUntil, _ := authModelFailoverSnapshot(authA, model)
+
+	stubProbePing(t, func(*traeAuth, string) error { return errFakeProbeFailed })
+
+	candidate := cooldownProbeCandidate{authID: authA, model: model, scope: failureScopeAuthModel}
+	if probeCoolingAccount(candidate, &traeAuth{}) {
+		t.Fatal("探活失败应返回 false")
+	}
+	if !isAuthModelCoolingDown(authA, model) {
+		t.Fatal("探活失败后应仍在冷却中")
+	}
+	_, secondUntil, ok := authModelFailoverSnapshot(authA, model)
+	if !ok {
+		t.Fatal("探活失败后应保留模型级冷却记录")
+	}
+	if !secondUntil.After(firstUntil) {
+		t.Fatalf("探活失败应沿阶梯续期: first=%v second=%v", firstUntil, secondUntil)
+	}
+	if isTestFailed(authA) {
+		t.Fatal("冷却探活失败绝不能写 test_failed 标签")
+	}
+}
+
+// TestBlockedErrorBodyMarkersCoverProductionShape 用生产实测报文做回归，
+// 防止上游文案变化后判定静默失效。
+func TestBlockedErrorBodyMarkersCoverProductionShape(t *testing.T) {
 	// 生产原样报文（2026-10-18，1,173 次）
 	production := `{"code":11128,"msg":"request illegal","requestId":"e1a6043f-92ab-4eb8-b5c0-a1791dea9a24","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送"}}`
-	if !isModelCircuitError(400, production) {
-		t.Fatal("生产 11128 报文必须被识别为模型级风控")
+	if !isModelBlockedError(400, production) {
+		t.Fatal("生产 11128 报文必须被识别为请求被拦截")
 	}
 	if !strings.Contains(production, "11128") {
 		t.Fatal("回归样本本身应包含 11128")
-	}
-}
-
-// TestCircuitModelNormalizesTraeAliases 验证熔断键按上游真实 config_name 聚合：
-// 客户端短 ID 与直接写全名必须落到同一熔断域，auto 则回退原值。
-func TestCircuitModelNormalizesTraeAliases(t *testing.T) {
-	if got, want := circuitModel("seed-2.1-pro"), "Doubao-Seed-2.1-Pro"; got != want {
-		t.Fatalf("别名归一失败: got %q, want %q", got, want)
-	}
-	// 同一模型两种写法必须产生同一个聚合键，避免风控信号被拆成两域。
-	shortKey := modelCircuitKey("traework-provider", circuitModel("seed-2.1-pro"))
-	fullKey := modelCircuitKey("traework-provider", circuitModel("Doubao-Seed-2.1-Pro"))
-	if shortKey != fullKey {
-		t.Fatalf("短 ID 与全名应在同一熔断域: %q vs %q", shortKey, fullKey)
-	}
-	// auto 无 config_name，回退原值保证键非空。
-	if got := circuitModel("auto"); got != "auto" {
-		t.Fatalf("auto 应回退原值，got %q", got)
-	}
-}
-
-// TestIsModelCircuitErrorMatchesTraeErrorShapes 验证本插件三种上游错误文本形态
-// 都能被识别：UpstreamError（"upstream HTTP %d"）、SSE（"upstream %d"）、
-// 以及聚合层业务码文本（"4011: ..."）。11128 出现在正文任意位置即命中。
-func TestIsModelCircuitErrorMatchesTraeErrorShapes(t *testing.T) {
-	body := `{"code":11128,"msg":"request illegal","displayMsg":{"zh":"请求被拦截，请重新发送"}}`
-	cases := []struct {
-		name   string
-		status int
-		text   string
-		want   bool
-	}{
-		{
-			name:   "UpstreamError 打开阶段形态",
-			status: 400,
-			text:   "upstream HTTP 400: " + body,
-			want:   true,
-		},
-		{
-			name:   "SSE 聚合形态",
-			status: 400,
-			text:   "upstream 400: 11128: request illegal",
-			want:   true,
-		},
-		{
-			name:   "HTTP 200 内的 event:error 业务帧",
-			status: 200,
-			text:   "11128: request illegal",
-			want:   false, // 200 不在判定范围，风控码只在 400/403 才成立
-		},
-		{
-			name:   "账号级 11140 不误判",
-			status: 403,
-			text:   "upstream HTTP 403: " + `{"code":11140,"msg":"request illegal"}`,
-			want:   false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isModelCircuitError(tc.status, tc.text); got != tc.want {
-				t.Fatalf("isModelCircuitError(%d, %q) = %v, want %v", tc.status, tc.text, got, tc.want)
-			}
-		})
 	}
 }

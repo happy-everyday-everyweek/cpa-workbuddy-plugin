@@ -202,6 +202,34 @@ func resetAuthModelFailover(authID, model string) {
 	}
 }
 
+// clearAuthModelCooldowns 清除某个模型上的冷却记录。
+//
+// 传空 authID 时清空该模型在所有账号上的记录，用于「一次成功证明模型已恢复」
+// 的场景；传了 authID 时只清该账号。账号级冷却不受影响——它代表账号整体不可用，
+// 与单个模型的恢复无关。
+//
+// [参数] authID: 账号标识，空表示全部账号；model: 已归一化的上游模型名。
+// [返回] 无。
+// 最近修改时间：2026-10-20；改动原因：新增，统一模型维度清理的唯一落点。
+func clearAuthModelCooldowns(authID, model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	for id, entry := range failoverRecords {
+		if entry == nil || entry.modelStates == nil {
+			continue
+		}
+		if authID != "" && strings.TrimSpace(id) != authID {
+			continue
+		}
+		delete(entry.modelStates, model)
+	}
+}
+
 // lastFailoverModel 返回账号最近一次触发冷却的模型名，供冷却前探活回放。
 // [参数] authID: 账号唯一标识。
 // [返回] 归一化后的上游模型名；无记录时为空串。

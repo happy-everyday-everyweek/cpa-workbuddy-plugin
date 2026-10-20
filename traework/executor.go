@@ -178,14 +178,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// 写入 usage feed 供 dashboard「会话」列区分会话归属；跨换号尝试冻结。
 	sessionKey := extractSessionKeyFromSources(req.Headers, req.Metadata)
 
-	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时直接短路，
-	// 不再向任何账号发起上游调用——这是本机制真正的收益点。
-	if isModelCircuitOpen(providerName, circuitKeyModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
-		log.Printf("[traework] exec %s", msg)
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, msg, "", 0, authUID, sessionKey)
-		return nil, fmt.Errorf("%s", msg)
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层会跳过它们；本请求若仍落到这里说明上游刚恢复或该组合尚未被
+	// 标记，按正常流程发起即可。
 
 	oa := &openAIRequest{}
 	if err := json.Unmarshal(req.Payload, oa); err != nil && len(req.Payload) > 0 {
@@ -227,8 +222,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			completion, aggDetail, aggErr := aggregateTraeCompletion(bytes.NewReader(resp.Body), req.Model, resp.StatusCode)
 			if aggErr == nil {
 				resetAccountFailover(usedAuthID)
-				// 一次真实成功即证明该模型已恢复，清掉熔断残留。
-				resetModelCircuit(providerName, circuitKeyModel)
+				// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却。
+				resetModelBlockedState(circuitKeyModel)
 				publishUsage(req.Model, upstreamModel, authUID, started, usageDetailForCompletion(aggDetail, completion), false, 0, "", "", 0, authUID, sessionKey)
 				return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 			}
@@ -238,16 +233,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			// surfaces here. When the error classifies as account-level, rotate
 			// to the next candidate on the SAME request (mirrors the HTTP 4xx
 			// branch below); otherwise surface it immediately.
-			// HTTP 200 + event:error 帧同样可能承载风控码，命中口径与 open 阶段一致。
-			if isModelCircuitError(resp.StatusCode, aggErr.Error()) {
-				if noteModelCircuitHit(providerName, circuitKeyModel, usedAuthID) {
-					log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(usedAuthID))
-				}
-			}
-			if isModelCircuitOpen(providerName, circuitKeyModel) {
+			// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后
+			// 直接返回，由冷却探活验证恢复，不再把剩余账号逐个赔进往返。
+			if isModelBlockedError(resp.StatusCode, aggErr.Error()) {
+				noteModelBlockedHit(usedAuthID, circuitKeyModel)
 				reconcileAfterExecutorErrorForModel(usedAuthID, circuitKeyModel, resp.StatusCode, aggErr.Error())
 				publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, resp.StatusCode, aggErr.Error(), "", 0, authUID, sessionKey)
-				return nil, fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+				return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncateRedacted(aggErr.Error(), 200))
 			}
 			if !isAccountFailure(resp.StatusCode, aggErr.Error()) || attempt >= budget || curSA == nil {
 				reconcileAfterExecutorErrorForModel(usedAuthID, circuitKeyModel, resp.StatusCode, aggErr.Error())
@@ -265,16 +257,12 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		}
 
 		statusCode := parseUpstreamStatusFromErr(callErr)
-		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
-		if isModelCircuitError(statusCode, callErr.Error()) {
-			if noteModelCircuitHit(providerName, circuitKeyModel, usedAuthID) {
-				log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(usedAuthID))
-			}
-		}
-		if isModelCircuitOpen(providerName, circuitKeyModel) {
+		// 11128：写入账号×模型冷却后直接返回，由冷却探活验证恢复。
+		if isModelBlockedError(statusCode, callErr.Error()) {
+			noteModelBlockedHit(usedAuthID, circuitKeyModel)
 			reconcileAfterExecutorErrorForModel(usedAuthID, circuitKeyModel, statusCode, callErr.Error())
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, callErr.Error(), "", 0, authUID, sessionKey)
-			return nil, fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+			return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(callErr.Error(), 200))
 		}
 		// 换号判定用 isAccountFailure：open 阶段 transport 级错误（TTFB 超时等
 		// status=0，生产实证 stream 4553：上游对单账号挂起 60s 不回响应头）与
@@ -409,15 +397,8 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 	attemptsMade := 0
 	circuitKeyModel := circuitModel(ctx.UpstreamModel)
 
-	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时直接短路，
-	// 不再向任何账号发起上游调用。放在冷却换号之前，避免为同一被拦模型继续换号。
-	if isModelCircuitOpen(providerName, circuitKeyModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", ctx.UpstreamModel)
-		log.Printf("[traework] exec stream async %s", msg)
-		publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, 0, msg, "", 0, curAuthUID, ctx.SessionKey)
-		emitTraeAsyncError(ctx.StreamID, msg, deps)
-		return
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层会跳过它们，本请求正常发起即可。
 
 	// 前置冷却拦截：若宿主指定的初始账号已处于冷却中，直接切换到健康账号，不发送自杀式网络调用。
 	// 判定带模型维度：账号×模型级冷却只挡同一模型，不能把整个账号摘掉。
@@ -453,15 +434,10 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 			log.Printf("[traework] exec stream async open error: request_id=%s stream_id=%s model=%s auth_hash=%s attempt=%d status=%d err=%s",
 				requestID, ctx.StreamID, ctx.Model, authLogHash(curAuthID), attempt+1, statusCode, truncateRedacted(openErr.Error(), 200))
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, statusCode, openErr.Error(), "", 0, curAuthUID, ctx.SessionKey)
-			// 模型级风控（11128「请求被拦截」）：跨账号命中即熔断，
-			// 同请求内不再把剩余账号逐个赔进一次上游往返。
-			if isModelCircuitError(statusCode, openErr.Error()) {
-				if noteModelCircuitHit(providerName, circuitKeyModel, curAuthID) {
-					log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(curAuthID))
-				}
-			}
-			if isModelCircuitOpen(providerName, circuitKeyModel) {
-				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream model circuit open: %s", ctx.UpstreamModel), deps)
+			// 11128：写入账号×模型冷却后停止换号，由冷却探活验证恢复。
+			if isModelBlockedError(statusCode, openErr.Error()) {
+				noteModelBlockedHit(curAuthID, circuitKeyModel)
+				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(openErr.Error(), 200)), deps)
 				return
 			}
 			// 换号判定用 isAccountFailure 而非 isAccountLevel4xx：open 阶段的
@@ -556,14 +532,11 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 			// 每个 attempt 的用量先按实际账号记失败（与 openErr / pseudo 分支同款），
 			// 再决定透传错误还是换号续试。
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), true, statusCode, result.Err.Error(), "", ttftNSBetween(ctx.Started, result.FirstOutputAt), curAuthUID, ctx.SessionKey)
-			// HTTP 200 + event:error 帧同样可能承载风控码，命中口径与 open 阶段一致。
-			if isModelCircuitError(statusCode, result.Err.Error()) {
-				if noteModelCircuitHit(providerName, circuitKeyModel, curAuthID) {
-					log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(curAuthID))
-				}
-			}
-			if isModelCircuitOpen(providerName, circuitKeyModel) {
-				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream model circuit open: %s", ctx.UpstreamModel), deps)
+			// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后返回，
+			// 由冷却探活验证恢复。
+			if isModelBlockedError(statusCode, result.Err.Error()) {
+				noteModelBlockedHit(curAuthID, circuitKeyModel)
+				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(result.Err.Error(), 200)), deps)
 				return
 			}
 			// HTTP 200 + event:error 是上游的业务失败通道（配额 14018 / 限流 4011
@@ -621,8 +594,8 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 			return
 		}
 		resetAccountFailover(curAuthID)
-		// 一次真实成功即证明该模型已恢复，清掉熔断残留。
-		resetModelCircuit(providerName, circuitKeyModel)
+		// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却。
+		resetModelBlockedState(circuitKeyModel)
 		publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), false, 0, "", "", ttftNSBetween(ctx.Started, result.FirstOutputAt), curAuthUID, ctx.SessionKey)
 		log.Printf("[traework] exec stream async done: request_id=%s stream_id=%s model=%s auth_hash=%s attempt=%d chunks=%d",
 			requestID, ctx.StreamID, ctx.Model, authLogHash(curAuthID), attempt+1, len(result.Chunks))
@@ -662,13 +635,8 @@ func runTraeSyncStream(initialAuth *traeAuth, payload map[string]any, ctx traeSy
 	attemptsMade := 0
 	circuitKeyModel := circuitModel(ctx.UpstreamModel)
 
-	// 模型级风控熔断前置检查：被拦模型的请求直接短路，不再消耗任何账号。
-	if isModelCircuitOpen(providerName, circuitKeyModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", ctx.UpstreamModel)
-		log.Printf("[traework] exec stream %s", msg)
-		publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, 0, msg, "", 0, curAuthUID, ctx.SessionKey)
-		return nil, fmt.Errorf("%s", msg)
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层会跳过它们，本请求正常发起即可。
 
 	// 前置冷却拦截：若宿主指定的初始账号已处于冷却中，直接换号到健康候选。
 	// 判定带模型维度：账号×模型级冷却只挡同一模型，不能把整个账号摘掉。
@@ -692,15 +660,11 @@ func runTraeSyncStream(initialAuth *traeAuth, payload map[string]any, ctx traeSy
 		if callErr != nil {
 			statusCode := parseUpstreamStatusFromErr(callErr)
 			log.Printf("[traework] exec stream upstream error: model=%s auth_hash=%s status=%d err=%s", ctx.Model, authLogHash(curAuthID), statusCode, truncateRedacted(callErr.Error(), 200))
-			// 模型级风控：跨账号命中即熔断，后续账号不再赔进同类往返。
-			if isModelCircuitError(statusCode, callErr.Error()) {
-				if noteModelCircuitHit(providerName, circuitKeyModel, curAuthID) {
-					log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(curAuthID))
-				}
-			}
-			if isModelCircuitOpen(providerName, circuitKeyModel) {
+			// 11128：写入账号×模型冷却后直接返回，由冷却探活验证恢复。
+			if isModelBlockedError(statusCode, callErr.Error()) {
+				noteModelBlockedHit(curAuthID, circuitKeyModel)
 				publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, statusCode, callErr.Error(), "", 0, curAuthUID, ctx.SessionKey)
-				return nil, fmt.Errorf("upstream model circuit open: %s", ctx.UpstreamModel)
+				return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(callErr.Error(), 200))
 			}
 			// 换号判定用 isAccountFailure：open 阶段 transport 级错误（TTFB 超时等
 			// status=0）与 5xx / 429 / 账号级 4xx 同责换号，400 业务错仍直通。核算
@@ -766,24 +730,21 @@ func runTraeSyncStream(initialAuth *traeAuth, payload map[string]any, ctx traeSy
 				continue
 			}
 			resetAccountFailover(curAuthID)
-			// 一次真实成功即证明该模型已恢复，清掉熔断残留。
-			resetModelCircuit(providerName, circuitKeyModel)
+			// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却。
+			resetModelBlockedState(circuitKeyModel)
 			log.Printf("[traework] exec stream collect ok: model=%s auth_hash=%s attempt=%d chunks=%d", ctx.Model, authLogHash(curAuthID), attempt+1, len(chunks))
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usageDetailForAttempt(detail, chunks), false, 0, "", "", ttftNSBetween(ctx.Started, firstOutputAt), curAuthUID, ctx.SessionKey)
 			return chunks, nil
 		}
 
 		// 3. HTTP 200 内的账号级 SSE 错误可继续换号，其余错误立即返回。
-		// HTTP 200 + event:error 帧同样可能承载风控码，命中口径与 open 阶段一致。
-		if isModelCircuitError(resp.StatusCode, collectErr.Error()) {
-			if noteModelCircuitHit(providerName, circuitKeyModel, curAuthID) {
-				log.Printf("[traework] model circuit OPEN provider=%s model=%s last_auth_hash=%s", providerName, circuitKeyModel, authLogHash(curAuthID))
-			}
-		}
-		if isModelCircuitOpen(providerName, circuitKeyModel) {
+		// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后返回，
+		// 由冷却探活验证恢复。
+		if isModelBlockedError(resp.StatusCode, collectErr.Error()) {
+			noteModelBlockedHit(curAuthID, circuitKeyModel)
 			reconcileAfterExecutorErrorForModel(curAuthID, circuitKeyModel, resp.StatusCode, collectErr.Error())
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, resp.StatusCode, collectErr.Error(), "", ttftNSBetween(ctx.Started, firstOutputAt), curAuthUID, ctx.SessionKey)
-			return nil, fmt.Errorf("upstream model circuit open: %s", ctx.UpstreamModel)
+			return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncateRedacted(collectErr.Error(), 200))
 		}
 		if !isAccountFailure(resp.StatusCode, collectErr.Error()) || attempt >= ctx.Budget || curSA == nil {
 			reconcileAfterExecutorErrorForModel(curAuthID, circuitKeyModel, resp.StatusCode, collectErr.Error())

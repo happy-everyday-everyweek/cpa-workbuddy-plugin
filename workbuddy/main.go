@@ -337,7 +337,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.16.8"
+var version = "0.16.9"
 
 func wbRegistration() registration {
 	return registration{
@@ -777,7 +777,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			if usedAuthID == "" {
 				usedAuthID = strings.TrimSpace(curSA.Account.UID)
 			}
-			resetModelCircuit(providerName, upstreamModel)
+			resetModelBlockedState(upstreamModel)
 			break
 		}
 		// Decide whether to retry on the next account. Account-level 4xx
@@ -787,16 +787,17 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// 5xx/0/402 keep the cooldown-only path (cross-request rotation
 		// via recordAccountFailure) and skip this loop.
 		statusCode := parseUpstreamStatusFromErr(completionErr)
-		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
-		if isModelCircuitError(statusCode, completionErr.Error()) && curSA != nil {
-			currentID := strings.TrimSpace(curSA.Auth.AccessToken)
-			if currentID == "" {
-				currentID = strings.TrimSpace(curSA.Account.UID)
+		// 11128：把命中的账号×模型写入冷却，并立即停止本轮换号。
+		// 上游拦截的是这个组合，其余账号大概率同样命中；冷却探活会在
+		// 到期前用同一模型回放验证。
+		if isModelBlockedError(statusCode, completionErr.Error()) {
+			if curSA != nil {
+				currentID := strings.TrimSpace(curSA.Auth.AccessToken)
+				if currentID == "" {
+					currentID = strings.TrimSpace(curSA.Account.UID)
+				}
+				noteModelBlockedHit(currentID, upstreamModel)
 			}
-			noteModelCircuitHit(providerName, upstreamModel, currentID)
-		}
-		if isModelCircuitOpen(providerName, upstreamModel) {
-			completionErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
 			break
 		}
 		if !shouldRotateOnUpstreamErr(statusCode, completionErr.Error()) || attempt >= budget || curSA == nil {

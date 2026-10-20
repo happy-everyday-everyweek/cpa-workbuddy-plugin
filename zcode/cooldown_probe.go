@@ -2,7 +2,7 @@
 // 它 → 再次失败」这条浪费用户等待时间的链路。
 //
 // 设计要点（与实施总览第 5 节的裁定一致）：
-//  1. 触发点是 cooldownUntil - 5s，不是到期后立即探测——后者等于把首次探测成本
+//  1. 触发点是 cooldownUntil - 20s，不是到期后立即探测——后者等于把首次探测成本
 //     推给业务请求；
 //  2. 只要进入冷却就探测，不设 count >= 3 门槛；
 //  3. 必须用当初失败的模型（entry.lastModel）回放，任意模型成功不算恢复；
@@ -16,7 +16,7 @@
 //	冷却继续沿阶梯递增。因此本模块只调用纯传输内核 pingUpstreamOnceFn，
 //	任何分支都不写 test_failed。
 //
-// 最近修改时间：2026-10-19 02:00:00；改动原因：新增冷却前主动探活。
+// 最近修改时间：2026-10-20；改动原因：调度粒度 5s 改为 1s，提前量 5s 改为 20s。
 package main
 
 import (
@@ -28,13 +28,15 @@ import (
 )
 
 const (
-	// cooldownProbeLeadTime 是探测相对冷却到期的提前量。用户裁定为 5 秒：
-	// 最短冷却 60s 也留有 55s 的准备窗口。
-	cooldownProbeLeadTime = 5 * time.Second
+	// cooldownProbeLeadTime 是探测相对冷却到期的提前量。用户裁定为 20 秒：
+	// 最短冷却 60s 仍留有 40s 余量，且窗口足以覆盖一次探活往返。
+	cooldownProbeLeadTime = 20 * time.Second
 
-	// cooldownProbeInterval 是探活调度粒度。必须显著小于最短冷却（60s），
-	// 否则首档冷却会整轮错过探测窗口。
-	cooldownProbeInterval = 5 * time.Second
+	// cooldownProbeInterval 是探活调度粒度。必须显著小于提前量窗口（20s）：
+	// 窗口宽度等于 tick 间隔时，一轮里只会落进一个 tick，该 tick 一旦被
+	// 「上一轮未结束就跳过」吃掉，整个冷却周期就再也不会被探测。取 1s
+	// 让窗口内有 20 个机会。
+	cooldownProbeInterval = 1 * time.Second
 
 	// cooldownProbeStartupWait 是启动时等待宿主装配的最长时间。
 	cooldownProbeStartupWait = 15 * time.Second
@@ -56,6 +58,8 @@ type cooldownProbeCandidate struct {
 	authID        string
 	cooldownUntil time.Time
 	model         string
+	// scope 记录该候选来自哪一层冷却，探活失败时按同一维度续期。
+	scope failureScope
 }
 
 // pingCooldownProbe 是探活内核的适配层：pingUpstreamOnce 返回多值，
@@ -111,13 +115,33 @@ func cooldownProbeTargets(now time.Time) []cooldownProbeCandidate {
 		authID string
 		until  time.Time
 		model  string
+		scope  failureScope
 	}
+	// 同账号多条目时保留更晚到期的那条（模型级阶梯通常长于账号级），
+	// 一次探活即可同时验证账号与该模型，避免重复探测浪费上游请求。
 	var snaps []snapshot
 	for id, entry := range failoverRecords {
-		if entry == nil || !now.Before(entry.cooldown) {
+		if entry == nil {
 			continue
 		}
-		snaps = append(snaps, snapshot{authID: id, until: entry.cooldown, model: entry.lastModel})
+		var pick *snapshot
+		// 1. 账号级冷却
+		if now.Before(entry.cooldown) {
+			pick = &snapshot{authID: id, until: entry.cooldown, model: entry.lastModel, scope: failureScopeAccount}
+		}
+		// 2. 账号×模型级冷却（11128 等模型级失败的落点，必须同样被探活）
+		for model, ms := range entry.modelStates {
+			if ms == nil || !now.Before(ms.cooldown) {
+				continue
+			}
+			cand := snapshot{authID: id, until: ms.cooldown, model: model, scope: failureScopeAuthModel}
+			if pick == nil || cand.until.After(pick.until) {
+				pick = &cand
+			}
+		}
+		if pick != nil {
+			snaps = append(snaps, *pick)
+		}
 	}
 	failoverMu.RUnlock()
 
@@ -132,6 +156,7 @@ func cooldownProbeTargets(now time.Time) []cooldownProbeCandidate {
 			authID:        s.authID,
 			cooldownUntil: s.until,
 			model:         s.model,
+			scope:         s.scope,
 		})
 	}
 	return out
@@ -187,16 +212,21 @@ func probeCoolingAccount(candidate cooldownProbeCandidate, sa *StoredAuth) bool 
 	}
 	err := probePingFn(sa, candidate.model)
 	if err != nil {
-		// 失败：沿阶梯继续递增账号级冷却。传空模型是因为探活失败只说明账号
-		// 尚未恢复，同时避免覆盖 lastModel——下一次探测仍需回放原模型。
-		recordFailureScoped(candidate.authID, "", failureScopeAccount, err.Error())
+		// 失败：沿阶梯继续递增冷却，维度与候选来源一致。账号级冷却的失败
+		// 仍记账号级；模型级冷却只记该模型，不牵连账号的其它模型。
+		recordFailureScoped(candidate.authID, candidate.model, candidate.scope, err.Error())
 		// 探活失败不动 test_failed：标签是硬排除、永不自动过期，
 		// 写进去比冷却严重得多。此处只让冷却继续递增。
 		log.Printf("[zcode] cooldown probe failed: auth=%s model=%s err=%s",
 			candidate.authID, candidate.model, err.Error())
 		return false
 	}
-	resetAccountFailover(candidate.authID)
+	// 成功时按候选来源清除对应维度：账号级清整账号，模型级只清该模型。
+	if candidate.scope == failureScopeAuthModel {
+		resetAuthModelFailover(candidate.authID, candidate.model)
+	} else {
+		resetAccountFailover(candidate.authID)
+	}
 	log.Printf("[zcode] cooldown probe ok: auth=%s model=%s, cooldown cleared",
 		candidate.authID, candidate.model)
 	return true
@@ -259,15 +289,15 @@ func hostAPIAvailable() bool {
 // cooldownProbeLoop 冷却前探活的常驻循环。
 //
 // 与既有定时探活分离：它们的最小粒度是小时级，对最短 60s 的冷却太粗，
-// 首档冷却会整轮错过提前 5 秒的探测窗口。
+// 首档冷却会整轮错过提前 20 秒的探测窗口。
 //
-// 单轮可能阻塞到探活超时（20s），远大于 5s 的 tick 间隔，因此用
+// 单轮可能阻塞到探活超时（20s），远大于 1s 的 tick 间隔，因此用
 // 「上一轮未结束就跳过本轮」而非排队：堆积轮次只会让同一批账号被重复探测，
 // 而探测本身已经按冷却周期去重。
 //
 // [参数] 无。
 // [返回] 无；循环永不返回。
-// 最近修改时间：2026-10-19 02:00:00；改动原因：新增，补轮次防堆积。
+// 最近修改时间：2026-10-20；改动原因：调度粒度 5s 改为 1s，提前量 5s 改为 20s。
 func cooldownProbeLoop() {
 	// init() 早于宿主装配，立即 tick 只会拿到 host API unavailable。
 	deadline := time.Now().Add(cooldownProbeStartupWait)

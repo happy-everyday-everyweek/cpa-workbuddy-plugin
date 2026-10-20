@@ -124,11 +124,17 @@ func classifyUpstreamFailure(status int, body string) failureScope {
 	if status == 0 || status >= 500 {
 		return failureScopeAccount
 	}
-	// 3. 限流文案与零字节断流按账号×模型处理。
+	// 3. 请求被拦截（11128）按账号×模型冷却：冷却探活会用同一模型回放，
+	//    验证该账号在这个模型上是否真的恢复。先于限流文案判定，因为 11128
+	//    的 displayMsg 可能带「请重新发送」这类无关文案。
+	if isModelBlockedError(status, body) {
+		return failureScopeAuthModel
+	}
+	// 4. 限流文案与零字节断流按账号×模型处理。
 	if isSoftRateLimit(status, body) || isEmptyStreamBody(body) {
 		return failureScopeAuthModel
 	}
-	// 4. 其余不记账：400/422 等请求形状问题换账号同样失败。
+	// 5. 其余不记账：400/422 等请求形状问题换账号同样失败。
 	return failureScopeNone
 }
 
@@ -172,4 +178,26 @@ func isEmptyStreamBody(body string) bool {
 // 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
 func isRequestShapeFailure(status int) bool {
 	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+// isModelBlockedError 判定一次失败是否属于「上游拦截了这次请求」。
+//
+// 只认 11128（request illegal / 请求被拦截）。11140 是账号级封禁、6004 是
+// 频率限制，两者分别由账号冷却与限流逻辑处理，不能混进这里。
+//
+// 该判据同时用于两个落点：失败分类（写入账号×模型冷却）与同请求换号决策
+// （一次命中就够，不必把预算耗在其余账号上）。
+//
+// [参数] status：上游 HTTP 状态码；body：上游响应正文。
+// [返回] 命中 11128 语义时返回 true。
+// 最近修改时间：2026-10-20；改动原因：从 model_circuit.go 迁入，成为唯一判定点。
+func isModelBlockedError(status int, body string) bool {
+	if status != http.StatusBadRequest && status != http.StatusForbidden {
+		return false
+	}
+	// 11140 = 账号级封禁，必须排除，否则会把封号误判成模型拦截。
+	if strings.Contains(body, "11140") {
+		return false
+	}
+	return strings.Contains(body, "11128")
 }

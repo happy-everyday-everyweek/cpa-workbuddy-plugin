@@ -1,174 +1,57 @@
-// model_circuit.go 实现模型级风控熔断：同一 provider × 模型在短窗口内跨多个
-// 账号命中同一个风控错误码时，判定为上游对「模型」的拦截，而非账号故障。
+// model_circuit.go 处理上游「请求被拦截」（11128）的记账落点。
 //
-// 背景（2026-10-18 生产取证）：workbuddy-ai-provider 的 deepseek-v4.1-flash
-// 在 3 小时内返回 1173 次 {"code":11128,"msg":"request illegal"}，20 个账号
-// 命中次数几乎均匀（55~73 次/账号），而其他模型正常。该形态不可能由账号故障
-// 产生：账号级故障会让失败的账号逐个退出轮转，而不是全池等量失败。
+// 历史沿革：本文件最初实现的是独立的模型级熔断状态机——跨 3 个账号命中
+// 11128 后在该 provider × 模型上打开 60 秒闸门，闸门期间所有请求直接短路。
+// 该设计解决了「整池轮转后才失败」的时间损耗，但留下一个缺口：熔断只是拒绝
+// 请求，并不改变路由，被拦截的账号仍会被宿主选中，用户依旧每次都要等一个
+// 失败往返。
 //
-// 若继续按账号粒度处理，调度器会逐个换号，每个账号各赔一次 0.5~3.7 秒的上游
-// 往返，形成「整池轮转后才失败」的时间损耗（生产实测单链路 4.5~10.3 秒）。
-// 本模块把这类失败折叠成一次模型级判定：达到阈值后直接短路，不再消耗账号。
+// 现方案（2026-10-20 重构）：不再维护独立的熔断状态，11128 直接走
+// 账号×模型冷却（classifyUpstreamFailure 返回 failureScopeAuthModel）。
+// 好处是复用既有冷却探活闭环——到期前 5 秒用同一模型回放探活，成功才清冷却，
+// 失败则沿阶梯续期。路由层 isAuthModelCoolingDown 会跳过冷却中的账号×模型，
+// 请求因此不再被派到已知会被拦截的组合上。
 //
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增模型级风控熔断。
+// 本文件只保留「一次 11128 命中该记到哪」这个判定，状态全部交给 accountFailover。
+//
+// 最近修改时间：2026-10-20；改动原因：移除独立熔断状态机，改为复用账号×模型冷却。
 package main
 
 import (
 	"strings"
-	"sync"
-	"time"
 )
 
-const (
-	// modelCircuitDistinctAuths 是触发熔断所需的「不同账号」数量。
-	// 用不同账号数而非失败次数：单账号反复失败是账号故障，只有跨账号
-	// 等量失败才说明拦截点在模型/租户层。
-	modelCircuitDistinctAuths = 3
-
-	// modelCircuitWindow 是统计窗口。生产实测 11128 在同一分钟内跨 20 个
-	// 账号出现，3 分钟窗口足以聚合出判定信号，又不会把已恢复的历史失败
-	// 一直算进来。
-	modelCircuitWindow = 3 * time.Minute
-
-	// modelCircuitHold 是熔断后的抑制时长。取 60 秒：足够让调度侧跳过该
-	// 模型，又不至于在上游恢复后仍长时间拦截正常流量。
-	modelCircuitHold = 60 * time.Second
-)
-
-// modelCircuitState 记录某个 provider × 模型的风控聚合状态。
-type modelCircuitState struct {
-	auths       map[string]time.Time // 账号 → 最近一次命中时间
-	blockedTill time.Time            // 熔断截止时间，零值表示未熔断
-}
-
-var (
-	modelCircuitMu     sync.Mutex
-	modelCircuitStates = make(map[string]*modelCircuitState)
-)
-
-// modelCircuitKey 生成 provider × 模型的聚合键。
-// [参数] provider：插件 provider 名；model：已归一化的上游模型名。
-// [返回] 聚合键；任一为空时返回空串表示不参与熔断。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func modelCircuitKey(provider, model string) string {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	model = strings.ToLower(strings.TrimSpace(model))
-	if provider == "" || model == "" {
-		return ""
-	}
-	return provider + "\x00" + model
-}
-
-// isModelCircuitError 判定一次失败是否属于「模型级风控」信号。
-// 只有明确指向请求被拦截、且与具体账号无关的错误码才计数：账号级封禁
-// （11140「Your account」）与限流（6004）不在此列，它们分别由账号冷却和
-// 频率限制逻辑处理。
-// [参数] status：上游 HTTP 状态码；body：上游响应正文。
-// [返回] 命中模型级风控语义时返回 true。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func isModelCircuitError(status int, body string) bool {
-	if status != 400 && status != 403 {
-		return false
-	}
-	// 11128 = 请求被拦截（模型级）；11140 是账号级封禁，必须排除。
-	if strings.Contains(body, "11140") {
-		return false
-	}
-	return strings.Contains(body, "11128")
-}
-
-// noteModelCircuitHit 记录一次模型级风控命中，并在跨账号达到阈值时熔断。
-// [参数] provider：插件 provider 名；model：上游模型名；authID：命中账号。
-// [返回] 本次命中后该模型是否处于熔断状态。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func noteModelCircuitHit(provider, model, authID string) bool {
-	key := modelCircuitKey(provider, model)
-	if key == "" {
-		return false
-	}
-	now := time.Now()
-	modelCircuitMu.Lock()
-	defer modelCircuitMu.Unlock()
-
-	st := modelCircuitStates[key]
-	if st == nil {
-		st = &modelCircuitState{auths: make(map[string]time.Time)}
-		modelCircuitStates[key] = st
-	}
-
-	// 1. 清理窗口外的账号记录，避免历史失败长期占位
-	for id, at := range st.auths {
-		if now.Sub(at) > modelCircuitWindow {
-			delete(st.auths, id)
-		}
-	}
-
-	// 2. 记录本次命中
-	if authID = strings.TrimSpace(authID); authID != "" {
-		st.auths[authID] = now
-	}
-
-	// 3. 跨账号数达到阈值即熔断；已熔断期间继续命中则续期，
-	//    避免持续拦截的模型每 60 秒放行一次再失败。
-	if len(st.auths) >= modelCircuitDistinctAuths {
-		st.blockedTill = now.Add(modelCircuitHold)
-	}
-	return now.Before(st.blockedTill)
-}
-
-// isModelCircuitOpen 判定某 provider × 模型当前是否处于熔断抑制中。
-// [参数] provider：插件 provider 名；model：上游模型名。
-// [返回] 熔断中返回 true，调用方应快速失败而不消耗账号。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func isModelCircuitOpen(provider, model string) bool {
-	key := modelCircuitKey(provider, model)
-	if key == "" {
-		return false
-	}
-	modelCircuitMu.Lock()
-	defer modelCircuitMu.Unlock()
-	st := modelCircuitStates[key]
-	if st == nil || st.blockedTill.IsZero() {
-		return false
-	}
-	return time.Now().Before(st.blockedTill)
-}
-
-// resetModelCircuit 清除某个 provider × 模型的熔断与计数。
-// 上游恢复正常（一次成功请求）时调用，避免残留状态影响后续判定。
-// [参数] provider：插件 provider 名；model：上游模型名。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func resetModelCircuit(provider, model string) {
-	key := modelCircuitKey(provider, model)
-	if key == "" {
+// noteModelBlockedHit 记录一次 11128 命中，并把它写进账号×模型冷却。
+//
+// 与历史 noteModelCircuitHit 的差异：不再维护跨账号聚合与 blockedTill，
+// 而是直接调用与其它失败相同的记账落点 recordFailureScoped。这样：
+//  1. 冷却阶梯（60s 起、每次 +60s、上限 10 分钟）对 11128 同样生效；
+//  2. 冷却探活会在到期前回放同一模型，成功才放开；
+//  3. 路由与换号通过 isAuthModelCoolingDown 自动跳过，不需要额外的全局闸门。
+//
+// [参数] authID: 命中的账号标识；model: 已归一化的上游模型名。
+// [返回] 无。冷却状态由 failover 记录持有，调用方无需返回值。
+// 最近修改时间：2026-10-20；改动原因：改为写入账号×模型冷却。
+func noteModelBlockedHit(authID, model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
 		return
 	}
-	modelCircuitMu.Lock()
-	delete(modelCircuitStates, key)
-	modelCircuitMu.Unlock()
+	recordFailureScoped(authID, model, failureScopeAuthModel, "upstream 11128 request illegal")
 }
 
-// clearModelCircuits 清空全部熔断状态。测试辅助，生产路径不调用。
-func clearModelCircuits() {
-	modelCircuitMu.Lock()
-	modelCircuitStates = make(map[string]*modelCircuitState)
-	modelCircuitMu.Unlock()
-}
-
-// modelCircuitSnapshot 返回某 provider × 模型的当前状态快照。
-// [参数] provider：插件 provider 名；model：上游模型名。
-// [返回] 命中账号数、熔断截止时间、是否存在记录。
-// 最近修改时间：2026-10-18 23:40:00；改动原因：新增。
-func modelCircuitSnapshot(provider, model string) (authCount int, blockedTill time.Time, ok bool) {
-	key := modelCircuitKey(provider, model)
-	if key == "" {
-		return 0, time.Time{}, false
+// resetModelBlockedState 在一次成功请求后清理该模型的残留冷却。
+//
+// 冷却状态按账号×模型存储，单账号成功由 resetAuthModelFailover 精确清除；
+// 这里额外清空该模型的全部账号记录，是因为一次成功已证明「该模型当前可用」，
+// 留着其它账号的旧冷却只会让已恢复的模型继续被跳过一段时间。
+//
+// [参数] model：已归一化的上游模型名。
+// 最近修改时间：2026-10-20；改动原因：成功路径清理模型维度的残留冷却。
+func resetModelBlockedState(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
 	}
-	modelCircuitMu.Lock()
-	defer modelCircuitMu.Unlock()
-	st := modelCircuitStates[key]
-	if st == nil {
-		return 0, time.Time{}, false
-	}
-	return len(st.auths), st.blockedTill, true
+	clearAuthModelCooldowns("", model)
 }

@@ -448,6 +448,45 @@ func resetAuthModelFailover(authID, model string) {
 	}
 }
 
+// clearAuthModelCooldowns 清除某个模型上的冷却记录。
+//
+// 传空 authID 时清空该模型在所有账号上的记录，用于「一次成功证明模型已恢复」
+// 的场景；传了 authID 时只清该账号。账号级冷却不受影响——它代表账号整体不可用，
+// 与单个模型的恢复无关。
+//
+// [参数] authID：账号标识，空表示全部账号；model：已归一化的上游模型名。
+// 最近修改时间：2026-10-20；改动原因：新增，统一模型维度清理的唯一落点。
+func clearAuthModelCooldowns(authID, model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	failoverMu.Lock()
+	defer failoverMu.Unlock()
+	for k, st := range failoverStates {
+		if st == nil || st.modelStates == nil {
+			continue
+		}
+		if authID != "" && !failoverKeyMatches(k, authID) {
+			continue
+		}
+		delete(st.modelStates, model)
+	}
+}
+
+// failoverKeyMatches 判定一个 failoverStates 键是否指向给定账号。
+// 键可能是 UID、auth.ID 或 auth_index，因此同时比对归一化别名。
+// [参数] key：failoverStates 的键；authID：目标账号标识。
+// [返回] true 表示该键属于目标账号。
+// 最近修改时间：2026-10-20；改动原因：新增，供按账号清理模型冷却。
+func failoverKeyMatches(key, authID string) bool {
+	if key == authID {
+		return true
+	}
+	return normalizeFailoverKey(key) == normalizeFailoverKey(authID)
+}
+
 func pruneFailoverStates() {
 	failoverMu.Lock()
 	defer failoverMu.Unlock()

@@ -27,7 +27,7 @@ func stubProbePing(t *testing.T, fn func(*traeAuth, string) error) *int {
 	return &calls
 }
 
-// TestShouldProbeCandidateWindow 锁定触发窗口：只有「距到期 ≤5s 且尚未到期」
+// TestShouldProbeCandidateWindow 锁定触发窗口：只有「距到期 ≤20s 且尚未到期」
 // 的冷却才探测，冷却过期后交给正常路由。
 func TestShouldProbeCandidateWindow(t *testing.T) {
 	now := probeTestNow()
@@ -42,20 +42,20 @@ func TestShouldProbeCandidateWindow(t *testing.T) {
 		want          bool
 	}{
 		{
-			name:          "距到期 10s 太早",
-			cooldownUntil: now.Add(10 * time.Second),
+			name:          "距到期 25s 太早",
+			cooldownUntil: now.Add(25 * time.Second),
 			model:         model,
 			want:          false,
 		},
 		{
-			name:          "距到期 6s 仍未进窗口",
-			cooldownUntil: now.Add(6 * time.Second),
+			name:          "距到期 21s 仍未进窗口",
+			cooldownUntil: now.Add(21 * time.Second),
 			model:         model,
 			want:          false,
 		},
 		{
-			name:          "距到期正好 5s 进窗口",
-			cooldownUntil: now.Add(5 * time.Second),
+			name:          "距到期正好 20s 进窗口",
+			cooldownUntil: now.Add(20 * time.Second),
 			model:         model,
 			want:          true,
 		},
@@ -123,7 +123,7 @@ func TestCooldownProbeSuccessClearsCooldown(t *testing.T) {
 
 	stubProbePing(t, func(*traeAuth, string) error { return nil })
 
-	candidate := cooldownProbeCandidate{authID: authID, cooldownUntil: time.Now().Add(2 * time.Second), model: "GLM-4.6"}
+	candidate := cooldownProbeCandidate{authID: authID, cooldownUntil: time.Now().Add(2 * time.Second), model: "GLM-4.6", scope: failureScopeAccount}
 	if !probeCoolingAccount(candidate, &traeAuth{}) {
 		t.Fatal("探活成功应返回 true")
 	}
@@ -146,7 +146,7 @@ func TestCooldownProbeFailureEscalatesCooldown(t *testing.T) {
 
 	stubProbePing(t, func(*traeAuth, string) error { return fmt.Errorf("upstream HTTP 503: unavailable") })
 
-	candidate := cooldownProbeCandidate{authID: authID, cooldownUntil: before, model: "GLM-4.6"}
+	candidate := cooldownProbeCandidate{authID: authID, cooldownUntil: before, model: "GLM-4.6", scope: failureScopeAccount}
 	if probeCoolingAccount(candidate, &traeAuth{}) {
 		t.Fatal("探活失败应返回 false")
 	}
@@ -188,8 +188,8 @@ func TestCooldownProbeNeverWritesTestFailed(t *testing.T) {
 		return nil
 	})
 
-	probeCoolingAccount(cooldownProbeCandidate{authID: okAuth, cooldownUntil: time.Now().Add(time.Second), model: "ok-model"}, &traeAuth{})
-	probeCoolingAccount(cooldownProbeCandidate{authID: failAuth, cooldownUntil: time.Now().Add(time.Second), model: "fail-model"}, &traeAuth{})
+	probeCoolingAccount(cooldownProbeCandidate{authID: okAuth, cooldownUntil: time.Now().Add(time.Second), model: "ok-model", scope: failureScopeAccount}, &traeAuth{})
+	probeCoolingAccount(cooldownProbeCandidate{authID: failAuth, cooldownUntil: time.Now().Add(time.Second), model: "fail-model", scope: failureScopeAccount}, &traeAuth{})
 
 	if isTestFailed(okAuth) {
 		t.Fatal("探活成功不得写 test_failed")
@@ -322,5 +322,21 @@ func TestCooldownProbeSkipsUnresolvableAuth(t *testing.T) {
 	// 第二轮解析恢复：应能正常探测。
 	if probed := runCooldownProbeTick(time.Now(), func(string) *traeAuth { return &traeAuth{} }); probed != 1 {
 		t.Fatalf("解析恢复后应探测 1 个账号，got %d", probed)
+	}
+}
+
+// TestCooldownProbeIntervalFitsWindow 钉住调度粒度与探测窗口的关系。
+// 窗口宽度若只容得下一个 tick，该 tick 一旦被「上一轮未结束就跳过」吃掉，
+// 冷却到期后就再也不会被探测，账号会不带验证地重新接流量。
+// [参数] t：测试上下文。
+// [返回] 无。
+// 最近修改时间：2026-10-20；改动原因：新增，守护窗口余量不低于 3 个 tick。
+func TestCooldownProbeIntervalFitsWindow(t *testing.T) {
+	if cooldownProbeInterval <= 0 {
+		t.Fatalf("调度粒度必须为正, got %v", cooldownProbeInterval)
+	}
+	if ticks := cooldownProbeLeadTime / cooldownProbeInterval; ticks < 3 {
+		t.Fatalf("探测窗口只容得下 %d 个 tick（窗口 %v / 粒度 %v），窗口余量不足，至少需要 3 个",
+			ticks, cooldownProbeLeadTime, cooldownProbeInterval)
 	}
 }

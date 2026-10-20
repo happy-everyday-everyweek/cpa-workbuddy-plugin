@@ -293,7 +293,7 @@ type registrationCapability struct {
 	UsagePlugin           bool                         `json:"usage_plugin"`
 }
 
-var version = "0.1.20"
+var version = "0.1.21"
 
 func wbRegistration() registration {
 	return registration{
@@ -615,20 +615,19 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			if usedAuthID == "" {
 				usedAuthID = strings.TrimSpace(curSA.Account.UID)
 			}
-			resetModelCircuit(providerName, upstreamModel)
+			resetModelBlockedState(upstreamModel)
 			break
 		}
+		// 11128：把命中的账号×模型写入冷却，并立即停止本轮换号。
+		// 上游拦截的是这个组合，其余账号大概率同样命中，继续换号只会把
+		// 预算耗在一连串必败的往返上；冷却探活会在到期前用同一模型回放验证。
 		statusCode := parseUpstreamStatusFromErr(completionErr)
-		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
-		if isModelCircuitError(statusCode, completionErr.Error()) {
+		if isModelBlockedError(statusCode, completionErr.Error()) {
 			currentID := strings.TrimSpace(curSA.Auth.AccessToken)
 			if currentID == "" {
 				currentID = strings.TrimSpace(curSA.Account.UID)
 			}
-			noteModelCircuitHit(providerName, upstreamModel, currentID)
-		}
-		if isModelCircuitOpen(providerName, upstreamModel) {
-			completionErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+			noteModelBlockedHit(currentID, upstreamModel)
 			break
 		}
 		if !shouldRotateOnUpstreamErr(statusCode, completionErr.Error()) || attempt >= budget || curSA == nil {

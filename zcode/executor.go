@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -45,14 +44,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	var finalRespBytes []byte
 	var finalStatusCode int
 
-	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时直接短路，
-	// 不再向任何账号发起上游调用——这是本机制真正的收益点。
-	if isModelCircuitOpen(providerName, upstreamModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
-		log.Printf("[zcode] exec %s", msg)
-		publishUsage("", "", req.Model, upstreamModel, startTime, usageTokensDetail{}, 0, 0, true, msg, 0)
-		return nil, fmt.Errorf("%s", msg)
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层会跳过它们；本请求若仍落到这里说明上游刚恢复或该组合尚未被
+	// 标记，按正常流程发起即可。
 
 	// 最多 3 次换号重试
 	for attempt := 0; attempt < 3; attempt++ {
@@ -66,22 +60,19 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		if err == nil {
 			finalRespBytes = respBytes
 			lastErr = nil
-			// 一次真实成功即证明该模型已恢复，清掉熔断残留。
-			resetModelCircuit(providerName, upstreamModel)
+			// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却。
+			resetModelBlockedState(upstreamModel)
 			break
 		}
 
 		lastErr = err
 		noteAccountFailureForModel(sa.AuthID, upstreamModel, status, err.Error())
 
-		// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
-		if isModelCircuitError(status, err.Error()) {
-			if noteModelCircuitHit(providerName, upstreamModel, sa.AuthID) {
-				log.Printf("[zcode] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, sa.AuthID)
-			}
-		}
-		if isModelCircuitOpen(providerName, upstreamModel) {
-			lastErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+		// 11128：命中即写入账号×模型冷却并停止换号。上游拦截的是这个
+		// 组合，其余账号大概率同样命中；冷却探活会在到期前回放验证。
+		if isModelBlockedError(status, err.Error()) {
+			noteModelBlockedHit(sa.AuthID, upstreamModel)
+			lastErr = fmt.Errorf("upstream %d: %s", status, err.Error())
 			break
 		}
 
@@ -148,15 +139,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	var finalResp *http.Response
 	var finalCancel context.CancelFunc
 
-	// 模型级风控熔断前置检查：被拦模型的请求直接短路，不再消耗任何账号。
-	if isModelCircuitOpen(providerName, upstreamModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
-		log.Printf("[zcode] exec stream %s", msg)
-		streamEmitError(req.StreamID, msg)
-		streamClose(req.StreamID)
-		publishUsage("", "", req.Model, upstreamModel, startTime, usageTokensDetail{}, 0, 0, true, msg, 0)
-		return okEnvelope(streamResponse{Headers: streamHeaders()})
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层会跳过它们，本请求正常发起即可。
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if sa == nil || sa.APIKey == "" {
@@ -193,14 +177,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			lastStreamErr = fmt.Errorf("%s", errMsg)
 			noteAccountFailureForModel(sa.AuthID, upstreamModel, resp.StatusCode, errMsg)
 
-			// 模型级风控：跨账号命中即熔断，同请求内不再把剩余账号逐个赔进往返。
-			if isModelCircuitError(resp.StatusCode, errMsg) {
-				if noteModelCircuitHit(providerName, upstreamModel, sa.AuthID) {
-					log.Printf("[zcode] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, sa.AuthID)
-				}
-			}
-			if isModelCircuitOpen(providerName, upstreamModel) {
-				lastStreamErr = fmt.Errorf("upstream model circuit open: %s", upstreamModel)
+			// 11128：写入账号×模型冷却后停止换号，由冷却探活验证恢复。
+			if isModelBlockedError(resp.StatusCode, errMsg) {
+				noteModelBlockedHit(sa.AuthID, upstreamModel)
 				break
 			}
 

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -137,15 +136,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		}
 	}
 
-	// 模型级风控熔断前置检查：该 provider × 模型已被判定为上游拦截时，
-	// 直接短路返回，不再向任何账号发起上游调用——这是本机制真正的收益点，
-	// 避免每个账号各赔一次往返后仍然失败。
-	if isModelCircuitOpen(providerName, upstreamModel) {
-		msg := fmt.Sprintf("upstream model circuit open: %s", upstreamModel)
-		log.Printf("[workbuddy] %s (auth=%s)", msg, curAuthID)
-		streamEmitError(streamID, msg)
-		return
-	}
+	// 模型级拦截不再有独立的全局闸门：被拦截的账号×模型已写入冷却，
+	// 路由层 isAuthModelCoolingDown 会跳过它们，本请求若仍落到这里说明上游
+	// 刚恢复或该组合尚未被标记，按正常流程发起即可。
 
 	for attempt := 0; attempt <= budget; attempt++ {
 		stream, statusCode, _, err := hostHTTPDoStream(curReq)
@@ -176,12 +169,14 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			//   Business 400 is request-shaped and would fail identically
 			//   on every account, so we propagate it immediately.
 			//
-			// 模型级风控（11128「请求被拦截」）：跨 3 个账号命中即判定为上游
-			// 拦截的是模型而非账号，立即短路，不再消耗其余账号的往返时间。
-			if isModelCircuitError(statusCode, errPayload) {
-				if noteModelCircuitHit(providerName, upstreamModel, curAuthID) {
-					log.Printf("[workbuddy] model circuit OPEN provider=%s model=%s last_auth=%s", providerName, upstreamModel, curAuthID)
-				}
+			// 11128「请求被拦截」：写入账号×模型冷却后直接返回。
+			// 该状态码是 400，本就不会进入换号分支（isAccountLevel4xx 不含
+			// 400），因此这里只需负责记账——冷却探活会在到期前用同一模型
+			// 回放验证，路由层则通过 isAuthModelCoolingDown 跳过该组合。
+			if isModelBlockedError(statusCode, errPayload) {
+				noteModelBlockedHit(curAuthID, upstreamModel)
+				streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errPayload, 200)))
+				return
 			}
 			if !isAccountLevel4xx(statusCode) {
 				streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errPayload, 200)))
@@ -354,9 +349,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), false, 0, "", reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
 		invalidateAccountCredits(curAuthID, curAuthUID)
 		resetAccountFailover(curAuthID)
-		// 一次真实成功即证明该模型已恢复，清掉熔断残留，避免抑制窗口
-		// 在恢复后仍拦住正常流量。
-		resetModelCircuit(providerName, upstreamModel)
+		// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却，
+		// 避免其它账号的旧记录让已恢复的模型继续被跳过。
+		resetModelBlockedState(upstreamModel)
 		return
 	}
 }
@@ -401,24 +396,24 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	for attempt := 0; attempt <= budget; attempt++ {
 		chunks, statusCode, errOnce := collectUpstreamStreamOnce(body, curSA, sseFramed, collector, model)
 		if errOnce == nil {
-			// 真实成功即证明模型已恢复，清掉熔断残留。
-			resetModelCircuit(providerName, model)
+			// 真实成功即证明模型已恢复，清掉该模型上残留的冷却。
+			resetModelBlockedState(model)
 			return chunks, statusCode, nil
 		}
 		lastStatus = statusCode
 		lastErr = errOnce
 
-		// 模型级风控：跨账号命中即熔断，后续同类请求直接短路，
-		// 不再把剩余账号逐个赔进一次上游往返。
-		if isModelCircuitError(statusCode, errOnce.Error()) && curSA != nil {
-			currentID := strings.TrimSpace(curSA.Auth.AccessToken)
-			if currentID == "" {
-				currentID = strings.TrimSpace(curSA.Account.UID)
+		// 11128：写入账号×模型冷却后直接返回。冷却探活会在到期前用同一
+		// 模型回放验证，路由层则跳过冷却中的组合。
+		if isModelBlockedError(statusCode, errOnce.Error()) {
+			if curSA != nil {
+				currentID := strings.TrimSpace(curSA.Auth.AccessToken)
+				if currentID == "" {
+					currentID = strings.TrimSpace(curSA.Account.UID)
+				}
+				noteModelBlockedHit(currentID, model)
 			}
-			noteModelCircuitHit(providerName, model, currentID)
-		}
-		if isModelCircuitOpen(providerName, model) {
-			return chunks, statusCode, fmt.Errorf("upstream model circuit open: %s", model)
+			return chunks, statusCode, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(errOnce.Error(), 200))
 		}
 
 		// 1. 已收集分片即视为已下发；其中是否含正文由 streamChunksHaveContent 判定

@@ -2,7 +2,7 @@
 // 它 → 再次失败」这条浪费用户等待时间的链路。
 //
 // 设计要点（与实施总览第 5 节的裁定一致）：
-//  1. 触发点是 cooldownUntil - 5s，不是到期后立即探测——后者等于把首次探测成本
+//  1. 触发点是 cooldownUntil - 20s，不是到期后立即探测——后者等于把首次探测成本
 //     推给业务请求；
 //  2. 只要进入冷却就探测，不设 count >= 3 门槛；
 //  3. 必须用当初失败的模型（state.lastModel）回放，任意模型成功不算恢复；
@@ -16,7 +16,7 @@
 //	独立实现，只调用 sendActivePingTrae（纯发请求）并自行处理结果，
 //	任何分支都不调用 persistTestFailedToggle(..., true)。
 //
-// 最近修改时间：2026-10-19 01:20:00；改动原因：新增冷却前主动探活。
+// 最近修改时间：2026-10-20；改动原因：调度粒度 5s 改为 1s，提前量 5s 改为 20s。
 package main
 
 import (
@@ -27,13 +27,15 @@ import (
 )
 
 const (
-	// cooldownProbeLeadTime 是探测相对冷却到期的提前量。用户裁定为 5 秒：
-	// 最短冷却 60s 也留有 55s 的准备窗口。
-	cooldownProbeLeadTime = 5 * time.Second
+	// cooldownProbeLeadTime 是探测相对冷却到期的提前量。用户裁定为 20 秒：
+	// 最短冷却 60s 仍留有 40s 余量，且窗口足以覆盖一次探活往返。
+	cooldownProbeLeadTime = 20 * time.Second
 
-	// cooldownProbeInterval 是探活调度粒度。必须显著小于最短冷却（60s），
-	// 否则首档冷却会整轮错过探测窗口。
-	cooldownProbeInterval = 5 * time.Second
+	// cooldownProbeInterval 是探活调度粒度。必须显著小于提前量窗口（20s）：
+	// 窗口宽度等于 tick 间隔时，一轮里只会落进一个 tick，该 tick 一旦被
+	// 「上一轮未结束就跳过」吃掉，整个冷却周期就再也不会被探测。取 1s
+	// 让窗口内有 20 个机会。
+	cooldownProbeInterval = 1 * time.Second
 )
 
 var (
@@ -52,6 +54,8 @@ type cooldownProbeCandidate struct {
 	authID        string
 	cooldownUntil time.Time
 	model         string
+	// scope 记录该候选来自哪一层冷却，探活失败时按同一维度续期。
+	scope failureScope
 }
 
 // shouldProbeCandidate 判定某条冷却状态当前是否该探测。
@@ -91,13 +95,40 @@ func cooldownProbeTargets(now time.Time) []cooldownProbeCandidate {
 		authID string
 		until  time.Time
 		model  string
+		scope  failureScope
 	}
-	var snaps []snapshot
+	// 同一账号可能以多个键存在（原始键 + 归一化别名），按归一化键去重，
+	// 否则一次命中会被当成两个候选、对同一账号探测两次。
+	byAuth := make(map[string]snapshot)
+	record := func(s snapshot) {
+		key := normalizeFailoverKey(s.authID)
+		if key == "" {
+			key = s.authID
+		}
+		if prev, ok := byAuth[key]; ok && !s.until.After(prev.until) {
+			return
+		}
+		byAuth[key] = s
+	}
 	for id, st := range failoverStates {
-		if st == nil || !now.Before(st.cooldownUntil) {
+		if st == nil {
 			continue
 		}
-		snaps = append(snaps, snapshot{authID: id, until: st.cooldownUntil, model: st.lastModel})
+		// 1. 账号级冷却
+		if now.Before(st.cooldownUntil) {
+			record(snapshot{authID: id, until: st.cooldownUntil, model: st.lastModel, scope: failureScopeAccount})
+		}
+		// 2. 账号×模型级冷却（11128 等模型级失败的落点，必须同样被探活）
+		for model, ms := range st.modelStates {
+			if ms == nil || !now.Before(ms.cooldownUntil) {
+				continue
+			}
+			record(snapshot{authID: id, until: ms.cooldownUntil, model: model, scope: failureScopeAuthModel})
+		}
+	}
+	snaps := make([]snapshot, 0, len(byAuth))
+	for _, v := range byAuth {
+		snaps = append(snaps, v)
 	}
 	failoverMu.Unlock()
 
@@ -105,13 +136,18 @@ func cooldownProbeTargets(now time.Time) []cooldownProbeCandidate {
 	defer probedUntilMu.Unlock()
 	var out []cooldownProbeCandidate
 	for _, s := range snaps {
-		if !shouldProbeCandidate(s.authID, s.until, s.model, probedUntil[s.authID], now) {
+		probeKey := normalizeFailoverKey(s.authID)
+		if probeKey == "" {
+			probeKey = s.authID
+		}
+		if !shouldProbeCandidate(s.authID, s.until, s.model, probedUntil[probeKey], now) {
 			continue
 		}
 		out = append(out, cooldownProbeCandidate{
 			authID:        s.authID,
 			cooldownUntil: s.until,
 			model:         s.model,
+			scope:         s.scope,
 		})
 	}
 	return out
@@ -136,8 +172,14 @@ func currentCooldownUntil(authID string, fallback time.Time) time.Time {
 // 冷却被阶梯延长后会得到新的截止时间，届时允许再探一次。
 // 最近修改时间：2026-10-19 01:20:00；改动原因：新增。
 func markCooldownProbed(authID string, cooldownUntil time.Time) {
+	// 记录键用归一化标识：同一账号在冷却表里可能同时存在原始键与别名键，
+	// 按原始键记录会让另一条记录查不到标记而被重复探测。
+	key := normalizeFailoverKey(authID)
+	if key == "" {
+		key = authID
+	}
 	probedUntilMu.Lock()
-	probedUntil[authID] = cooldownUntil
+	probedUntil[key] = cooldownUntil
 	probedUntilMu.Unlock()
 }
 
@@ -165,16 +207,22 @@ func probeCoolingAccount(candidate cooldownProbeCandidate, sa *traeAuth) bool {
 	}
 	err := probePingFn(sa, candidate.model)
 	if err != nil {
-		// 失败：沿阶梯继续递增账号级冷却。传空模型是因为对传输层失败而言模型
-		// 维度没有新信息，同时避免覆盖 lastModel——下一次探测仍需回放原模型。
-		recordFailureScoped(candidate.authID, "", failureScopeAccount)
+		// 失败：沿阶梯继续递增冷却，维度与候选来源一致。账号级冷却的失败
+		// 仍记账号级（该账号在这个模型上不可用）；模型级冷却只记该模型，
+		// 不牵连账号的其它模型。
+		recordFailureScoped(candidate.authID, candidate.model, candidate.scope)
 		// 探活失败不动 test_failed：标签是硬排除、永不自动过期，
 		// 写进去比冷严重得多。此处只让冷却继续递增。
 		log.Printf("[traework] cooldown probe failed: auth=%s model=%s err=%s",
 			candidate.authID, candidate.model, truncateRedacted(err.Error(), 160))
 		return false
 	}
-	resetAccountFailover(candidate.authID)
+	// 成功时按候选来源清除对应维度：账号级清整账号，模型级只清该模型。
+	if candidate.scope == failureScopeAuthModel {
+		resetAuthModelFailover(candidate.authID, candidate.model)
+	} else {
+		resetAccountFailover(candidate.authID)
+	}
 	log.Printf("[traework] cooldown probe ok: auth=%s model=%s, cooldown cleared",
 		candidate.authID, candidate.model)
 	return true
@@ -223,13 +271,13 @@ func resolveProbeAuth(authID string) *traeAuth {
 // cooldownProbeLoop 冷却前探活的常驻循环。
 //
 // 与 watchdogLoop 分离：watchdog 的 10 分钟粒度对最短 60s 的冷却太粗，
-// 首档冷却会整轮错过提前 5 秒的探测窗口。
+// 首档冷却会整轮错过提前 20 秒的探测窗口。
 //
-// 单轮可能阻塞到探活超时（20s），远大于 5s 的 tick 间隔，因此用
+// 单轮可能阻塞到探活超时（20s），远大于 1s 的 tick 间隔，因此用
 // 「上一轮未结束就跳过本轮」而非排队：堆积轮次只会让同一批账号被重复探测，
 // 而探测本身已经按冷却周期去重。
 //
-// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，补轮次防堆积。
+// 最近修改时间：2026-10-20；改动原因：调度粒度 5s 改为 1s，提前量 5s 改为 20s。
 func cooldownProbeLoop() {
 	// 与 watchdog 一致：init() 早于宿主装配，立即 tick 会静默失败。
 	waitHostReadyForWatchdog(watchdogStartupWait, hostReadyForWatchdog)

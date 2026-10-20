@@ -146,6 +146,6 @@ func pumpUpstreamStream(
 	}
 	publishUsage(authID, accountLabel, model, upstreamModel, startTime, detail, durationMS, resp.StatusCode, false, "", ttftNS)
 	resetAccountFailover(authID)
-	// 一次真实成功即证明该模型已恢复，清掉熔断残留。
-	resetModelCircuit(providerName, upstreamModel)
+	// 一次真实成功即证明该模型已恢复，清掉该模型上残留的冷却。
+	resetModelBlockedState(upstreamModel)
 }

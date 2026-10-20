@@ -94,8 +94,8 @@ func pumpUpstreamStream(
 			// 1. 终止哨兵：收到即结束，不再等待后续 Keep-Alive 空闲帧。
 			if trimmed == "data: [DONE]" || trimmed == "data:[DONE]" {
 				_ = streamEmit(streamID, line)
-				// 干净终止即证明该模型已恢复，清掉熔断残留。
-				resetModelCircuit(providerName, upstreamModel)
+				// 干净终止即证明该模型已恢复，清掉该模型上残留的冷却。
+				resetModelBlockedState(upstreamModel)
 				return
 			}
 
@@ -124,6 +124,6 @@ func pumpUpstreamStream(
 		}
 	}
 	resetAccountFailover(authID)
-	// 读到干净 EOF 同样证明该模型已恢复，清掉熔断残留。
-	resetModelCircuit(providerName, upstreamModel)
+	// 读到干净 EOF 同样证明该模型已恢复，清掉该模型上残留的冷却。
+	resetModelBlockedState(upstreamModel)
 }
