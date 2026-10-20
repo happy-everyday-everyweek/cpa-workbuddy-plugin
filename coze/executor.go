@@ -38,6 +38,20 @@ const (
 	// 超时后降级到 message/list 轮询兜底：上游偶发不推 WS 帧，
 	// 但消息仍会落库，此时至少能把答案给用户。
 	executorFirstTokenTimeout = 90 * time.Second
+
+	// imagesPollTimeout 是生图附件落库的等待上限。
+	//
+	// 生产实测（2026-10-21）成功生图的端到端耗时为 24s~3m6s，
+	// 而失败的请求在 6-9s 就返回了——差别就在于有没有等附件。
+	// 取 4 分钟覆盖最长成功场景并留出余量；再长就交给
+	// executorReplyTimeout 与宿主超时，不在插件里无限等。
+	imagesPollTimeout = 4 * time.Minute
+
+	// imagesPollInterval 是生图附件轮询间隔。
+	//
+	// 落库延迟在十秒到百秒量级，1 秒既能让图片一出现就返回，
+	// 又不会把 message/list 打成高频轮询。
+	imagesPollInterval = time.Second
 )
 
 // cozeExecutor 是一次执行的上下文。
@@ -47,6 +61,9 @@ type cozeExecutor struct {
 	client *clawClient
 	sa     *StoredAuth
 	model  string
+	// wantImages 标记本轮是生图：收尾帧不携带图片附件，
+	// 必须继续轮询到附件落库才算完成（见 waitForReply）。
+	wantImages bool
 	// frontierServerURL 覆盖 frontier 主机，仅供测试指向 httptest 服务端。
 	frontierServerURL string
 }
@@ -241,6 +258,18 @@ func newCozeExecutor(sa *StoredAuth, model string, client httpDoer) *cozeExecuto
 	}
 }
 
+// newImageExecutor 构造一次生图执行的上下文。
+//
+// 与对话共用同一套 claw 通道，唯一区别是 wantImages：生图的收尾帧
+// 不带图片附件，必须等附件落库（约 18 秒）才算完成。
+// [参数] sa: 账号；model: 对外模型 ID；client: HTTP 客户端。
+// [返回] 执行上下文。
+func newImageExecutor(sa *StoredAuth, model string, client httpDoer) *cozeExecutor {
+	exec := newCozeExecutor(sa, model, client)
+	exec.wantImages = true
+	return exec
+}
+
 // prepare 完成对话前的握手：取 claw_id、主会话与 WS 凭证。
 // [参数] 无。
 // [返回] 会话 ID、WS 凭证与错误。
@@ -339,7 +368,44 @@ func (e *cozeExecutor) runConversation(ctx context.Context, prompt string, emit 
 	// 图片来自 WS 实时与 message/list 兜底两条路径，都汇到同一个 collector；
 	// 取快照必须在这之后，否则兜底补进来的图会漏。
 	content, errWait := e.waitForReply(ctx, collector, emit, messageID)
-	return content, collector.imagesSnapshot(), errWait
+	if errWait != nil {
+		return content, collector.imagesSnapshot(), errWait
+	}
+	if errImages := e.awaitImages(ctx, collector, messageID); errImages != nil {
+		return content, collector.imagesSnapshot(), errImages
+	}
+	return content, collector.imagesSnapshot(), nil
+}
+
+// awaitImages 在生图轮次等待晚到的图片附件。
+//
+// 生图的 WS 收尾帧只带占位正文（`[图片](computer:///...)`），真正的附件
+// 要十几秒到几分钟后才写进 message/list 的 files。只认收尾帧就会把
+// 「已扣额度且已出图」的一轮判成失败（2026-10-21 生产实证：失败集中在
+// 6-9 秒返回，而成功请求耗时 24s~3m6s）。
+//
+// 放在 waitForReply 之后统一收口：对话有「正文非空即完成」的语义，
+// 生图必须额外等附件，且 waitForReply 有多个成功返回分支，
+// 在分支内各自处理必然漏路径。
+// [参数] ctx: 生命周期；collector: 收集器；messageID: 本轮用户消息 ID。
+// [返回] 需要等待但未取到图片时返回错误，否则 nil。
+func (e *cozeExecutor) awaitImages(ctx context.Context, collector *replyCollector, messageID string) error {
+	if !e.wantImages || len(collector.imagesSnapshot()) > 0 || messageID == "" {
+		return nil
+	}
+	if errPoll := e.pollImagesUntilAvailable(ctx, collector, messageID); errPoll != nil {
+		hostLogf("warn", "生图附件轮询未取到图片", map[string]any{
+			"message_id": messageID,
+			"error":      errPoll.Error(),
+		})
+	}
+	if len(collector.imagesSnapshot()) > 0 {
+		return nil
+	}
+	// 附件始终没出现：上游已扣额度却没交付图片。返回请求级错误
+	// （见 imagesUnavailableError），避免宿主把它当账号故障换号重试、
+	// 再烧一遍额度。
+	return &imagesUnavailableError{messageID: messageID}
 }
 
 // waitForReply 等待回复完成，并把增量实时交给 emit。
@@ -386,6 +452,7 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 			// 收尾了却既没有正文也没有图片：上游确实没产出内容。
 			// 必须返回错误，否则调用方会把它当「空正文的成功响应」
 			// 一路带到下游，表现为「成功但 0 输出」（2026-10-19 生产实测）。
+			// 生图轮次的「等附件」由调用方 awaitImages 统一处理。
 			if strings.TrimSpace(collector.text()) == "" && len(collector.imagesSnapshot()) == 0 {
 				hostLogf("warn", "回复正文为空", map[string]any{
 					"message_id": messageID,
@@ -431,6 +498,54 @@ func (e *cozeExecutor) waitForReply(ctx context.Context, collector *replyCollect
 			if err := flush(); err != nil {
 				return collector.text(), err
 			}
+		}
+	}
+}
+
+// pollImagesUntilAvailable 轮询 message/list 直到本轮回复的图片附件落库。
+//
+// 生图的 WS 收尾帧只带占位正文（`[图片](computer:///...)`），附件在十几秒
+// 后才写进 message/list 的 files。因此生图轮次不能「收到收尾就算完」，
+// 必须等附件出现——否则上游已扣额度、图已生成，插件却报「没拿到图」。
+//
+// 只在拿到非空附件时 accept：collector 的去重键是 turn|seq|phase，
+// 先 accept 一个空附件的 final 会把后续带附件的同一帧判成重复丢掉。
+// [参数] ctx: 生命周期；collector: 收集器；userMessageID: 本轮用户消息 ID。
+// [返回] 取到图片时返回 nil，否则返回错误。
+func (e *cozeExecutor) pollImagesUntilAvailable(ctx context.Context, collector *replyCollector, userMessageID string) error {
+	// 不重取 sessionID 之外的握手：调用方已确认会话可用。
+	sessionID, _, errPrepare := e.prepare()
+	if errPrepare != nil {
+		return fmt.Errorf("图片附件轮询前握手失败：%w", errPrepare)
+	}
+
+	deadline := time.Now().Add(imagesPollTimeout)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		messages, errList := e.client.listMessages(sessionID)
+		if errList == nil {
+			if message, found := findReplyMessageFor(messages, userMessageID); found {
+				if urls := clawFileURLs(message.Files); len(urls) > 0 {
+					collector.accept(&frontierMessage{
+						ID:     message.ID,
+						Phase:  "event_final",
+						Images: urls,
+					})
+					return nil
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("图片附件轮询超时")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(imagesPollInterval):
 		}
 	}
 }

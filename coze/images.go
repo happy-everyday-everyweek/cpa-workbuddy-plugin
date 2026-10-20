@@ -152,6 +152,33 @@ func buildImagesPrompt(req *imagesRequest) string {
 	return builder.String()
 }
 
+// imagesUnavailableError 表示「上游已扣额度但没交付图片」。
+//
+// 这是请求级故障而不是账号故障：换号重试只会再扣一次额度、再拿一次
+// 空结果（2026-10-21 生产实证：生图全失败但账号积分被烧光）。
+// 状态码取 400：命中宿主的请求级白名单（400/409/413/422），
+// 既不冷却账号、也不触发换号重试，直接把这个错误交给调用方。
+// [参数] 无。
+// [返回] 无。
+type imagesUnavailableError struct {
+	// messageID 是上游消息 ID，用于运维对上一条具体对话。
+	messageID string
+}
+
+// Error 返回面向用户的失败说明。
+// [参数] 无。
+// [返回] 错误文案。
+func (e *imagesUnavailableError) Error() string {
+	return fmt.Sprintf("生图未返回图片：上游已接受请求但未产出附件（message_id=%s）", e.messageID)
+}
+
+// StatusCode 返回宿主分类用的 HTTP 状态码。
+// [参数] 无。
+// [返回] 400。
+func (e *imagesUnavailableError) StatusCode() int {
+	return http.StatusBadRequest
+}
+
 // buildImagesResponse 把 claw 取回的图片地址包装成 images 响应。
 //
 // b64_json 模式必须真实下载：客户端会直接把它交给图片解码器，
@@ -261,6 +288,13 @@ func isImagesExecution(req pluginapi.ExecutorRequest) bool {
 		strings.EqualFold(strings.TrimSpace(req.SourceFormat), openAIImageModelType)
 }
 
+// newImageExecutorFn 是生图执行器的构造入口。
+//
+// 单独一层是为了让真实入口可测：handleImagesExecute 直接写死构造函数时，
+// 漏掉 wantImages 标记（退化成对话执行器）在用例里完全看不出来。
+// 与 runExecutorConversation 同构，生产路径不替换。
+var newImageExecutorFn = newImageExecutor
+
 // handleImagesExecute 处理标准图片端点的一次生成请求。
 //
 // 复用对话链路的 executor 与 claw 通道：生图在扣子侧本来就是一轮对话，
@@ -288,7 +322,7 @@ func handleImagesExecute(sa *StoredAuth, req pluginapi.ExecutorRequest) ([]byte,
 	ctx, cancel := context.WithTimeout(context.Background(), executorReplyTimeout)
 	defer cancel()
 
-	exec := newCozeExecutor(sa, model, nil)
+	exec := newImageExecutorFn(sa, model, nil)
 	_, images, errRun := exec.runConversation(ctx, prompt, func(string) error { return nil })
 
 	// 正文为空但有图是生图的正常形态：图片只在附件里。
@@ -299,7 +333,15 @@ func handleImagesExecute(sa *StoredAuth, req pluginapi.ExecutorRequest) ([]byte,
 
 	payload, errBuild := buildImagesResponse(images, imagesResponseFormat(imageReq.ResponseFormat), nil)
 	if errBuild != nil {
-		return nil, errBuild
+		// 走到这里说明既没图、errRun 也为 nil，属于上游没有交付产物。
+		// 必须按请求级故障回传：无状态码的错误会被兜底成 502，
+		// 宿主据此冷却账号并换号重试，等于把同一笔额度再烧一遍。
+		hostLogf("warn", "生图未取到图片附件", map[string]any{
+			"model":   model,
+			"auth_id": sa.AuthID,
+			"error":   errBuild.Error(),
+		})
+		return nil, &imagesUnavailableError{}
 	}
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: payload})
 }
