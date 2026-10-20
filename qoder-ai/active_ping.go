@@ -34,11 +34,16 @@ func pickRandomQoderModels(sa *storedAuth, limit int) []string {
 	if limit <= 0 {
 		limit = 1
 	}
-	// 1. 从缓存或凭据提取候选模型并去重
-	models, _ := cachedDynamicModels()
+	// 1. 从缓存或凭据提取候选模型并去重。缓存按账号分片：探活针对的是
+	// sa 这个具体账号，只能读它自己的清单，否则会拿别的账号的模型去测。
+	var accountKey string
+	if sa != nil {
+		accountKey = sa.Account.UID
+	}
+	models, _ := cachedDynamicModels(accountKey)
 	if len(models) == 0 && sa != nil && strings.TrimSpace(sa.Auth.AccessToken) != "" {
 		if dyn, err := callModelsAPI(sa); err == nil && len(dyn) > 0 {
-			storeDynamicModels(dyn)
+			storeDynamicModels(accountKey, dyn)
 			models = dyn
 		}
 	}

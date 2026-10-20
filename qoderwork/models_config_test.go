@@ -28,13 +28,22 @@ func resetConfiguredModels(t *testing.T) {
 	t.Cleanup(clearConfiguredModels)
 }
 
-// resetDynamicModelsCache 清空全局动态模型缓存并在用例结束后恢复。
+// resetDynamicModelsCache 清空全部账号的动态模型缓存与负缓存并在用例结束后恢复。
 // 动态缓存是跨用例共享的全局状态，且优先级反转后它会遮蔽配置与静态列表，
 // 因此凡断言"配置保底 / 静态兜底"的用例都必须先清缓存。
+// 缓存改为按账号分片后，清空必须覆盖 map 里的全部条目，不能只清单个 key。
 func resetDynamicModelsCache(t *testing.T) {
 	t.Helper()
-	storeDynamicModels(nil)
-	t.Cleanup(func() { storeDynamicModels(nil) })
+	clearDynamicModelsState()
+	t.Cleanup(clearDynamicModelsState)
+}
+
+// clearDynamicModelsState 清空分片缓存与负缓存。
+func clearDynamicModelsState() {
+	dynamicModelsMu.Lock()
+	dynamicModelsCache = make(map[string]*dynamicModelsCacheEntry)
+	dynamicModelsFails = make(map[string]*dynamicModelsFailEntry)
+	dynamicModelsMu.Unlock()
 }
 
 // TestResolveModels_PriorityChain 验证优先级链：动态 > 配置 > 静态默认。
@@ -178,7 +187,7 @@ func TestConfiguredModels_StaticPrefersDynamicCache(t *testing.T) {
 	resetConfiguredModels(t)
 	resetDynamicModelsCache(t)
 	parseModelsConfig([]any{"custom-a"})
-	storeDynamicModels([]pluginapi.ModelInfo{{ID: "upstream-new"}, {ID: "glm-5.2"}})
+	storeDynamicModels("u-static-dyn", []pluginapi.ModelInfo{{ID: "upstream-new"}, {ID: "glm-5.2"}})
 	raw, err := handleModelStatic([]byte("{}"))
 	if err != nil {
 		t.Fatalf("handleModelStatic: %v", err)
@@ -217,7 +226,6 @@ func TestNoConfiguredModels_FallsBackToStatic(t *testing.T) {
 		t.Fatalf("fallback model count = %d, want %d", len(resp.Models), len(wbModels()))
 	}
 }
-
 
 // TestWBModels_AlignmentWithClient 验证静态兜底模型列表与 Qoder 客户端权威配置一致。
 func TestWBModels_AlignmentWithClient(t *testing.T) {

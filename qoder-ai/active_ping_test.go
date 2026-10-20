@@ -11,8 +11,10 @@ import (
 
 // TestPickRandomQoderModel 验证缓存缺失时回退兜底模型、缓存命中时从候选集中选取。
 func TestPickRandomQoderModel(t *testing.T) {
-	storeDynamicModels(nil)
-	saEmpty := &storedAuth{}
+	clearDynamicModelsState()
+	t.Cleanup(clearDynamicModelsState)
+	// 有 uid 的账号才能命中分片缓存；空凭据用于验证无缓存时的兜底。
+	saEmpty := &storedAuth{Account: storedAccount{UID: "u-ping-1"}}
 	if m := pickRandomQoderModel(saEmpty); m != "auto" {
 		t.Fatalf("expected fallback model auto, got %s", m)
 	}
@@ -21,8 +23,7 @@ func TestPickRandomQoderModel(t *testing.T) {
 		{ID: "fake-model-1"},
 		{ID: "fake-model-2"},
 	}
-	storeDynamicModels(fakeModels)
-	defer storeDynamicModels(nil)
+	storeDynamicModels("u-ping-1", fakeModels)
 
 	picked := pickRandomQoderModel(saEmpty)
 	if picked != "fake-model-1" && picked != "fake-model-2" {
@@ -32,8 +33,9 @@ func TestPickRandomQoderModel(t *testing.T) {
 
 // TestPickRandomQoderModels 验证多模型随机挑选的上限、去重与 fallback 行为。
 func TestPickRandomQoderModels(t *testing.T) {
-	storeDynamicModels(nil)
-	saEmpty := &storedAuth{}
+	clearDynamicModelsState()
+	t.Cleanup(clearDynamicModelsState)
+	saEmpty := &storedAuth{Account: storedAccount{UID: "u-ping-2"}}
 	resFallback := pickRandomQoderModels(saEmpty, 5)
 	if len(resFallback) != 1 || resFallback[0] != "auto" {
 		t.Fatalf("expected fallback model, got %v", resFallback)
@@ -42,8 +44,7 @@ func TestPickRandomQoderModels(t *testing.T) {
 	fakeModels := []pluginapi.ModelInfo{
 		{ID: "m1"}, {ID: "m2"}, {ID: "m3"}, {ID: "m4"}, {ID: "m5"}, {ID: "m6"}, {ID: "m1"},
 	}
-	storeDynamicModels(fakeModels)
-	defer storeDynamicModels(nil)
+	storeDynamicModels("u-ping-2", fakeModels)
 
 	res5 := pickRandomQoderModels(saEmpty, 5)
 	if len(res5) != 5 {
@@ -125,7 +126,7 @@ func TestHandleTestActiveWithAuthSpecifiedModel(t *testing.T) {
 	}
 
 	// 2. 模型为空时回退随机模型（缓存清空 + 无 token → 兜底默认值），兼容旧面板
-	storeDynamicModels(nil)
+	clearDynamicModelsState()
 	resAuto := handleTestActiveWithAuth(sa, "test-index", "")
 	if resAuto["ok"] != true || calledModel != "auto" {
 		t.Fatalf("expected fallback random model, got res=%v called=%q", resAuto, calledModel)

@@ -1,5 +1,21 @@
 # QoderWork Plugin Changelog
 
+## 0.9.48
+
+### Fix - 模型清单按账号分片 + 发现顺序改为额度优先
+
+- 变更要点:
+  1. 根因：模型发现缓存 `dynamicModelsCache` 是插件级全局单例，而**上游返回的模型清单本身是按账号的**。2026-10-20 生产实测：额度耗尽账号（`exhausted=true`）只返回 `qfmodel`、`dfmodel` 共 **2 个**模型，健康账号返回 **14 个**。先刷新缓存的账号会把自己的清单强行套给其余全部账号。
+  2. 双向危害：耗尽账号先刷 → 健康账号被降级成 2 个模型（用户看不到可用模型）；健康账号先刷 → 耗尽账号被注册上它实际不能用的模型，宿主按此注册后请求路由过去被上游拒绝（表现为「列表里有、一请求就失败」）。
+  3. 缓存分片：`dynamicModelsCache` 改为 `map[string]*dynamicModelsCacheEntry`，负缓存 `dynamicModelsFails` 同样按账号隔离。key 统一经 `dynamicModelsKey` 归一化（覆盖 `auth.ID` = `qoderwork-<uid>.json`、文件名、裸 uid 三种形态）。`model.for_auth` 用宿主传入的 `AuthID` 分片，面板/探活用账号 uid 分片。
+  4. 额度优先排序：`fetchDynamicModels` 遍历前按 `modelDiscoveryRank` 排序 —— **有额度 > 未测 > 耗尽**，同档保持宿主文件名顺序。此前沿用文件名顺序，使「字母序靠前的耗尽账号」垄断全局清单（生产正是排序第一的 `070a9a477e4b9275` 为耗尽账号）。
+  5. 全局视图保留：`model.static` 无账号上下文，改由 `widestCachedDynamicModels` 取所有账号缓存中**模型最多的一份**（健康账号清单 ⊇ 耗尽账号），避免全局模型表漏项。
+  6. 全局扫描负缓存：`allDynamicModelsFailed` 取代原全局 `failedAt` —— 只要还有一个账号不在窗口内就继续尝试，单个账号被拒不封锁整轮扫描。
+- 验证: 新增 6 个用例（分片缓存隔离 / 负缓存按账号隔离 / 窗口过期 / 成功清窗 / 回退顺序 / 额度优先全链路）；三次变异反证均精确捕获（缓存 key 强制全局 → 4 例 FAIL；删除额度排序调用 → 1 例 FAIL；`for_auth` 改读全局最宽缓存 → 2 例 FAIL）；cgo-shim build/vet/test 全绿；gofmt 干净；`POLLUTION: PASS`。
+- 边界说明: 上游对耗尽账号收窄模型清单属上游业务事实，本版本不改变它，只是让各账号如实拿到自己的清单。
+- 依据: 用户报障「生产 QoderWork / Qoder AI 插件自动获取模型不对」；诊断见 `doc/4-bugs/2026-10-20_021500_Qoder模型清单跨账号缓存污染根因诊断.md`。
+- 涉及文件: qoderwork/main.go、qoderwork/models.go、qoderwork/active_ping.go、qoderwork/active_ping_test.go、qoderwork/models_config_test.go、qoderwork/models_negative_cache_test.go、qoderwork/VERSION、qoderwork/CHANGELOG.md
+
 ## 0.9.46
 
 ### Fix - 正文已泄漏的断流改为 length 收尾（new-api 可恢复计费）

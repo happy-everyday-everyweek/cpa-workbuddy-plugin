@@ -345,7 +345,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.1.27"
+var version = "0.1.28"
 
 func wbRegistration() registration {
 	return registration{
@@ -395,11 +395,39 @@ const dynamicModelsCacheTTL = 5 * time.Minute
 // 触发的 model.for_auth 放大成 N+1 请求风暴（生产 OOM 主因）。
 const dynamicModelsFailCacheTTL = 5 * time.Minute
 
-var dynamicModelsCache struct {
-	sync.RWMutex
-	models   []pluginapi.ModelInfo
-	fetched  time.Time
-	failedAt time.Time // 最近一次全量扫描失败的时间；零值表示无失败记录
+// dynamicModelsCacheEntry 保存单个账号最近一次模型发现的结果。
+//
+// 模型清单是**按账号**返回的：上游对额度耗尽账号只给出可用子集
+// （2026-10-20 生产实测耗尽账号 2 个 / 健康账号 14 个）。若沿用插件级
+// 单例，先刷新的账号会把自己的清单强行套给其余全部账号，既会让健康账号
+// 被降级成 2 个模型，也会让耗尽账号被注册上它实际不能用的模型。
+// 因此缓存必须以账号为粒度，key 统一经 dynamicModelsKey 归一化。
+type dynamicModelsCacheEntry struct {
+	models  []pluginapi.ModelInfo
+	fetched time.Time
+}
+
+// dynamicModelsFailCache 记录各账号最近一次模型发现失败的时间，
+// 零值表示无失败记录。负缓存同样按账号隔离：某个账号被拒不应连带
+// 封锁其它账号的发现。key 与 dynamicModelsCache 保持一致。
+type dynamicModelsFailEntry struct {
+	failedAt time.Time
+}
+
+var (
+	dynamicModelsMu    sync.RWMutex
+	dynamicModelsCache = make(map[string]*dynamicModelsCacheEntry)
+	dynamicModelsFails = make(map[string]*dynamicModelsFailEntry)
+)
+
+// dynamicModelsKey 把多种账号标识（auth.ID、文件名、裸 uid）归一化成
+// 同一个缓存 key。宿主在 model.for_auth 传 auth.ID（qoderai-<uid>.json），
+// 而面板与探活拿到的是 auth_index 或裸 uid，不复用归一化会导致同一账号
+// 命中不同缓存项，反而制造出"同号不同模型"的新问题。
+// [参数] authID：任意形式的账号标识
+// [返回] 归一化后的缓存 key；输入为空时返回空串（调用方须跳过缓存）
+func dynamicModelsKey(authID string) string {
+	return normalizeFailoverKey(authID)
 }
 
 //

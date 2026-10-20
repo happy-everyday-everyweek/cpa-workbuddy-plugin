@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -199,11 +200,12 @@ func nonEmptyModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 
 // resolveModelsFromStorage 是 handleModelForAuth 的判定入口：先尝试账号级
 // 动态发现，成功即返回动态列表，否则交给优先级链回退配置 / 静态默认。
+// [参数] authID：宿主传入的账号标识，用于缓存分片
 // [参数] storageJSON：宿主传入的账号凭据 JSON
 // [返回] 按优先级链选出的最终列表
-// 最近修改时间 2026-09-12（动态成功不再让配置遮蔽上游模型）
-func resolveModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
-	dynamic := fetchDynamicModelsFromStorage(storageJSON)
+// 最近修改时间 2026-10-20 03:10:00 修改, 缓存分片后需透传账号标识
+func resolveModelsFromStorage(authID string, storageJSON []byte) []pluginapi.ModelInfo {
+	dynamic := fetchDynamicModelsFromStorage(authID, storageJSON)
 	return resolveModels(dynamic, getConfiguredModels(), wbModels())
 }
 
@@ -228,45 +230,175 @@ func modelInfoFromConfig(id, name string, ctxLen, maxTok int64) pluginapi.ModelI
 	}
 }
 
-func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.models) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsCacheTTL {
-		return dynamicModelsCache.models, true
+// cachedDynamicModels 读取指定账号未过期的模型缓存。
+// [参数] authID：账号标识，内部经 dynamicModelsKey 归一化；空串直接视为未命中
+// [返回] 缓存命中的模型列表与 true；未命中或已过期返回 nil, false
+// 最近修改时间 2026-10-20 03:10:00 修改, 缓存改为按账号分片，避免跨账号互相覆盖
+func cachedDynamicModels(authID string) ([]pluginapi.ModelInfo, bool) {
+	key := dynamicModelsKey(authID)
+	if key == "" {
+		return nil, false
+	}
+	dynamicModelsMu.RLock()
+	defer dynamicModelsMu.RUnlock()
+	entry := dynamicModelsCache[key]
+	if entry != nil && len(entry.models) > 0 && time.Since(entry.fetched) < dynamicModelsCacheTTL {
+		return entry.models, true
 	}
 	return nil, false
+}
+
+// widestCachedDynamicModels 返回所有账号缓存中最完整的一份，供无账号上下文的
+// model.static 使用。
+//
+// model.static 描述插件整体可提供的模型全集，没有账号信息；取份数最多的一份
+// 而非任意一份，是因为各账号清单之间存在包含关系（健康账号 ⊇ 耗尽账号），
+// 缺失模型会让宿主的全局模型表漏项。
+// [参数] 无
+// [返回] 未过期缓存中模型最多的一份；全部未命中或过期时返回 nil, false
+// 最近修改时间 2026-10-20 03:10:00 新增, 分片缓存后的全局聚合视图
+func widestCachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
+	dynamicModelsMu.RLock()
+	defer dynamicModelsMu.RUnlock()
+	var best []pluginapi.ModelInfo
+	for _, entry := range dynamicModelsCache {
+		if entry == nil || len(entry.models) == 0 {
+			continue
+		}
+		if time.Since(entry.fetched) >= dynamicModelsCacheTTL {
+			continue
+		}
+		if len(entry.models) > len(best) {
+			best = entry.models
+		}
+	}
+	if len(best) == 0 {
+		return nil, false
+	}
+	return best, true
+}
+
+// allDynamicModelsFailed 判断当前是否所有已记录账号都处于负缓存窗口内，
+// 供无账号上下文的全局扫描决定是否直接放弃。
+//
+// 与 per-account 窗口的区别：全局扫描由 model.static 触发，它不针对某个账号，
+// 只要还有一个账号不在窗口内就仍值得尝试，因此不能用单个账号的窗口拦截整轮扫描。
+// [参数] 无
+// [返回] true 表示无可用账号可试（含从未成功且全部失败的情况）
+// 最近修改时间 2026-10-20 03:10:00 新增, 补齐分账号负缓存的全局扫描判定
+func allDynamicModelsFailed() bool {
+	now := time.Now()
+	dynamicModelsMu.RLock()
+	defer dynamicModelsMu.RUnlock()
+	if len(dynamicModelsFails) == 0 {
+		return false
+	}
+	for _, fail := range dynamicModelsFails {
+		if fail == nil || fail.failedAt.IsZero() || now.Sub(fail.failedAt) >= dynamicModelsFailCacheTTL {
+			return false
+		}
+	}
+	return true
 }
 
 // callModelsAPIFn 是 callModelsAPI 的可替换入口（同 sendActivePingQoderFn 惯例），
 // 供负缓存行为单测注入假上游，避免真实网络与宿主 RPC 依赖。
 var callModelsAPIFn = callModelsAPI
 
+// hostAuthListFilesFn 是 hostAuthListFiles 的可替换入口（同上惯例），
+// 供全量扫描单测注入账号列表——否则「遍历是否真的按额度排序」这一层
+// 无法在 shim 环境断言，删掉排序调用也不会有用例失败。
+var hostAuthListFilesFn = hostAuthListFiles
+
+// hostAuthGetByIndexFn 是 hostAuthGetByIndex 的可替换入口，
+// 与 hostAuthListFilesFn 配套提供全量扫描的可测性。
+var hostAuthGetByIndexFn = hostAuthGetByIndex
+
 // fetchDynamicModelsFallbackFn 是存储入口回退到全量扫描的调用点接缝。
 // 单测据此断言「回退发生在开启负缓存窗口之前」——顺序颠倒会让窗口
 // 立刻拦住回退本身，使另一账号本可成功的扫描永远走不到。
 var fetchDynamicModelsFallbackFn = fetchDynamicModels
 
-// inDynamicModelsFailWindow 判断当前是否处于模型发现负缓存窗口内。
-// [返回] true 表示窗口内，调用方应直接放弃本次逐账号扫描。
-func inDynamicModelsFailWindow() bool {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	return !dynamicModelsCache.failedAt.IsZero() && time.Since(dynamicModelsCache.failedAt) < dynamicModelsFailCacheTTL
+// inDynamicModelsFailWindow 判断指定账号当前是否处于模型发现负缓存窗口内。
+// [参数] authID：账号标识，内部经 dynamicModelsKey 归一化；空串视为无窗口
+// [返回] true 表示窗口内，调用方应直接放弃该账号的发现尝试
+// 最近修改时间 2026-10-20 03:10:00 修改, 负缓存改为按账号隔离，单账号被拒不连带封锁其它账号
+func inDynamicModelsFailWindow(authID string) bool {
+	key := dynamicModelsKey(authID)
+	if key == "" {
+		return false
+	}
+	dynamicModelsMu.RLock()
+	defer dynamicModelsMu.RUnlock()
+	entry := dynamicModelsFails[key]
+	return entry != nil && !entry.failedAt.IsZero() && time.Since(entry.failedAt) < dynamicModelsFailCacheTTL
 }
 
-// markDynamicModelsFailed 记录一次「全账号扫描失败」，开启负缓存窗口。
-func markDynamicModelsFailed() {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.failedAt = time.Now()
-	dynamicModelsCache.Unlock()
+// markDynamicModelsFailed 记录指定账号的一次发现失败，开启该账号的负缓存窗口。
+// [参数] authID：账号标识；空串直接忽略（无 key 无法分片，不能降级成全局窗口）
+// [返回] 无
+// 最近修改时间 2026-10-20 03:10:00 修改, 负缓存改为按账号分片
+func markDynamicModelsFailed(authID string) {
+	key := dynamicModelsKey(authID)
+	if key == "" {
+		return
+	}
+	dynamicModelsMu.Lock()
+	dynamicModelsFails[key] = &dynamicModelsFailEntry{failedAt: time.Now()}
+	dynamicModelsMu.Unlock()
 }
 
-func storeDynamicModels(models []pluginapi.ModelInfo) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.models = models
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.failedAt = time.Time{} // 成功即清除负缓存窗口
-	dynamicModelsCache.Unlock()
+// storeDynamicModels 写入指定账号的模型缓存，并清除该账号的负缓存窗口。
+// [参数] authID：账号标识；models：该账号的模型列表
+// [返回] 是否写入成功；账号标识为空时返回 false，调用方据此保留原返回路径
+// 最近修改时间 2026-10-20 03:10:00 修改, 缓存按账号分片并清除该账号负缓存
+func storeDynamicModels(authID string, models []pluginapi.ModelInfo) bool {
+	key := dynamicModelsKey(authID)
+	if key == "" {
+		return false
+	}
+	dynamicModelsMu.Lock()
+	dynamicModelsCache[key] = &dynamicModelsCacheEntry{models: models, fetched: time.Now()}
+	delete(dynamicModelsFails, key) // 成功即清除该账号的负缓存窗口
+	dynamicModelsMu.Unlock()
+	return true
+}
+
+// modelDiscoveryRank 给出账号在模型发现遍历中的优先级档位（数值越小越先试）。
+//
+// 不能直接按积分数值排序：未测账号返回 -1，耗尽账号返回 0，数值大小会把
+// 「耗尽」排在「未测」前面，与要求的「有额度 > 未测 > 耗尽」相反。
+// [参数] authID：账号标识
+// [返回] 0=有额度；1=未测；2=耗尽
+// 最近修改时间 2026-10-20 03:10:00 修改, 新增模型发现的额度优先档位
+func modelDiscoveryRank(authID string) int {
+	remain, _ := cachedCreditsScore(authID)
+	switch {
+	case remain > 0:
+		return 0 // 有额度：最可能返回完整清单
+	case remain < 0:
+		return 1 // 未测：信息不足，排在有额度之后
+	default:
+		return 2 // 耗尽：上游只给可用子集，最后再试
+	}
+}
+
+// sortAuthsByCredits 把账号按「有额度 > 未测 > 耗尽」重排，同档保持入参顺序。
+//
+// 模型发现采用「首个成功即停」，因此遍历顺序直接决定哪份清单成为默认来源。
+// 上游对额度耗尽的账号只返回可用子集（2026-10-20 生产实测 2 个 vs 14 个），
+// 沿用宿主文件名顺序会让「字母序靠前的耗尽账号」垄断全局清单。用调度器同一套
+// 积分口径排序后，排第一的必然是最可能返回完整清单的健康账号。
+// [参数] files：宿主返回的账号列表
+// [返回] 重排后的新切片，不修改入参
+// 最近修改时间 2026-10-20 03:10:00 修改, 新增额度优先排序
+func sortAuthsByCredits(files []pluginapi.HostAuthFileEntry) []pluginapi.HostAuthFileEntry {
+	out := make([]pluginapi.HostAuthFileEntry, len(files))
+	copy(out, files)
+	sort.SliceStable(out, func(i, j int) bool {
+		return modelDiscoveryRank(out[i].ID) < modelDiscoveryRank(out[j].ID)
+	})
+	return out
 }
 
 // fetchDynamicModels 按宿主已注册的 qoderwork 凭据逐个尝试动态发现。
@@ -276,18 +408,20 @@ func storeDynamicModels(models []pluginapi.ModelInfo) {
 // 调用方无法区分"上游真的只有这些模型"与"上游调用失败"。
 // [参数] 无
 // [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-10-19 13:10:00；改动原因：新增失败负缓存窗口拦截，切断 N+1 重扫风暴
+// 最近修改时间 2026-10-20 03:10:00 修改, 改为额度优先排序，缓存写入按账号分片
 func fetchDynamicModels() []pluginapi.ModelInfo {
-	if models, ok := cachedDynamicModels(); ok {
+	// 全局扫描不带账号上下文，只能命中"最完整的一份"聚合视图。
+	if models, ok := widestCachedDynamicModels(); ok {
 		return models
 	}
 	// 负缓存窗口内直接放弃逐账号重扫：宿主每次 auth 重写都会触发
 	// model.for_auth，若失败不留窗口，N 账号 × 每事件一次全扫会放大成
 	// N+1 请求风暴（生产 OOM 主因，见 BUG-QODER-MODELS-SIGNATURE-INVALID-20261012）。
-	if inDynamicModelsFailWindow() {
+	// 全局扫描的窗口按"零 key"聚合判定：只有当所有账号都在各自窗口内才跳过。
+	if allDynamicModelsFailed() {
 		return nil
 	}
-	files, err := hostAuthListFiles()
+	files, err := hostAuthListFilesFn()
 	if err != nil || len(files) == 0 {
 		return nil
 	}
@@ -296,13 +430,22 @@ func fetchDynamicModels() []pluginapi.ModelInfo {
 	// would wrongly include workbuddy-*.json auths here and cause us to call
 	// the qoderwork models API with a workbuddy token.)
 	prefix := authFilePrefix
-	scanned := 0
+	candidates := make([]pluginapi.HostAuthFileEntry, 0, len(files))
 	for _, f := range files {
 		if !strings.HasPrefix(strings.ToLower(f.Name), prefix) {
 			continue
 		}
+		candidates = append(candidates, f)
+	}
+	// 额度优先：健康账号先试，耗尽账号兜底，避免耗尽账号的小清单成为默认。
+	candidates = sortAuthsByCredits(candidates)
+	scanned := 0
+	for _, f := range candidates {
+		if inDynamicModelsFailWindow(f.ID) {
+			continue
+		}
 		scanned++
-		raw, err := hostAuthGetByIndex(f.AuthIndex)
+		raw, err := hostAuthGetByIndexFn(f.AuthIndex)
 		if err != nil {
 			continue
 		}
@@ -312,27 +455,33 @@ func fetchDynamicModels() []pluginapi.ModelInfo {
 		}
 		dyn, err := callModelsAPIFn(sa)
 		if err == nil && len(dyn) > 0 {
-			storeDynamicModels(dyn)
+			storeDynamicModels(f.ID, dyn)
 			return dyn
 		}
+		markDynamicModelsFailed(f.ID)
 	}
-	if scanned > 0 {
-		markDynamicModelsFailed()
+	if scanned > 0 && allDynamicModelsFailed() {
+		return nil
 	}
 	return nil
 }
 
 // fetchDynamicModelsFromStorage 用请求自带的账号凭据优先尝试动态发现，
 // 失败时再回退到已注册凭据扫描。**不**兜底配置与静态列表。
+//
+// 缓存按账号分片：先查本账号的缓存，未命中才真正打上游。这样额度耗尽账号
+// 与健康账号各拿各的清单，彼此的发现结果互不覆盖。
+// [参数] authID：宿主传入的账号标识，用作缓存分片 key
 // [参数] storageJSON：宿主传入的账号凭据 JSON
 // [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-10-19 13:10:00；改动原因：新增失败负缓存窗口拦截与失败标记
-func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
-	if models, ok := cachedDynamicModels(); ok {
+// 最近修改时间 2026-10-20 03:10:00 修改, 缓存与负缓存均改为按账号分片
+func fetchDynamicModelsFromStorage(authID string, storageJSON []byte) []pluginapi.ModelInfo {
+	if models, ok := cachedDynamicModels(authID); ok {
 		return models
 	}
 	// 负缓存窗口内直接返回 nil，让上层走 resolveModels 静态兜底。
-	if inDynamicModelsFailWindow() {
+	// 窗口按本账号判定：别的账号失败不应该连带封锁本账号的发现。
+	if inDynamicModelsFailWindow(authID) {
 		return nil
 	}
 	sa, err := parseStored(storageJSON)
@@ -341,18 +490,18 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	}
 	dyn, dynErr := callModelsAPIFn(sa)
 	if dynErr == nil && len(dyn) > 0 {
-		storeDynamicModels(dyn)
+		storeDynamicModels(authID, dyn)
 		return dyn
 	}
 	// 本账号被拒后先回退全量扫描，回退必须在开窗之前：窗口一旦置位，
-	// 全量扫描入口立即返回 nil，本函数声明的「回退到已注册凭据扫描」
+	// 本账号的后续调用会被立即拦住，本函数声明的「回退到已注册凭据扫描」
 	// 就变成死路径（另一账号本可成功）。
 	if dyn := fetchDynamicModelsFallbackFn(); len(dyn) > 0 {
 		return dyn
 	}
 	// 回退也拿不到结果才开窗：本账号确实打过上游，属真实失败而非
 	// 「本地没账号」，可以安全进入负缓存。
-	markDynamicModelsFailed()
+	markDynamicModelsFailed(authID)
 	return nil
 }
 
@@ -652,7 +801,7 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 // handleModelForAuth 返回指定账号的模型列表，优先级为动态 > 配置 > 静态默认。
 // [参数] raw：宿主传入的 AuthModelRequest（含 StorageJSON 凭据）
 // [返回] 成功 envelope；请求解析失败时返回错误
-// 最近修改时间 2026-09-12（动态成功时完全忽略配置，避免遮蔽上游新增模型）
+// 最近修改时间 2026-10-20 03:10:00 修改, 把 AuthID 透传给分片缓存
 func handleModelForAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthModelRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -663,28 +812,30 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// req.AuthProvider back would silently drop the model list whenever the
 	// auth file carries a non-canonical provider string.
 	cacheModelAliases(req.Host)
-	models := resolveModelsFromStorage(req.StorageJSON)
+	models := resolveModelsFromStorage(req.AuthID, req.StorageJSON)
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
 // authModelsForIndex 返回指定账号当前可用的模型列表，供面板「测试」弹窗选择。
 //
-// 复用账号级动态发现链路：优先未过期缓存，未命中时用该账号凭据实时拉取；
+// 复用账号级动态发现链路：优先该账号未过期缓存，未命中时用该账号凭据实时拉取；
 // 末尾追加随机兜底模型，保证上游瞬时失败时弹窗仍有一个可测选项。
-//
 // [参数] authIndex：宿主账号索引。
 // [返回] 去重后的模型 ID 列表；账号凭据不可用时返回 nil。
-// 最近修改时间 2026-10-10（新增测试按钮指定模型选择支持，同步自 workbuddy）
+// 最近修改时间 2026-10-20 03:10:00 修改, 改为按账号读取缓存，避免拿到别的账号清单
 func authModelsForIndex(authIndex string) []string {
 	sa, err := hostAuthGet(authIndex)
 	if err != nil || sa == nil {
 		return nil
 	}
-	models, _ := cachedDynamicModels()
+	// 缓存 key 用本账号凭据的 uid：hostAuthGet 已按 auth_index 取到具体账号，
+	// 不能用 authIndex 当 key（它与宿主 auth.ID 不同形，会命中不到分片）。
+	accountKey := sa.Account.UID
+	models, _ := cachedDynamicModels(accountKey)
 	if len(models) == 0 && strings.TrimSpace(sa.Auth.AccessToken) != "" {
 		if dyn, ferr := callModelsAPI(sa); ferr == nil && len(dyn) > 0 {
-			storeDynamicModels(dyn)
+			storeDynamicModels(accountKey, dyn)
 			models = dyn
 		} else if ferr != nil {
 			log.Printf("[qoderwork] authModelsForIndex: dynamic discovery failed (%v), falling back to static list", ferr)
