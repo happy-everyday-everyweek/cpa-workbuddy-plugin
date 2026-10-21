@@ -32,6 +32,17 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-21）：**coze 0.5.4：全池积分耗尽时快速失败，止血上游白打与错误风暴**：
+  - 用户报障（附截图）：生成一张图刷出 9 条 `Failed to generate image`（20:11 / 21:12 各一批）。**与 0.5.3 的晚到附件问题无关**，是另一条独立缺陷。
+  - **根因（生产日志实证）**：0.5.2 闸门兜底语义是「全池低额则放行」，本意别把最后一个残血号挡掉；但全池都是 0 分时「放行」等于把请求交回宿主逐个白打上游。四个时段的 request_id **每个都轮满 7 个号**、每条 1.2–3.2 秒才拿到上游 `1000521 该用户积分已耗尽`，闸门在这些时段**零拦截**（`低于路由红线` 计数为 0）；叠加 new-api `RetryTimes=5` 且自动重试码 `401-407,409-428,430-503` 恰好跳过 400，一次出图放大成 9 条错误。
+  - **修复**：新增「整池确定 0 分」快速失败通道，返回 **400**（`creditsPoolDepletedError`）——命中宿主请求级白名单 `clienterror.IsRequestFault`（400/409/413/422）立即终止换号轮转且不冷却账号，又不在 new-api 重试区间，两层重试一起止住、零上游消耗。判据只认 `remain` **恰好为 0**（残血非零仍按原语义放行让上游自己判），并要求本号与池内每个可用号的积分数据都在 `creditDepletedTrustWindow`（15 分钟，故意宽于 5 分钟缓存 TTL，免得刷新边界期把刚拿到的 0 分判成不可信而使快速失败失效）内新鲜；任一账号未知/过期、或快照为空（刚热重载未跑首轮）一律退回放行；红线配 0 时两条判据一并失效，无需额外开关。
+  - **机制实证（对照实验）**：用既有 413 分支（同走同步信封、同属请求级白名单）验证——客户端发 70000 字节 → `HTTP=413 41ms`，宿主侧该 request_id **只有 1 条执行日志**、未轮转到第二个号，413 原样透传调用方。⇒「同步信封带请求级 4xx」确实既终止轮转又到达客户端。**400 分支自身上线时尚未在生产触发过**（它要求整池确定 0 分，验收时池里有 2 个健康号），不得声称已生产实证。
+  - **验证**：cgo-shim build+vet+test 全绿；新增 9 用例（全池 0 分必须 400、有健康号仍走 403、快照为空放行、本号过期放行、他号过期放行、未知积分不判耗尽、残血非零放行、本号健康但快照滞后放行、穿过 `handleExecExecute` 的零上游断言）；**7 项变异反证全部 KILLED**，其中「池内不校验缓存新鲜度」与「忽略 kill switch」首轮**存活**——前者补 `TestVerifyAccountCreditsAllowsWhenPeerCreditCacheStale` 后捕获，后者暴露 `redline > 0` 是死代码（`remain < redline` 已隐含闸门开启），已删。
+  - **发布链**：提交 `2310041` + registry `320249d` → CI run `39622568217` **21 job 全 success**（本次 darwin/arm64 未被排队拖死）→ 6/6 assets `ALL CHECKSUMS OK` → 产物内嵌 `0.5.4`×2、`0.5.3` 归零、新文案「账号池积分已耗尽」命中 → 远端 6/6 assets 200 且字节数一致 → 生产 `plugin-store install` 热重载（`active_version=0.5.4 retired_version=0.5.3`，**零容器重启**）→ 落盘 `.so` sha256 `32217406a64be9e754eb1f1fb2d97f7d694a3e9fb36ff088bd3d13c02d69e4c5` 与本地逐字节一致。
+  - **生产回归（request_id 159372c8，23:15）**：0 分号 3ms 被 403 拦截 → 换健康号 → **30.3 秒 HTTP 200 出图**，确认未破坏 0.5.3 的晚到附件路径与既有换号语义。
+  - **遗留待办（仍未闭合）**：① token-usage-tracker 把管理密钥当 `source` 打印到日志（`source=Ld@588588`），属凭据回显违规，需在该插件侧修复；② coze 的 `min_routable_credits` 未写入生产配置，走默认 100。
+  - 文档：`coze/CHANGELOG.md` 0.5.4 章节；路由口径同步见 `PROJECT_MEMORY.md`。
+
 - 当前会话（2026-10-20）：**coze 0.5.3：修复「生图全部失败但积分被烧光」**：
   - 用户报障（附 new-api 日志 + CPA 用量面板截图）：`coze/doubao-seedream-5-0-260128` 请求几乎全部 502/403 失败，账号 7840 积分却耗尽。
   - **根因（收尾时序错配）**：WS 的 `event_final` 帧 6–9 秒就到达，正文只有 `[图片](computer:///...)` 占位符（非空），真实图片附件要晚十几秒到几分钟才落库 `message/list` 的 `files`。旧逻辑只在「正文为空」时兜底轮询 → 生图路径不轮询、不报错 → 空 images → `buildImagesResponse` 报「上游未返回任何图片」。**上游已出图并扣额度**。
@@ -78,33 +89,14 @@
   - 文档：`doc/3-实施/2026-10-19_213000_账号冷却基数30s改60s实施总览.md`。
   - **并发盘点（只读）**：积分刷新走 `refreshConcurrency=10` worker 池（6 插件）；签到/保活 sem=4；coze 续期并发 4；zcode 单 worker + 300ms；traework 自动签到与 qwenwork 对账串行；copilot/cursor/doubao/notion 无插件侧定时循环。全仓无跨插件共享限流，4h 槽位整点对齐致整机峰值约 70–80 个上游请求同刻在场。
 - 当前会话（2026-10-19）：**Qoder 系模型发现风暴与 OOM 修复 P0/P1/P2 本地实施（按约束未发布生产）**：
-  - 来源：会话 `6f11d093` 只读分析给出的 P0/P1/P2 优先级建议。生产连续 5 次 OOM 的放大器链：`callModelsAPI` 签名 body 与 GET 实际 body 不一致 → `Signature invalid` 恒 403（累计 5449 条、从未成功）→ 失败不写任何缓存 → 宿主每次 auth 重写触发 `model.for_auth` 逐账号全量重扫（实测 8409 条 N+1 风暴）。
-  - **P0（qoder-ai / qoderwork）**：两处 `callModelsAPI` 抽出 `newModelsAPIRequest`，GET 以 `strings.NewReader(encodedBody)` 真实携带与签名同一的 `qoderEncode("{}")`。修复方向由外部可工作实现 qoder2api-hub（`qoder_proxy.py::read_dynamic_models`，commit `fd7a3740`）裁定：其 `sign_body` 同时进签名与 `data=`，裸 GET 判 403。qwenwork 走 Bearer 无 COSY 不受影响。
-  - **P1（五插件）**：`dynamicModelsCache` 增 `failedAt` + `dynamicModelsFailCacheTTL=5min`；全部扫描/拉取入口窗口内直接返回 nil 走静态兜底，全败路径 `markDynamicModelsFailed`，`storeDynamicModels` 成功即清零。切断 N+1 风暴，即使 P0 未生效或上游再变更也不再重演。
-  - **P2（qoder 三插件）**：`pickNextAuth` 选定候选后统一 `time.Sleep(failoverBackoff=50ms)`（唯一 chokepoint 单点收口，不动 21 个调用位）；`readAllUpstreamErr` 改 `io.LimitReader(r, 1<<20)`。
-  - **验证**：新增 9 个测试文件（签名一致性反推 md5 断言 / 负缓存三行为 / 错误体截断+退避护栏）；P0/P1/P2 各经真实变异复验捕获，报错打印旧值 vs 新值；五插件 `cgo-shim-build.py` build+vet+test 全绿；改动文件 gofmt 全绿；`POLLUTION: PASS`。P0 宿主转发链已对宿主源码取证（`internal/pluginhost/http_bridge.go:156` 用 `bytes.NewReader(bytes.Clone(req.Body))` 重建请求，GET body 会真实发出）。
-  - **复核追加修复（同日晚间）**：首版 `fetchDynamicModelsFromStorage` 先 `markDynamicModelsFailed()` 再 `fetchDynamicModels()`，而后者入口的窗口检查会立刻拦住 → 自身声明的「回退到已注册凭据扫描」成死路径（本账号凭据损坏时另一账号本可成功）。改为「先回退、无果再开窗」+ 抽出 `fetchDynamicModelsFallbackFn` 接缝；三插件各补 `TestNegativeCache_StorageFallbackRunsBeforeWindow`，变异（恢复先开窗）报 `回退结果应被采用，got []` 精确 FAIL，还原后五插件全绿。
-  - **未覆盖**：端到端「`dynamic discovery ok` 首现 / `Signature invalid` 归零」属生产观测项，本轮不发布不热重载留待发布后验收；workbuddy / workbuddy-ai 的 P2 未纳入本轮。
-  - 文档：`doc/3-实施/2026-10-19_133000_Qoder系模型发现风暴与OOM修复P0P1P2实施总览.md`、`doc/4-bugs/2026-10-12_015500_*`（§9 实施结论 + §6 裁定）。
-  - 同会话前段（2026-10-18~19）：**账号冷却模型维度与冷却前探活 周期 4（zcode/copilot）收口 + 五插件测试模板缺口补齐**：见 `doc/3-实施/2026-10-18_230000_账号冷却模型维度与冷却前探活实施总览.md`（五周期全部完成，5 插件：workbuddy/workbuddy-ai/traework/zcode/copilot，同样未发布）。
-
-- 当前会话（2026-10-18）：**coze 0.3.0 发布生产，验收连修四处真实缺陷（0.3.1~0.3.4）**：
-  - **发布链（0.3.0）**：commit `ed32383`（22 文件）→ push → dispatch CI run `39120784169` success（取消冗余 push run `39120767331`）→ 下载 7 assets 全 OK → `publish-assets.py` → registry commit `2117b34` → 远端 ALL PASS → 生产 `plugin-store install` 返回 `restart_required:false`，`hot reloaded active_version=0.3.0 retired_version=0.2.2`，落盘 `.so` sha256 `bcc6cdc0…` 与本地 zip 内 `.so` 逐字节一致，零容器重启；accounts/panel 均 200。
-  - **缺陷 1（0.3.0 → 0.3.1）：流式响应 500**。生产 `POST /v1/chat/completions` 立即返回 `json: unsupported type: <-chan pluginapi.ExecutorStreamChunk`。根因：宿主 `rpcExecutorStreamResponse.Chunks` 是 **slice**（`internal/pluginhost/rpc_schema.go:52`），`rpc_client_stream.go:29` 先判 `len()` 再转 channel；0.3.0 直接把 channel 塞进 `ExecutorStreamResponse.Chunks` 返回，JSON 序列化即失败。修复：带 `stream_id` 时立即返回响应头，后台用 `host.stream.emit` 逐帧推送、`host.stream.close` 收尾；无 `stream_id` 时同步收集返回 slice；补 `X-Accel-Buffering: no`。回归 `TestStreamResponseSerializable`（变异回 channel 形态精确复现生产报错文案）。发布链 `06bb281` → CI `39121930862` success → registry `45e6851` → 远端 ALL PASS → 生产热重载 `active_version=0.3.1 retired_version=0.3.0`，落盘 sha256 `50dfcd41…` 与本地一致。
-  - **缺陷 2（0.3.1 → 0.3.2）：WS 握手缺 Cookie，只能收到心跳**。0.3.1 后流式虽完整但耗时 92 秒、正文在最后一帧一次性到达——首帧后 91 秒零增量，正好卡在首字超时 90s，实际走轮询兜底。**对照实验（同一生产账号，仅差 Cookie 头）**：不带 Cookie 6 帧全是 `hi`；带 Cookie 25 帧含 21 条二进制业务帧，0.34–4.25s 陆续到达。**根因**：frontier 网关对无 Cookie 握手照样返回 101，但只推心跳。修复：`frontierClient` 增加 `cookieHeader`，`runOnce` 握手写入 `Cookie`；`runStream` 传 `sa.CookieHeader`。回归 `TestFrontierHandshakeCarriesCookie`（变异删头精确 FAIL）。
-  - **生产日志佐证**：`frontier 已连接`（19:19:06）→ `连接中断`（19:20:37）相隔 91 秒，中间零业务帧。
-  - **缺陷 3（0.3.2 → 0.3.3）：正文重复一遍**。0.3.2 部署后生产时序验收：总耗时从 92s 降到 17.71s、29 个正文帧在 5.02–17.70s 陆续到达（间隔约 0.3s），真流式恢复。但发现末帧 578 字**恰好等于前文拼接**，全文 1156 字重复输出两遍。**根因**：`content.message_data.reply.content` 在 `event_delta` 是增量、在 `event_final` 是**累积全文**，`parseFrontierMessage` 一视同仁当 delta 追加。修复：解析完 `content_v2` 拿到 phase 后，`event_final` 清空 `Delta` 只留 `Snapshot`。回归 `TestParseFinalFrameDoesNotDuplicate` + `TestParseDeltaFrameKeepsDelta`（变异移除清空逻辑精确 FAIL）。
-  - 文档：`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md`（STYLE: PASS）。
-  - **缺陷 4（0.3.3 → 0.3.4）：多轮对话空正文**。生产验收：单 user 正常（65 字），带 `assistant` 历史的多轮请求 0 字、`finish=stop`。**根因**：`runStream` 用固定 300ms 猜 WS 是否连上再发 chat；网络慢时 chat 抢跑，快速回复（多轮约 2 秒结束）的 `event_delta` 在连接就绪前推完，只收到重放的 `event_final`，而 final 的 delta 已被 0.3.3 清空 → 空正文。**WS 抓帧佐证**：同一 prompt 上游确实推了 start / delta(28 字) / final 三帧。修复：① 新增 `frontierClient.WaitReady`（握手成功即关 `ready` 通道，调用方等真实就绪信号，上限 10s）；② `waitForReply` 增加「已收尾但正文为空 → 按 message_id 轮询补齐」兜底；③ `fallbackPoll` 改按 `reply_to_message_id` 精确配对（原「取最新一条 reply」可能拿到上一轮）。回归 `TestWaitReadySignalsAfterHandshake` + `TestEmptyReplyFallsBackToPolling`（变异移除兜底后精确复现空正文）。
-  - **0.3.5（21:08:42 热重载）**：面板测试改为三层真实推理探活（判据 + 模型目录 + 极小推理），移除「不产生推理请求」过期文案。
-  - **发布态复核（21:24）**：远端 registry 0.3.5 + 6 平台资产 sha256 ALL PASS；生产落盘 `.so` sha256 `5706a80c…` 与 Release 产物逐字节一致；零容器重启。行为验收：单轮流式 19 帧 / TTFB 7ms / 10.92s，多轮流式返回 `5`，非流式「你好！」，探活 `scope=auth+models+inference` 回复「可用」；accounts / models / panel 均 200。
-  - **模型清单澄清**：16 个模型是 `/v1/model/list`（在线 9）+ 多模态目录（8，去重 1）动态合并结果，与 CPA `/v1/models` 逐条一致；`staticFallbackModels()` 的 5 条仅用于启动期无账号兜底。
-  - **0.3.6（22:00:10 热重载）**：修复 `/v1/responses` 入口必然 503。根因 `executorRequestBody` 优先读 `OriginalRequest`（客户端原始体，Responses 入口只有 `input`），而宿主只翻译 `Payload`；解析失败还会让宿主把账号标记不可用，连带 chat 请求 503。改为 Payload 优先。生产验收：responses 非流式 / 流式 / chat 三场景均 200，账号 `auth_state=ok`，`请求缺少 messages` 归零。
-  - **待办**：new-api 渠道 4「混合」的 `models` 仍需手工追加 coze 模型名，否则 new-api 侧不会转发到 CPA。
-  - **0.4.0（并行会话）**：打通对话内生图，图片按 Markdown 在正文后下发；已发布并生产验收。
-  - **0.4.1（2026-10-19 00:27:28 热重载）**：修复下游用量全部记零。根因：插件从未输出 `usage`，而扣子上游无 token 计数端点、WS 帧也不带用量，宿主只能拿到零值。改为流式终止帧 + 非流式响应体输出 OpenAI 规范 usage，按字符特征估算并标记 `estimated:true`。生产验收：两条路径均输出 `9/2/11`，中间帧不带 usage；零容器重启。
-  - **待办（新）**：`token-usage-tracker` 的 `/stats/groups` 查不到 coze-provider 行（其 `usage.handle` 日志确认已收到记录），属该插件聚合口径问题，不影响 CPA/new-api 计费取值。
-
+  - 放大器链：`callModelsAPI` 签名 body 与 GET 实际 body 不一致 → `Signature invalid` 恒 403（累计 5449 条、从未成功）→ 失败不写任何缓存 → 宿主每次 auth 重写触发 `model.for_auth` 逐账号全量重扫（实测 8409 条 N+1）。
+  - P0 改 GET 真实携带与签名同源的 `qoderEncode("{}")`（方向由外部可工作实现 qoder2api-hub 裁定）；P1 补 `failedAt` 负缓存 5min 切断风暴；P2 在 `pickNextAuth` 单点收口 50ms 退避 + 错误体 `io.LimitReader` 截断。复核追加修复「先开窗再回退致回退成死路径」。
+  - **P0/P1/P2 逐项细节、9 个新测试文件与变异复验见 `doc/3-实施/2026-10-19_133000_Qoder系模型发现风暴与OOM修复P0P1P2实施总览.md`；生产发布与验收由后续会话完成（见 git log 与 `PROJECT_MEMORY.md`）。**
+- 前序会话（2026-10-18）：**coze 0.3.0 发布生产并连修四处缺陷（0.3.1~0.3.4），后续 0.3.5/0.3.6/0.4.0/0.4.1 同会话收口**：
+  - 四个真实缺陷（根因一句话）：① 流式把 channel 塞进 `Chunks` 致 JSON 序列化失败 → 带 `stream_id` 时改 `host.stream.emit` 异步逐帧推送；② WS 握手不带 Cookie 时网关照样 101 但只推心跳 → `frontierClient` 补 `cookieHeader`；③ `event_final` 的 reply.content 是累积全文而 delta 是增量，一视同仁追加致正文重复一遍 → final 只留 Snapshot；④ 固定 300ms 猜 WS 就绪致多轮快速回复的 delta 在就绪前推完、只剩被清空的 final → 新增 `WaitReady` 真实就绪信号 + 兜底轮询按 `reply_to_message_id` 精确配对。
+  - 另：0.3.6 修 `/v1/responses` 必然 503（`executorRequestBody` 改 Payload 优先，原读 `OriginalRequest`）；0.4.1 修下游用量全记零（流式终止帧 + 非流式体输出 `usage`，按字符特征估算并标 `estimated:true`）。均热重载零重启验收。
+  - **逐版本细节、变异反证与发布链见 `coze/CHANGELOG.md` 0.3.0~0.4.1 各章节、`doc/5-tests/2026-10-18_182000_Coze对话链路实现验证.md`、`doc/6-review/2026-10-18_182000_Coze对话链路实现_6-review.md` 与 git log。**
+  - 未闭合待办：new-api 渠道 4「混合」的 `models` 需手工追加 coze 模型名，否则 new-api 侧不转发到 CPA。
 - 前序会话（2026-10-18）：**coze TASK-004 对话链路实现完成（v0.3.0），真流式落地**：
   - 需求：用户「开工 TASK-004，按 §4.6 实现收帧逻辑」。
   - **实现（5 个新文件，约 1600 行）**：`frontier_frame.go`（12 字段 protobuf 手写编解码，按 tag 分派+跳过未知字段）、`frontier.go`（WS 客户端：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`、10s `hi` 心跳、读超时、指数退避重连）、`claw.go`（claw/info→get_main→chat→message/list→get_frontier_key，统一 `code` 业务判定）、`convert.go`（OpenAI messages 折叠、chunk/completion 构造）、`executor.go`（流式/非流式入口、`turn_id+seq_num+phase` 去重、`event_final` 收尾、首字超时降级轮询）。
@@ -114,35 +106,20 @@
 - 前序会话（2026-10-18，已压缩）：**coze CYCLE-01 协议取证：抓到真流式帧，TASK-004 阻断解除**：浏览器内给 `WebSocket.prototype.send` 打补丁捕获页面真实 WS 实例，抓到 100 帧业务数据（44 条 reply 增量）。关键实测：`aid=751148`/`fpid=1289`/`xsack=0`/`pbbp2`（`connection-params` 的 `aid=578287`/`service=33555616` 是另一条通道，用错只收心跳）；claw 业务 `service=33555657`；protobuf 12 字段；阶段机 `event_start`→`event_delta`→`event_final`；`content.message_data.reply.content` 是 delta、`content_v2.session.final` 是累积快照（实测 10 个 delta 拼接 371 字符 == final 371）；去重键 `turn_id+seq_num+phase`。文档见 `doc/5-tests/2026-10-18_164500_Coze对话链路协议补全.md` §4.6。
 
 - 前序会话（2026-10-18）：**coze-provider 0.2.2 定时续期改由插件自建定时器执行**：
-  - 需求：用户问「续期是自动的吗?」，随后要求「定时 4 小时补 `refresh_interval_seconds`，续期，和其他插件的定时一样」，并要求面板展示积分余额。
-  - **根因（宿主源码取证）**：`refresh_interval_seconds` 只决定宿主「何时把账号排进刷新队列」；`auto_refresh_loop.handleDueAuth` 在 `exec == nil` 时只做 `l.upsert(authID, now.Add(interval))` 空转重排，**不调用 `auth.refresh`**。`RegisterExecutors` 只注册声明 executor 的插件，coze 声明 `Executor:false`，因此宿主的 4 小时排期对本插件永不产生续期。生产证据：24h 内 0 条 auto-refresh 日志，3 次续期全是手动点击。
-  - **实现**：新增 `coze/renew_loop.go`（默认 4 小时遍历启用账号执行 `renewSession` + `applyRenewal`；热重载后立即跑首轮；`reconfigure` 即时重排；`Shutdown` 关闭停止信号；并发上限 4；经宿主 `host.log` 留痕）。`main.go` 在 `cliproxy_plugin_init` 启动、`Shutdown` 停止。
-  - **顺带修复真实缺陷**：`applyRenewal` 原防覆盖判据 `bindStore(path).replaced()` 在写前才取摘要，比对对象永远是文件自身 → 外部重新授权的新凭据会被旧快照静默覆盖。改为读取时锚定 `StoredAuth.LoadedDigest`，删除失效的 `storeBinding`/`bindStore`。
-  - **验证**：cgo-shim build/vet/test 全绿（新增 12 个用例）；哨兵证明测试真实进编译；7 次变异反证全部精确命中；真实 cgo 构建 10.9MB `.so`（8 个 ABI 符号、版本串 0.2.2）；真实 `.so` ctypes 探针 `test/coze/renew_loop_probe.py` **7/7 PASS**（含判别力变异：注释掉 `startRenewLoop` → 4 项 FAIL）。
-  - **发布（0.2.2）**：CI run `39106119186` success → `90edaae`(源码) → 资产 6/6 `ALL CHECKSUMS OK` → `4f45084`(registry)；远端 git 内容 version=0.2.2、6 artifacts sha256+size 齐全（raw CDN 有缓存延迟）。
-  - **生产部署（15:15:18）**：`plugin-store install?version=0.2.2` → 200 + `restart_required:false`，**零容器重启（Up 2 days）**；`active_version=0.2.2 retired_version=0.2.1`；落盘 `.so` sha256 `589830201cba…` 与本地 zip 一致。
-  - **生产行为验收（关键）**：15:15:19 与 15:15:38 各一轮 `定时续期完成`（**无手动点击**）；`last_renew_at` 推进到 `15:15:38`，`auth_state=ok`；`/panel` 200；`/credits` 返回 3000/3000/1500；0 error/panic。
-  - **未验证（诚实标注）**：4 小时排期的第二/三轮（仅等到首轮与热重载轮），由 `TestRenewLoopFiresOnInterval` 覆盖；插件直连 `www.coze.cn` 不经宿主 `host.http.do`，`.so` 探针无法拦截上游往返，换发与落盘由 Go 单测覆盖。
-
+  - **根因**：宿主 `refresh_interval_seconds` 只决定排期，`auto_refresh_loop.handleDueAuth` 在 `exec == nil` 时仅空转重排、**不调用 `auth.refresh`**；coze 声明 `Executor:false` 故不在 `RegisterExecutors` 名单内 ⇒ 宿主 4 小时排期对本插件永不产生续期（24h 零条 auto-refresh 日志，3 次续期全手动）。新增 `coze/renew_loop.go`（默认 4h、并发 4、热重载即跑首轮、reconfigure 即时重排、Shutdown 停止）。
+  - **顺带修真实缺陷**：`applyRenewal` 原防覆盖判据在写前才取摘要、比对对象永远是文件自身 → 外部重新授权的新凭据会被旧快照静默覆盖；改为读取时锚定 `StoredAuth.LoadedDigest`，删除失效的 `storeBinding`/`bindStore`。
+  - 已发布 0.2.2 并生产热重载零重启，首轮自动续期实测生效（`last_renew_at` 推进、`auth_state=ok`）。**细节、7 次变异反证与 `.so` ctypes 探针 7/7 PASS 见 `coze/CHANGELOG.md` 0.2.2 章节、`test/coze/renew_loop_probe.py` 与 git log。**
 - 前序会话（2026-10-18）：**coze-provider 0.2.0 模型动态发现 + 面板重做**：声明 `model_provider` 并实现 `model.static`/`model.for_auth`（`/v1/model/list` 的 `model_type` 必须是字符串枚举，多模态目录才有完整视频族，生产实测 16 模型）；面板移除授权区、按 workbuddy 风格重做、加 `/models` 与 `/test-active`、时间统一 `Asia/Shanghai`。已发布 0.2.0 并生产热重载验收（`active_version=0.2.0`、`/test-active` 可见 16 模型）。未验证：真实推理链路（属 CYCLE-01）。
 - 会话（2026-10-18，已压缩）：**qwenwork CYCLE-02 多账号调度：修复账号身份 key 失配（P0）**：执行器用 `auth.accessToken` 当账号身份，导致候选、冷却、会话绑定错位；改为账号维度稳定 key 并补回归；发布 0.2.x 生产热重载零重启。
 - 当前会话（2026-10-18）：**qwenwork-provider 0.1.0 立项实现并全链路发布**：Device Flow + PKCE（`gateway.qwenwork.cn`）换宿主 JWT → `POST /api/desktop-sessions`（**201 非 200**）签发 `sk-mm-v1.*` 短票据（TTL 2h）→ 裸 Bearer 打 `{base_url}/v1/chat/completions`；MaaS 无 `/v1/models`，目录在 `GET /api/desktop/chat-modes`。推理走**请求体透传**（仅强制 `stream=true` + `max_tokens` 自适应），管理路由收敛 13 条。发布链 `a9585c7` → CI `39050879075` → `91e050e` → `14bc392`(6 平台) → `3568d37`(registry)；图标改用仓库内 `assets/icons/QwenWork.png`（原外链 404）。
 - 当前会话（2026-10-18）：**发布矩阵下线 freebsd-amd64，平台数 7 → 6**：
-  - 需求背景：用户反馈「7 平台产物里有一个平台之前构建时出过问题，能否缩减」，并裁定「只砍 freebsd-amd64」。
-  - 根因确认：`go-cross/cgo-actions@v1` 硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从官方源下架（404），2026-10-17 曾导致全部 10 插件 freebsd 构建集体失败并连带 Release job skipped；当时的 wget 包装层改写 `14.3→14.4` 属绕过，本次直接下线该平台根治。
-  - **改动范围**：`.github/workflows/build.yml`（删除 12 条 freebsd 交叉矩阵项、删除 wget 补丁步骤、release notes 表格删行）；`scripts/publish-assets.py`（`PLATFORMS` 移除 `freebsd_amd64`、删除 `OPTIONAL_PLATFORMS` 可选平台逃生门）；`registry.json`（10 插件各 7→6 artifacts）；`release-assets/`（删除 10 个 freebsd zip 并同步各 `checksums.txt`）；文档同步 `README.md` / `cursor/README.md` / `项目设计.md` / `AGENTS.md` / `CLAUDE.md` / 两份发布 skill。
-  - **保留项**：`build-cross` 仅剩 windows-arm64（12 条）；release job 的 6 平台完整性检查本就不含 freebsd，未改。
-  - **验证**：workflow YAML 解析通过（native 60 条 5 组合 / cross 12 条仅 windows-arm64）；`validate-registry.py` OK（10 插件各 6 artifacts，组合恰为 6 个）；`publish-assets.py` 临时目录正向实跑（6 zip → 6 artifacts 回写成功）与负向实跑（缺 windows_arm64 → `missing zips` + exit=1）；10 个版本目录 `sha256sum -c checksums.txt` 全 OK；临时目录已清理。
-  - **真实 CI 已验证（run `39052278051`，提交 `0118051`）**：84 success / 1 skipped（Release job 因纯 push 跳过）/ 0 failure；作业总数由 108 降至 84，**freebsd 作业为 0**，交叉构建仅剩 12 条 windows-arm64。
-  - 文档：`doc/6-review/2026-10-18_010000_发布矩阵下线freebsd平台_6-review.md`（STYLE: PASS）。
+  - 根因：`go-cross/cgo-actions@v1` 硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从官方源下架（404），曾致全部 10 插件 freebsd 构建集体失败并连带 Release job skipped；旧的 wget `14.3→14.4` 改写属绕过，本次直接下线该平台根治。
+  - 改动：`build.yml` 删 12 条矩阵项与 wget 补丁步骤、`publish-assets.py` 删 `freebsd_amd64` 与 `OPTIONAL_PLATFORMS` 逃生门、`registry.json` 10 插件各 7→6、文档同步。真实 CI run `39052278051`（提交 `0118051`）84 success / 1 skipped / 0 failure，作业总数 108→84。
+  - **验证明细与 STYLE 结论见 `doc/6-review/2026-10-18_010000_发布矩阵下线freebsd平台_6-review.md`。**
 - 当前会话（2026-10-17）：**qoder 三插件流式断流换号与冷却落盘修复（CYCLE-01 + CYCLE-02 全部闭环）**：
-  - 需求背景：生产会话 `5fa71566` 中 `qwen-3.8-flash` 请求（ID `202610171157242386880308268d9d6KQb4LXIN`）上游断流后未换号。根因：插件断流分支无换号路径（主）+ 断流信封无状态码（次）+ 24h 冷却 92 次触发零落盘（独立缺陷）。
-  - **已实施 5 个任务**：qoderwork / workbuddy / qoder-ai 三插件新增 `isStreamReadError` + `shouldRotateOnStreamReadError` 纯函数；异步与同步断流分支接入分级换号（`emitted` 零泄漏守卫）；信封补 `http_status=502`（已泄漏时抑制）；qoderwork 冷却落盘失败补日志 + 内存冷却提前到 host RPC 之前 + watchdog 刷新合并保留未落盘条目。
-  - **验证**：三插件 cgo-shim 全绿（qoderwork 10.05s / workbuddy 26.14s / qoder-ai 10.14s）；8 次哨兵反证均精确命中单例；5 份 `doc/6-review/` 记录均为 `STYLE: PASS`。
-  - **已发布并生产部署（2026-10-17 22:40）**：qoderwork 0.9.44 / workbuddy 0.16.5 / qoder-ai 0.1.24；提交链 `d035e5e`(fix 23 文件) → `a47d5ad`(CI FreeBSD 14.4 镜像修复) → `f467b4d`(assets 24) → `6535ca5`(registry) → `d8faa83`(prune 0.14GB)。远端 21/21 artifacts ALL PASS 无残留；三插件 `plugin hot reloaded` 且 `active_version` 命中目标版本、落盘 `.so` sha256 与本地 zip 逐字节一致、panel/accounts 全 200，**零容器重启**（容器 Up 2 days）。
-  - **CI 阻断修复（既有缺陷，非本轮引入）**：`go-cross/cgo-actions@v1` 内硬编码下载 FreeBSD `14.3-RELEASE/base.txz`，该版本已从 `download.freebsd.org/releases` 下线（404），既有 patch 指向的 `archive.freebsd.org/old-releases` 同样 404，导致全部 10 插件 freebsd-amd64 构建失败并连带 `Release` job 被 skipped。已改为在 wget 包装层把 `14.3-RELEASE` 改写为仍可用的 `14.4-RELEASE`。
-  - **生产验收边界**：热重载后 15 分钟窗口内无断流事件，端到端「断流 → 换号 → 第二次成功」未能实证；已改为确认新符号 `shouldRotateOnStreamReadError` / `after partial output` / `daily cooling persist failed` 已进入三插件生产二进制（qoderwork 另含 `mergeActiveDailyCooling`），服务 `/v1/models` 200、无 error/panic 日志。后续需在真实断流发生时观察日志。
-  - 文档：`doc/4-bugs/2026-10-17_202500_qoderwork流式中途断流不换号且24h冷却未落盘根因诊断.md`、`doc/3-实施/2026-10-17_203500_qoder三插件流式断流换号与冷却落盘修复实施总览.md`（§14 记录执行结果与偏差）。
+  - 根因三层：插件断流分支无换号路径（主）+ 断流信封无状态码（次）+ 24h 冷却 92 次触发零落盘（独立缺陷）。qoderwork / workbuddy / qoder-ai 新增 `isStreamReadError` + `shouldRotateOnStreamReadError`，异步与同步断流分支接入分级换号（`emitted` 零泄漏守卫），信封补 `http_status=502`；qoderwork 冷却落盘失败补日志、内存冷却提前到 host RPC 之前。
+  - 已发布 qoderwork 0.9.44 / workbuddy 0.16.5 / qoder-ai 0.1.24，热重载零重启、落盘 `.so` 逐字节一致。**未实证项（热重载窗口内无断流事件，改以新符号进二进制佐证）、提交链与验收边界见 `doc/4-bugs/2026-10-17_202500_qoderwork流式中途断流不换号且24h冷却未落盘根因诊断.md` 与 `doc/3-实施/2026-10-17_203500_qoder三插件流式断流换号与冷却落盘修复实施总览.md`（§14）。**
+  - 同轮附带修复（非本轮引入的既有 CI 缺陷）：FreeBSD 镜像 404 曾致 10 插件 freebsd 构建全败并连带 Release skipped。
 - 会话（2026-10-15，已压缩）：**跨插件同步第二轮复检（只读审计）**：md5 对比 + 机制分布 grep + 版本矩阵复核 9 插件，原批次 A~D 全部闭环。
 
 - 会话（2026-10-15，已压缩）：**qoder 双插件重建上游 messages 保留工具调用结构（qoderwork 0.9.40 / qoder-ai 0.1.20）**：根因是 baseprompt 的 agent 上下文 + 插件重建 messages 丢掉 `tool_calls`/`tool_call_id`；补三字段并同步自定义 `UnmarshalJSON`（陷阱：加字段必须同步解析否则恒空）。**判别力边界**：只修结构丢失，探索型任务仍不收敛。
