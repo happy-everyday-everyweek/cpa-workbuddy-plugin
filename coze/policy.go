@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // 本文件定义「积分路由红线」策略。
@@ -35,6 +36,14 @@ const (
 	// 与续期循环同口径：账号多时串行会把一轮拖很久，并发过高又容易
 	// 触发上游风控，取 4 作为折中。
 	creditRefreshConcurrency = 4
+
+	// creditDepletedTrustWindow 是「全池耗尽」判据允许采信缓存的年龄。
+	//
+	// 比缓存 TTL（5 分钟）宽 3 倍：刷新周期本身就是 5 分钟，若沿用 TTL，
+	// 每轮刷新之间的边界期会把刚拿到的 0 分判成「数据不可信」，
+	// 快速失败随之失效、请求又回去白打上游。超过这个窗口说明刷新循环
+	// 已经停摆，此时宁可放行让上游自己判，也不要把整池误判成死号。
+	creditDepletedTrustWindow = 15 * time.Minute
 )
 
 var (
@@ -112,6 +121,26 @@ func cachedCreditRemain(authID string) (int64, bool) {
 	return entry.summary.Remain, true
 }
 
+// cachedCreditTrustworthy 判断账号积分缓存是否还值得采信。
+//
+// 「已知」不等于「可信」：余额接口只写成功结果，刷新循环停摆时缓存会长期
+// 停在旧值。全池耗尽的快速失败会把请求直接判死，必须确认数据是新的，
+// 否则一次刷新停滞就会把整池误判成 0 分而全线拒服务。
+// [参数] authID: 账号标识。
+// [返回] 缓存有值、无错误且年龄小于采信窗口时为 true。
+func cachedCreditTrustworthy(authID string) bool {
+	if authID == "" {
+		return false
+	}
+	creditsCache.mu.Lock()
+	defer creditsCache.mu.Unlock()
+	entry, ok := creditsCache.entries[authID]
+	if !ok || entry.summary.Error != "" {
+		return false
+	}
+	return time.Since(entry.fetched) < creditDepletedTrustWindow
+}
+
 // isCreditsBelowRedline 判断账号积分是否已低于路由红线。
 //
 // 未知积分一律返回 false（放行）：查不到余额时把账号挡在门外，
@@ -182,38 +211,106 @@ func hasRoutableAccountExcept(excludeAuthID string, pool []creditPoolEntry) bool
 	return false
 }
 
+// allRoutableAccountsDepleted 判断池内全部可用账号是否都「确定零积分」。
+//
+// 只认 remain 恰好为 0 且缓存新鲜的账号：低于红线但不为 0 的残血号
+// 仍可能跑完这一轮，那是原有「放行让上游自己判」的语义，不能在这里收紧。
+// 池空（刚热重载、循环还没跑过第一轮）时返回 false——否则会误把整池判死、
+// 全线拒绝服务。
+// [参数] pool: 账号池快照。
+// [返回] 至少有一个可用账号且它们全部确定零积分时为 true。
+func allRoutableAccountsDepleted(pool []creditPoolEntry) bool {
+	usable := 0
+	for _, entry := range pool {
+		if !entry.usable {
+			continue
+		}
+		usable++
+		if !entry.known || entry.remain != 0 {
+			return false
+		}
+		if !cachedCreditTrustworthy(entry.authID) {
+			return false
+		}
+	}
+	return usable > 0
+}
+
 // verifyAccountCredits 在执行前校验所选账号的积分是否足够承载本次请求。
 //
-// 只有「本号低于红线」且「池里还有别的可用号」时才拒绝：前者保证不会
-// 白打一次上游，后者保证拒绝是有意义的。返回的错误带 403，宿主据此
-// 走账号级换号通道（与上游 1000521 积分耗尽同一条路径）。
+// 两条独立判据，顺序不能反：
+//  1. 全池确定零积分 → 返回 400 请求级失败。此时换号没有目的地，
+//     继续放行的代价是宿主把整池轮一遍、每个号都白打一次上游
+//     （2026-10-21 生产实证：7 个 0 分号各耗 1.2-3.2 秒才拿到 1000521，
+//     再叠加 new-api 5 次重试，一次生图刷出 9 条错误）。
+//     400 命中宿主请求级白名单：立即终止轮转、不冷却账号；
+//     也不在 new-api 的自动重试区间内，两层重试一起止住。
+//  2. 本号低于红线但池里还有别的可用号 → 返回 403 走账号级换号通道，
+//     与上游 1000521 同一条路径。
 //
 // 全程只读内存快照与积分缓存，不发任何宿主 RPC 或上游请求。
 // [参数] sa: 本次请求选中的账号。
-// [返回] 应换号时返回带状态码的错误，否则 nil。
+// [返回] 应换号或应直接失败时返回带状态码的错误，否则 nil。
 func verifyAccountCredits(sa *StoredAuth) error {
 	if sa == nil {
 		return nil
 	}
-	remain, known := cachedCreditRemain(sa.AuthID)
-	if !known {
-		return nil
-	}
 	redline := loadedMinRoutableCredits()
-	if remain >= redline {
-		return nil
+	pool := loadCreditPool()
+
+	remain, known := cachedCreditRemain(sa.AuthID)
+	if known && remain < redline {
+		if hasRoutableAccountExcept(sa.AuthID, pool) {
+			// 只在真正换号时留痕：这是宿主的选中结果与积分现状不一致的证据，
+			// 常驻日志里出现即说明账号池的余额分布需要人工关注。
+			hostLogf("warn", "账号积分低于路由红线，转由宿主换号", map[string]any{
+				"auth_id": sa.AuthID,
+				"remain":  remain,
+				"redline": redline,
+			})
+			return &creditsBelowRedlineError{remain: remain, redline: redline}
+		}
 	}
-	if !hasRoutableAccountExcept(sa.AuthID, loadCreditPool()) {
-		return nil
+
+	// 走到这里说明换号没有目的地。若「本号确定零积分」且整池也都确定零积分，
+	// 就不要再把请求送往上游赌一次——残血但非零的号仍会落到放行分支。
+	// 必须同时看本号：池快照最多滞后一个刷新周期，若本号是快照之后才
+	// 加入的新账号，池里全零并不代表此刻选中的号不可用。
+	// 红线为 0（kill switch）时 remain < redline 恒不成立，闸门整体失效。
+	if known && remain < redline && cachedCreditTrustworthy(sa.AuthID) &&
+		allRoutableAccountsDepleted(pool) {
+		hostLogf("warn", "账号池积分已全部耗尽，直接返回失败", map[string]any{
+			"auth_id":  sa.AuthID,
+			"accounts": len(pool),
+			"redline":  redline,
+		})
+		return &creditsPoolDepletedError{}
 	}
-	// 只在真正换号时留痕：这是宿主的选中结果与积分现状不一致的证据，
-	// 常驻日志里出现即说明账号池的余额分布需要人工关注。
-	hostLogf("warn", "账号积分低于路由红线，转由宿主换号", map[string]any{
-		"auth_id": sa.AuthID,
-		"remain":  remain,
-		"redline": redline,
-	})
-	return &creditsBelowRedlineError{remain: remain, redline: redline}
+
+	return nil
+}
+
+// creditsPoolDepletedError 表示账号池已无积分、本次请求无法服务。
+//
+// 状态码取 400 而不是 403：403 会让宿主继续轮转下一个账号并冷却当前号，
+// 全池耗尽时那等于把整池白打一遍上游。400 命中宿主请求级白名单
+// （clienterror.IsRequestFault），一次都不打上游直接终止。
+// [参数] 无。
+// [返回] 无。
+type creditsPoolDepletedError struct{}
+
+// Error 返回面向用户的失败说明。
+// [参数] 无。
+// [返回] 错误文案。
+func (e *creditsPoolDepletedError) Error() string {
+	return "账号池积分已耗尽：当前无可用扣子账号，请稍后重试或补充积分"
+}
+
+// StatusCode 返回宿主分类用的 HTTP 状态码。
+// [参数] 无。
+// [返回] 400。
+func (e *creditsPoolDepletedError) StatusCode() int {
+	return http.StatusBadRequest
 }
 
 // creditsBelowRedlineError 表示账号积分低于红线、应换号的失败。
