@@ -2,8 +2,8 @@
 
 ## 目标与范围
 
-- 目标：维护 CLIProxyAPI (CPA) 的 Go 原生插件套件 `cpa-workbuddy-plugin`（涵盖 8 大 AI 服务商 Provider + 1 统一用量统计插件），提供多账号管理、动态模型发现、流式转发、专属现代管理控制台、扫码/Token 登录、保号巡检与统一 token 用量统计分析服务。
-- 范围：仓库内 9 大插件体系的代码实现、单元测试、资产构建、发布流水线、registry 元数据同步等：
+- 目标：维护 CLIProxyAPI (CPA) 的 Go 原生插件套件 `cpa-workbuddy-plugin`（涵盖 10 大 AI 服务商 Provider + 1 统一用量统计插件，共 11 插件），提供多账号管理、动态模型发现、流式转发、专属现代管理控制台、扫码/Token 登录、保号巡检与统一 token 用量统计分析服务。
+- 范围：仓库内 11 大插件体系的代码实现、单元测试、资产构建、发布流水线、registry 元数据同步等：
   1. `workbuddy-provider`：腾讯 CodeBuddy（国内版与 Global 版）；
   2. `workbuddy-ai-provider`：WorkBuddy AI（独立国际版）；
   3. `traework-provider`：Trae SOLO（字节跳动海外/国内 AI IDE 客户端）；
@@ -12,12 +12,15 @@
   6. `cursor-provider`：Cursor（cursor.sh，Connect-RPC 协议与会话连续性）；
   7. `zcode-provider`：ZCode（BigModel Coding Plan，Anthropic 兼容与客户端真实指纹 mimic）；
   8. `copilot-provider`：GitHub Copilot（设备码 OAuth / 内部令牌保活 / VS Code Copilot Chat 指纹模拟）；
-  9. `workbuddy-token-usage`：统一 Token 用量统计与实时看板服务。
+  9. `coze-provider`：扣子 Coze（claw 对话 / WS 真流式 / 生图与积分路由红线）；
+  10. `qwenwork-provider`：千问办公（Device Flow + PKCE / MaaS 短票据）；
+  11. `workbuddy-token-usage`：统一 Token 用量统计与实时看板服务。
 - 非范围：CLIProxyAPI 核心服务本体；跨项目文件修改。
+- 已下线插件：`gemini-provider`（2026-10-11）、`doubao-provider` 与 `notion-provider`（2026-10-22，源码/测试/图标/registry/CI/专属文档与生产残留全部清空）。
 
 ## 项目概况
 
-- 状态：活跃维护中。9 大插件全景全量编译与单测验证全绿（cgo-shim 零错误）。已彻底废除并删除 Gemini 插件（因依赖庞大导致二进制膨胀翻倍、GCP Project 门槛过高、缺乏调度与管理面板）。最新发布/就绪版本：
+- 状态：活跃维护中。11 大插件全景（10 Provider + 1 用量统计）。**2026-10-22 下线 doubao-provider 与 notion-provider**（用户裁定移除），叠加此前的 Gemini 插件，两者源码与生产残留均已清空。本轮删除后抽验 workbuddy / coze / token-usage 三插件 cgo-shim build+vet 全绿；未做 11 插件全量回归。最新发布/就绪版本（本轮未发新版）：
   - `zcode-provider`: **0.1.31**（面板额度改为逐模型独立进度条（GLM-5.3 / GLM-5.3-Flash 各一条）并移除「过期」等冗余信息；0.1.30 面板额度改用 `billing/balance` 取真实已用/剩余 + 领取失败文案友好化；0.1.29 修复面板无感验证 captcha 配置缺陷；0.1.28 面板内无感验证领取 Start Plan + OAuth 默认中国区）
   - `cursor-provider`: **0.1.6**（修复 Query 参数反序列化丢失导致真实发现模型被屏蔽、建立点号模型别名归一化根治上游 not_found、测试弹窗支持实时搜索过滤与秒开交互）
   - `qoderwork-provider`: **0.9.44**（0.9.44 流式中途断流零泄漏换号重试 + 断流信封补 `http_status=502` + 冷却落盘失败可观测与内存兜底；0.9.40 重建上游 messages 时保留工具调用结构修复 agent 多轮往返工具结果失配对；0.9.38 签到节奏恢复每 4 小时六槽 + 移除冗余门控；0.9.37 tools 对齐修复；0.9.35 max_tokens 统一 32768 最低输出底线；0.9.34 上游 110 日调用上限 24 小时持久化冷却 + 路由/换号排除 + 面板解冷）
@@ -31,6 +34,14 @@
 - 当前时间：2026-10-17 (GMT+8)
 
 ## 活动会话进展摘要
+
+- 当前会话（2026-10-22）：**下线 doubao-provider 与 notion-provider（13 → 11 插件）**：
+  - 用户裁定「这两个插件可以从我们项目删除了」，并选择「仓库删 + 生产卸载」与「doc 历史文档一并删除」。
+  - **仓库侧删除面**：源码 `doubao/`（45）、`notion/`（39）、测试镜像 `test/doubao`（8）、`test/notion`（5）、`assets/icons/Doubao.png` + `Notion.png`、`doc/` 专属文档 27 份（需求 2 / 实施 2 / bug 1 / 测试 10 / 6-review 12）；`registry.json` 13 → 11、`.github/workflows/build.yml` 清理 8 处接入点、`.gitignore` 移除指向已删目录的 `doubao/.local_cookie.txt`；本地 `release-assets/` 中两个插件约 250MB 缓存与遗留 `doubao/.local_cookie.txt` 一并清除。
+  - **生产侧关键发现**：两个插件**早已**是 `configured:false / registered:false / enabled:false`——生效配置 `config.yaml` 的 8 个插件键里本就没有它们（历史 `DELETE /v8/management/plugins/<id>` 的后果），生产只剩 14 个 `.so`（doubao 3 + notion 11）与 2 个账号凭据目录占盘，`/accounts` 均 404。故本轮「卸载」实为清理磁盘残留：备份 `/root/plugin-removal-backup-20261022_223520` 后删除全部 `.so` 与 `doubao_accounts` / `notion_accounts`。
+  - **验证**：workbuddy / coze / token-usage 三插件 cgo-shim build+vet 全绿；11 个 CI 矩阵目录与 registry 条目一一对应且全部存在；全仓无 `doubao-provider` / `notion-provider` 硬引用残留（剩余命中全是 `doubao-seed-*` 模型名与历史文档中的对比引用）；生产插件列表 12 → 10 项、doubao/notion 完全消失且其余插件状态逐项未变，管理面 `plugins=200` / `config=200`、外网 `/v1/models=401`（正常鉴权），容器 `Up 3 days` 未重启。
+  - **提交**：`34f6aa9`（129 文件 = 126 删 + 3 改），已推送 main。
+  - **遗留待办**：① CI run `39796599752` 长时间 queued，未在本轮等到完成，需回查确认 11 插件测试矩阵全绿；② `README.md` 与 `项目设计.md` 的插件数表述仍是「9 个」（本轮之前就已滞后于实际 13 个），本轮未顺手改写，如需对齐当前 11 个应单独处理。
 
 - 当前会话（2026-10-21）：**coze 0.5.4：全池积分耗尽时快速失败，止血上游白打与错误风暴**：
   - 用户报障（附截图）：生成一张图刷出 9 条 `Failed to generate image`（20:11 / 21:12 各一批）。**与 0.5.3 的晚到附件问题无关**，是另一条独立缺陷。
@@ -81,13 +92,12 @@
   - **验证**：六/十插件 `cgo-shim-build.py` 全绿；gofmt 干净；`POLLUTION: PASS`。三处变异均精确捕获并还原：抖动改 0 → `唤醒时刻 = 08:00:00, want 08:01:30`；去掉信号量 → `峰值并发 = 20，超过上限 4`；`watchdogFirstTickDelay` 返回 0 → `首轮抖动 = 0s, want 90s`。
   - **未覆盖**：生产侧尖峰是否真被摊平需发布后观测；跨插件共享限流未做；coze `/accounts` 无上限扇出未修。
   - 文档：`doc/3-实施/2026-10-19_220000_定时刷新抖动与签到重试并发上限实施总览.md`（§3.4/§3.5 为本轮追加）。
-- 当前会话（2026-10-19）：**账号故障冷却基数 30s → 60s（10 插件全量，未发布生产）**：
-  - 用户需求：「统一的 30s 冷却递增改成 60s 开始递增 60s」，裁定为 **60s、120s、180s…线性递增、上限仍 10 分钟**，覆盖全部含该阶梯的插件。
-  - **实现**：9 插件 `failoverCooldownBase` 30s→60s（workbuddy / workbuddy-ai / traework / qoderwork / qoder-ai / qwenwork / copilot / zcode / doubao）；notion 改 `failoverDefaultBaseSeconds` 与 `defaultConfig().CooldownSeconds` 默认值 30→60（配置项保留，已显式配置的值优先）。公式不变（仍 `base × count`），`LadderCap` 由 `max/base` 自动从 20 档变 10 档。账号×模型双层冷却共用同一函数，两层同时生效。
-  - **验证**：10 插件 `cgo-shim-build.py` build+vet+test 全绿；全部改动文件 gofmt 干净；`POLLUTION: PASS`；变异验证（workbuddy 基数改回 30s）→ 4 个用例精确 FAIL 并打印 `= 30s, want 1m0s`，还原后全绿。
-  - **注意**：notion 生产若已显式写 `cooldown_seconds: 30`，该值继续生效；各插件 CHANGELOG 的历史记录不改写。
+- 当前会话（2026-10-19）：**账号故障冷却基数 30s → 60s（未发布生产）**：
+  - 用户需求：「统一的 30s 冷却递增改成 60s 开始递增 60s」，裁定为 **60s、120s、180s…线性递增、上限仍 10 分钟**。
+  - **实现**：各插件 `failoverCooldownBase` 30s→60s（已下线插件当时也在范围），`LadderCap` 由 `max/base` 自动从 20 档变 10 档；公式不变（仍 `base × count`），账号×模型双层冷却共用同一函数。
+  - **验证**：当轮 10 插件 cgo-shim build+vet+test 全绿；gofmt 干净；`POLLUTION: PASS`；变异验证（workbuddy 基数改回 30s）→ 4 个用例精确 FAIL 并打印 `= 30s, want 1m0s`，还原后全绿。
+  - **并发盘点（只读）**：积分刷新走 `refreshConcurrency=10` worker 池（6 插件）；签到/保活 sem=4；coze 续期并发 4；zcode 单 worker + 300ms；traework 自动签到与 qwenwork 对账串行。全仓无跨插件共享限流，4h 槽位整点对齐致整机峰值约 70–80 个上游请求同刻在场。
   - 文档：`doc/3-实施/2026-10-19_213000_账号冷却基数30s改60s实施总览.md`。
-  - **并发盘点（只读）**：积分刷新走 `refreshConcurrency=10` worker 池（6 插件）；签到/保活 sem=4；coze 续期并发 4；zcode 单 worker + 300ms；traework 自动签到与 qwenwork 对账串行；copilot/cursor/doubao/notion 无插件侧定时循环。全仓无跨插件共享限流，4h 槽位整点对齐致整机峰值约 70–80 个上游请求同刻在场。
 - 当前会话（2026-10-19）：**Qoder 系模型发现风暴与 OOM 修复 P0/P1/P2 本地实施（按约束未发布生产）**：
   - 放大器链：`callModelsAPI` 签名 body 与 GET 实际 body 不一致 → `Signature invalid` 恒 403（累计 5449 条、从未成功）→ 失败不写任何缓存 → 宿主每次 auth 重写触发 `model.for_auth` 逐账号全量重扫（实测 8409 条 N+1）。
   - P0 改 GET 真实携带与签名同源的 `qoderEncode("{}")`（方向由外部可工作实现 qoder2api-hub 裁定）；P1 补 `failedAt` 负缓存 5min 切断风暴；P2 在 `pickNextAuth` 单点收口 50ms 退避 + 错误体 `io.LimitReader` 截断。复核追加修复「先开窗再回退致回退成死路径」。
