@@ -23,7 +23,6 @@ tmp_ws_probe
 
 # local-only credentials & probe scratch (never committed)
 .local_cookie.txt
-doubao/.local_cookie.txt
 .tmp-cookie-copy/
 tmp_collect_cookie.py
 tmp_extract_cookie.py
