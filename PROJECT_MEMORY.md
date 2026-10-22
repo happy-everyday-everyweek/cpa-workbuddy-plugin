@@ -38,7 +38,7 @@
   **How to apply**：涉及 workbuddy 账号生命周期时不得再假设「Global 会被删」；新增相关逻辑须过 `TestNoAutomaticAccountDeletion`（扫生产源码禁止出现删号通道）与 `TestMinRoutableCredits_RegisteredAsConfigField`（配置项必须登记）。
 - **全插件账号路由统一口径 = 「硬排除三类 + 高积分优先 + 全灭 defer」（2026-10-13 安全缓冲红线起生效，覆盖 2026-10-11 的低积分优先口径）**：全插件（workbuddy、workbuddy-ai、traework、qoderwork、qwenwork、qoder-ai）账号调度内核与基线对齐：
   1. `scheduler.pick` 只让健康账号承载流量——「测试」`test_failed`、「冷却」failover cooldown、「低额/耗尽」三类**无条件硬排除且无任何回退**；
-  2. 候选全被排除时**全灭 defer（`Handled: false`）**交还宿主做跨 provider failover，禁止死锁在坏号上；
+  2. 候选全被排除时**全灭 defer（`Handled: false`）**交还宿主做跨 provider failover，禁止死锁在坏号上；**红线语义就此止步——这是用户 2026-10-23 明确确认并保留的设计，不是缺陷**：宿主收到 defer 后走 `conductor_selection.go` 的 `if !handled { selector.Pick(..., selectorAuths) }`，而 `selectorAuths` 来自 `availableAuthsForRouteModel`，**只判断宿主自己的可用性（禁用 / 账号冷却 / 账号×模型冷却），完全不摄入插件的积分红线**（积分是插件私有数据，宿主不可见）⇒ 当池里还有 ≥ 红线的号时低额号**完全不参与**（不是优先级最低，是无条件剔除）；当**全池都低于红线时，宿主内置调度器仍会在这些号里挑一个**。即「红线 = 插件选择性退出」，不是「硬闸门」；
   3. 安全缓冲红线 `min_routable_credits` 默认 **20**（不是 100，全仓从未出现过 100），可按插件配置覆盖；剩余积分低于红线即摘出路由池，`pickNextAuth` 换号链同样跳过；**workbuddy 自 0.17.1（2026-10-22）起默认值为 400**，旧值 20 低于单次推理实际消耗量级，等于红线失效；其余插件仍为 20；面板阈值改为消费 `/accounts` 下发的 `min_routable_credits`，不再自带硬编码副本；**该键自 workbuddy 0.18.0 起已登记进 `ConfigFields`（Integer），管理端可见可改**——此前只被 `configure()` 解析而未登记，配置文件里改了有实际效果但界面无处可改；
   4. 存活候选按缓存剩余积分**降序**排序（高积分优先，未测 -1 排最后），叠加 Round-Robin 平摊；面板选中项 = 「可用账号中积分最高者」；
   5. 统一判定：各插件导出 `accountRoutable(authID)`（`!cooling && !testFailed && 未低额`）与 `accountHigherCredits(left,right)`，被 `pickActiveAuth` / `ensureDefaultActiveAuth` / `pickSessionAuth` / `scheduler.pick` 共用；
