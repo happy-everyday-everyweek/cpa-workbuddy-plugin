@@ -37,8 +37,8 @@ func TestSchedulerPick_TestFailedFiltered(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)
 	resetFailover(t)
-	storeCredits(t, "wb-tagged", 30, 0, 30)
-	storeCredits(t, "wb-clean", 40, 0, 40)
+	storeCredits(t, "wb-tagged", healthyCredits(), 0, healthyCredits())
+	storeCredits(t, "wb-clean", healthyCredits(), 0, healthyCredits())
 	testFailedSetPut("wb-tagged")
 	setActiveAuthID("wb-tagged")
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
@@ -64,8 +64,8 @@ func TestSchedulerPick_AllTestFailed_Defers(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)
 	resetFailover(t)
-	storeCredits(t, "wb-a", 30, 0, 30)
-	storeCredits(t, "wb-b", 40, 0, 40)
+	storeCredits(t, "wb-a", healthyCredits(), 0, healthyCredits())
+	storeCredits(t, "wb-b", healthyCredits(), 0, healthyCredits())
 	testFailedSetPut("wb-a")
 	testFailedSetPut("wb-b")
 	setActiveAuthID("wb-b")
@@ -94,8 +94,8 @@ func TestSchedulerPick_LowCreditFirstAndUnknownLast(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)
 	resetFailover(t)
-	storeCredits(t, "wb-mid", 300, 0, 300)
-	storeCredits(t, "wb-low", 12, 288, 300)
+	storeCredits(t, "wb-mid", healthyCredits(), 0, healthyCredits())
+	storeCredits(t, "wb-low", lowCredits(), healthyCredits(), healthyCredits()+lowCredits())
 	accountCache.Store("wb-unknown", &accountCacheEntry{})
 	defer accountCache.Delete("wb-unknown")
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
@@ -110,9 +110,9 @@ func TestSchedulerPick_LowCreditFirstAndUnknownLast(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	resp := parsePickResponse(t, raw)
-	// wb-low (12 < 20) 低于安全红线被硬排除，wb-mid (300) 排在 wb-unknown (-1) 之前被选中
+	// wb-low 低于安全红线被硬排除，已测积分的 wb-mid 排在 wb-unknown (-1) 之前被选中
 	if !resp.Handled || resp.AuthID != "wb-mid" {
-		t.Fatalf("want healthy wb-mid routed (wb-low < 20 excluded), got %+v", resp)
+		t.Fatalf("want healthy wb-mid routed (wb-low below redline excluded), got %+v", resp)
 	}
 }
 
@@ -147,8 +147,8 @@ func TestSchedulerPick_RecoversAfterTagCleared(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)
 	resetFailover(t)
-	storeCredits(t, "wb-recovered", 20, 0, 20)
-	storeCredits(t, "wb-other", 90, 0, 90)
+	storeCredits(t, "wb-recovered", healthyCredits(), 0, healthyCredits())
+	storeCredits(t, "wb-other", healthyCredits()*2, 0, healthyCredits()*2)
 	testFailedSetPut("wb-recovered")
 	setActiveAuthID("wb-recovered")
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
@@ -214,9 +214,9 @@ func TestEnsureDefaultActiveAuth_SkipsTestFailed(t *testing.T) {
 	resetActiveAuth(t)
 	resetTestFailed(t)
 	resetFailover(t)
-	storeCredits(t, "a1", 10, 0, 300)
-	storeCredits(t, "a2", 500, 0, 500)
-	storeCredits(t, "a3", 300, 0, 300)
+	storeCredits(t, "a1", lowCredits(), 0, healthyCredits())
+	storeCredits(t, "a2", healthyCredits(), 0, healthyCredits())
+	storeCredits(t, "a3", healthyCredits(), 0, healthyCredits())
 	testFailedSetPut("a1")
 	testFailedSetPut("a2")
 	setActiveAuthID("a1")

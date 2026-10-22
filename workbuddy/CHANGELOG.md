@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.1
+
+### Fix - 安全缓冲额度红线默认值 20 → 400
+
+- 变更要点:
+  1. `min_routable_credits` 默认值由 20 提升到 400：剩余积分低于该值的账号视为残血，摘出路由池（调度初筛、请求内换号链、面板选中卡、会话粘性四类判据共用同一红线）。旧值 20 已低于单次推理实际消耗量级，一次长推理就能把刚过线的账号打到耗尽，等于红线没起作用。
+  2. 面板不再自带一份硬编码阈值：低额判定、徽标文案、统计分段全部改为消费 `/accounts` 新增的 `min_routable_credits` 字段，避免前后端各存一份副本导致口径漂移。
+  3. 阈值仍可通过配置 `min_routable_credits` 覆盖（显式 0 关闭低额保护），本次不写生产配置，走代码默认。
+  4. 测试改用相对红线的 `lowCredits()` / `healthyCredits()` 构造账号数据，并新增默认值锚定与 399/400 分界用例，锁定「严格小于」的比较方向。
+- 涉及文件: `policy.go` `panel.go` `panel.html` `min_routable_credits_test.go` `routing_exclusion_test.go` `scheduler_test.go` `VERSION` `main.go`
+
 ## 0.17.0
 
 ### Feat - 账号故障改为写盘禁用 + 每 10 分钟只探失败模型

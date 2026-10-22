@@ -325,6 +325,10 @@ const SECRET_SALT = "cli-proxy-api-webui::secure-storage";
 const PANEL_STORE = "cli-proxy-auth";
 const SS_KEY = "workbuddy-mgmt-key";
 
+// 低额保护阈值：由 /accounts 的 min_routable_credits 下发（后端 loadedMinRoutableCredits），
+// 面板不另存硬编码副本。首帧未拿到时保持 0，此时只依赖后端下发的 low_credits 标记。
+let minRoutableCredits=0;
+
 function _enc(t){return new TextEncoder().encode(t)}
 function _dec(b){return new TextDecoder().decode(b)}
 function _keyBytes(){try{return _enc(SECRET_SALT+"|"+window.location.host+"|"+navigator.userAgent)}catch(e){return _enc(SECRET_SALT)}}
@@ -436,7 +440,7 @@ function progressHTML(c, a){
     statSegments.push(`<span class="pb-segment" style="color:var(--warn)">失败禁用${a.failover_model?" · "+esc(a.failover_model):""}（10 分钟探活中）</span>`);
   }
   if(isAccountLowCredits(a)){
-    statSegments.push(`<span class="pb-segment" style="color:var(--warn)">低额保护(&lt;20)</span>`);
+    statSegments.push(`<span class="pb-segment" style="color:var(--warn)">低额保护(&lt;${minRoutableCredits})</span>`);
   }
   const statHTML=statSegments.join('');
   const primaryHTML=`<span class="pb-primary"><span class="pb-segment">可用积分</span>${statHTML}</span>`;
@@ -484,14 +488,15 @@ function isAccountExhausted(a){
   const size=Number(cr.total_size)||0;
   return used>0||size>0||(Array.isArray(cr.packages)&&cr.packages.length>0);
 }
-// 低额保护判定：剩余积分在 0~20 之间，不可承载新推理
+// 低额保护判定：剩余积分低于后端下发的安全红线即不可承载新推理。
 function isAccountLowCredits(a){
   if(!a || isAccountExhausted(a)) return false;
   if(a.low_credits) return true;
+  if(!minRoutableCredits) return false;
   const cr=a.credits;
   if(!cr) return false;
   const remain=Number(cr.total_remain)||0;
-  return remain>0 && remain<20;
+  return remain>=0 && remain<minRoutableCredits;
 }
 function card(a){
   const plan=(a.plan||"unknown").toLowerCase();
@@ -519,7 +524,7 @@ function card(a){
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
   const testFailedBadge=a.test_failed?`<span class="badge test-failed" title="定时活跃测试失败且仍有积分；建议人工复核后清理">测试</span>`:"";
   const lowCredits=isAccountLowCredits(a);
-  const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(20)，已暂停路由，防止推理中途断开">低额保护</span>`:"";
+  const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(${minRoutableCredits})，已暂停路由，防止推理中途断开">低额保护</span>`:"";
   const badges=testFailedBadge+(exhausted?`<span class="badge exhausted">耗尽</span>`:lowCreditsBadge)+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
   return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-test="${a.test_failed?"1":"0"}" data-low="${lowCredits?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled)?"1":"0"}">
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}<button type="button" class="card-del" data-action="delete" data-auth-index="${esc(a.auth_index)}" title="删除账号（需二次确认）" aria-label="删除账号">×</button></span></h2>
@@ -844,7 +849,7 @@ function renderSummary(accounts){
   let cnRemain=0, cnUsed=0, glRemain=0, glUsed=0;
   scoped.forEach(a=>{
     const c=creditOf(a);
-    // 不可用 = 「测试」标签 / 耗尽 / 低额保护（低于安全红线 20）
+    // 不可用 = 「测试」标签 / 耗尽 / 低额保护（低于后端下发的安全红线）
     const isExhausted=isAccountExhausted(a);
     const isLowCredits=isAccountLowCredits(a);
     const isUnavailable=!!a.test_failed||isExhausted||isLowCredits;
@@ -992,6 +997,7 @@ async function load(){
     }
     lastAccounts=accounts;
     activeAuthId=d.active_auth||"";
+    if(Number(d.min_routable_credits)>0) minRoutableCredits=Number(d.min_routable_credits);
     if(!accounts.length){
       g.innerHTML='<div class="loading">暂无 WorkBuddy 账号</div>';
       renderSummary([]);

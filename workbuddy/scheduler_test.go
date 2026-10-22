@@ -111,8 +111,8 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 // low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
 func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 	resetActiveAuth(t)
-	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 10, TotalUsed: 90, TotalSize: 100}})
-	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 500, TotalSize: 500}})
+	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: lowCredits(), TotalUsed: healthyCredits(), TotalSize: healthyCredits()}})
+	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: healthyCredits() * 2, TotalSize: healthyCredits() * 2}})
 	defer func() {
 		accountCache.Delete("wb-a")
 		accountCache.Delete("wb-b")
@@ -129,16 +129,16 @@ func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	resp := parsePickResponse(t, raw)
-	// wb-a (remain=10 < minRoutableCredits=20) 被低额安全红线硬排除，自动切换到健康的 wb-b (500)
+	// wb-a 低于 minRoutableCredits 被低额安全红线硬排除，自动切换到健康的 wb-b
 	if !resp.Handled || resp.AuthID != "wb-b" {
-		t.Fatalf("want low-credit account wb-a (<20) excluded and wb-b routed, got %+v", resp)
+		t.Fatalf("want low-credit account wb-a (below redline) excluded and wb-b routed, got %+v", resp)
 	}
 }
 
 func TestSchedulerPick_KeepsHealthyPanelSelection(t *testing.T) {
 	resetActiveAuth(t)
-	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 300, TotalSize: 300}})
-	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 500, TotalSize: 500}})
+	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: healthyCredits(), TotalSize: healthyCredits()}})
+	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: healthyCredits() * 2, TotalSize: healthyCredits() * 2}})
 	defer func() {
 		accountCache.Delete("wb-a")
 		accountCache.Delete("wb-b")
@@ -168,7 +168,7 @@ func TestSchedulerPick_StaysOnExhaustedSelection(t *testing.T) {
 		credits: &creditsSummary{TotalRemain: 0, TotalUsed: 500, TotalSize: 500},
 	})
 	accountCache.Store("wb-ok", &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
+		credits: &creditsSummary{TotalRemain: healthyCredits(), TotalUsed: 0, TotalSize: healthyCredits()},
 	})
 	defer func() {
 		accountCache.Delete("wb-exhausted")
@@ -231,7 +231,7 @@ func TestSchedulerPick_AllExhausted_Defers(t *testing.T) {
 func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 	resetActiveAuth(t)
 	accountCache.Store("wb-ok", &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
+		credits: &creditsSummary{TotalRemain: healthyCredits(), TotalUsed: 0, TotalSize: healthyCredits()},
 	})
 	defer accountCache.Delete("wb-ok")
 	// Selected auth is NOT in candidates (host disabled it) → should switch.
@@ -257,7 +257,7 @@ func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 func TestSchedulerPick_SkipsDisabledCandidates(t *testing.T) {
 	resetActiveAuth(t)
 	accountCache.Store("wb-live", &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: 50, TotalSize: 50},
+		credits: &creditsSummary{TotalRemain: healthyCredits(), TotalSize: healthyCredits()},
 	})
 	defer accountCache.Delete("wb-live")
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{

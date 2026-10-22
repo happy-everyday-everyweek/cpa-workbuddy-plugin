@@ -79,9 +79,10 @@ var hardCreditMarkers = []string{
 	"not enough credit",
 }
 
-// defaultMinRoutableCredits 是安全缓冲额度红线默认值（20 点）。
+// defaultMinRoutableCredits 是安全缓冲额度红线默认值（400 点）。
 // 剩余额度低于该阈值的账号不再承载新请求，防止推理中途断开。
-const defaultMinRoutableCredits int64 = 20
+// 最近修改时间：2026-10-22；改动原因：20 → 400，单次推理消耗量级已超过旧红线。
+const defaultMinRoutableCredits int64 = 400
 
 var (
 	minRoutableCredits   int64 = defaultMinRoutableCredits

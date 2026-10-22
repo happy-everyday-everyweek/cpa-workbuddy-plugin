@@ -266,7 +266,9 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		"lifecycle_auto": lifecycleEnabled(),
 		"schedule":       []string{"00:00", "04:00", "08:00", "12:00", "16:00", "20:00"},
 		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
-		"summary":        sum,
+		// 低额保护阈值由后端下发，避免面板另存一份硬编码副本与调度口径漂移。
+		"min_routable_credits": loadedMinRoutableCredits(),
+		"summary":              sum,
 	}
 	if len(life) > 0 {
 		resp["lifecycle"] = life
