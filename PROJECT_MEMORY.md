@@ -33,7 +33,7 @@
 - **全插件账号路由统一口径 = 「硬排除三类 + 高积分优先 + 全灭 defer」（2026-10-13 安全缓冲红线起生效，覆盖 2026-10-11 的低积分优先口径）**：全插件（workbuddy、workbuddy-ai、traework、qoderwork、qwenwork、qoder-ai）账号调度内核与基线对齐：
   1. `scheduler.pick` 只让健康账号承载流量——「测试」`test_failed`、「冷却」failover cooldown、「低额/耗尽」三类**无条件硬排除且无任何回退**；
   2. 候选全被排除时**全灭 defer（`Handled: false`）**交还宿主做跨 provider failover，禁止死锁在坏号上；
-  3. 安全缓冲红线 `min_routable_credits` 默认 **20**（不是 100，全仓从未出现过 100），可按插件配置覆盖；剩余积分低于红线即摘出路由池，`pickNextAuth` 换号链同样跳过；
+  3. 安全缓冲红线 `min_routable_credits` 默认 **20**（不是 100，全仓从未出现过 100），可按插件配置覆盖；剩余积分低于红线即摘出路由池，`pickNextAuth` 换号链同样跳过；**workbuddy 自 0.17.1（2026-10-22）起默认值为 400**，旧值 20 低于单次推理实际消耗量级，等于红线失效；其余插件仍为 20；面板阈值改为消费 `/accounts` 下发的 `min_routable_credits`，不再自带硬编码副本；
   4. 存活候选按缓存剩余积分**降序**排序（高积分优先，未测 -1 排最后），叠加 Round-Robin 平摊；面板选中项 = 「可用账号中积分最高者」；
   5. 统一判定：各插件导出 `accountRoutable(authID)`（`!cooling && !testFailed && 未低额`）与 `accountHigherCredits(left,right)`，被 `pickActiveAuth` / `ensureDefaultActiveAuth` / `pickSessionAuth` / `scheduler.pick` 共用；
   6. 换号重试 `pickNextAuth` 同样跳过测试标签与低额账号，但保持宿主顺序不排序；

@@ -35,6 +35,13 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-22）：**workbuddy-provider 0.17.1：低额红线默认 20 → 400 并已发生产**：
+  - 用户要求「低额改成 400，并且核验一下是否生效」。**改动**：`policy.go` `defaultMinRoutableCredits` 20→400；面板低额判定 / 徽标文案 / 统计分段三处硬编码 20 改为消费 `/accounts` 新增的 `min_routable_credits` 字段；测试改用相对红线的 `lowCredits()` / `healthyCredits()` 构造数据，新增默认值锚定与 399/400 分界用例（锁死严格 `<`）。
+  - **验证**：cgo-shim build+vet+test 全绿；三组变异——阈值回 20（2 用例 FAIL）、`<` 改 `<=`（边界用例 FAIL）均被捕获；第三组「删面板下发字段」首轮**存活**（`buildDashboardEx` 无 host seam，补测需改生产代码，按规则不补），改为前端 `minRoutableCredits=0` 时只依赖后端 `low_credits` 标记降级。
+  - **发布链**：`44979a0`(fix 9 文件) → CI `39800921287` success（cancel 冗余 push run `39800886763`）→ 6/6 assets sha256 OK → `c96d4c1`(registry 0.17.1) → 远端 raw ALL PASS 且无 0.17.0 残留。
+  - **生产验收（热重载零重启）**：`hot reloaded active_version=0.17.1 retired_version=0.17.0`；落盘 `.so` sha256 `913a1092…c74842` 与本地 zip 逐字节一致；`/accounts` 返回 `min_routable_credits=400`；刷新后 26 号中 21 个有积分数据，`remain=372` 判 `low_credits=true`（旧红线 20 下不会触发）、`remain=590` 仍可路由。按用户选择未在生产配置显式写该键，走代码默认。
+  - **待办**：其余插件（workbuddy-ai / traework / qoderwork / qwenwork / qoder-ai）红线仍为 20；如需统一到 400 需各自发版。
+
 - 当前会话（2026-10-22）：**下线 doubao-provider 与 notion-provider（13 → 11 插件）**：
   - 用户裁定「这两个插件可以从我们项目删除了」，并选择「仓库删 + 生产卸载」与「doc 历史文档一并删除」。
   - **仓库侧删除面**：源码 `doubao/`（45）、`notion/`（39）、测试镜像 `test/doubao`（8）、`test/notion`（5）、`assets/icons/Doubao.png` + `Notion.png`、`doc/` 专属文档 27 份（需求 2 / 实施 2 / bug 1 / 测试 10 / 6-review 12）；`registry.json` 13 → 11、`.github/workflows/build.yml` 清理 8 处接入点、`.gitignore` 移除指向已删目录的 `doubao/.local_cookie.txt`；本地 `release-assets/` 中两个插件约 250MB 缓存与遗留 `doubao/.local_cookie.txt` 一并清除。
@@ -65,15 +72,10 @@
   - 文档：`coze/CHANGELOG.md` 0.5.3 章节。
 
 - 当前会话（2026-10-20）：**coze 0.5.2 发布生产：新增积分路由红线（默认 100 分）**：
-  - 用户需求：「要补（低积分跳过路由），但是 coze 的积分消耗速度和其他的不一样，应该要改成 100」。
-  - **关键前提（宿主源码取证，决定方案形态）**：① `internal/pluginhost/scheduler.go:37` 的 `schedulerRecord()` 只返回排序后**第一个** scheduler 插件（全局单例），生产在任者 copilot-provider；coze 抢槽会顶掉 workbuddy 系调度内核；② 插件账号 auth 文件的 `priority` 不被读取（watcher 走 `PluginAuthParser`，只解析 `disabled`）；③ `model.for_auth` 只影响模型注册表。故**放弃声明 Scheduler**，改用**执行入口闸门**。
-  - **实现**：`coze/policy.go`（红线常量 100 + 缓存判定 + `creditsBelowRedlineError` 带 `StatusCode()=403`）、`coze/credit_loop.go`（后台积分刷新，默认 300s、并发 4、shutdown 停止、reconfigure 重排、刷新后 `publishCreditPool` 发布快照）、两个执行入口在 `parseStoredAuth` 后加闸门、面板 `low_credits` + 「低额保护」徽标；配置项 `min_routable_credits`（`*int64`，缺省保持 100、显式 0 关闭）与 `credit_refresh_interval_seconds`。
-  - **性能红线**：闸门只读内存快照 `creditPoolSnapshot`，**禁止**在请求路径调 `host.auth.list`（列目录 + 每账号读取的 RPC 扇出会拖慢首字）。此约束由 `TestVerifyAccountCreditsUsesMemorySnapshotOnly`（清空账号目录后仍须拦截）守护。
-  - **兜底语义**：仅当池里还有其他可用账号时才拦截；全池低额或积分未知时放行。
-  - **验证**：cgo-shim build+vet+test 全绿；新增 12 用例；**8 项变异反证全部精确 FAIL**（红线改回 20 / 去掉全池兜底 / 403 改 500 / 删入口闸门 / 闸门改回实时 RPC 扫描 / 删快照发布 / 去掉可用性过滤 / 未知积分当 0）。其中「删快照发布」与「未知积分当 0」首轮**存活**，据此补强用例后才捕获——证明初版用例只覆盖了判定函数、没覆盖真正的放行与更新路径。
-  - **发布链**：提交 `b46969c`（feat）+ `b07d209`（registry）→ CI run `39452488433` success → 6/6 assets ALL CHECKSUMS OK → 产物内嵌 `min_routable_credits`/`credit_refresh_interval_seconds`/`0.5.2` 探针命中、`0.5.1` 归零 → 远端 raw 200 且字节数一致 → 生产 `plugin-store install` 热重载（`active_version=0.5.2 retired_version=0.5.1`，**零容器重启**）→ 落盘 `.so` sha256 `1b13157e6549722aceac8d5a8744b385d6922ec3f40bc3e4619e06b7bed3663e` 与本地 zip 逐字节一致。
-  - **生产验收（request_id 86564019，2026-10-21 00:20:22）**：生产 5 个 coze 号中 4 个为 0 分、1 个 437 分。同一请求先被 `coze-1185dd0`（**10ms**）与 `coze-75c7448`（**2ms**）以 403「账号积分不足：剩余 0 分，低于路由红线 100 分，正在切换账号」拦截，**零上游消耗**，随后换到健康号成功返回 200；连续 3 次真实对话全部 200。面板 `low_credits` 正确标出 4 个 0 分号。
-  - **待办**：① 生产日志出现 `source=Ld@588588`（token-usage-tracker 把管理密钥当作 usage source 打印），属凭据回显违规，需在 token-usage-tracker 侧修复；② coze 的 `min_routable_credits` 目前未写入生产配置，走默认 100。
+  - 用户需求：「低积分跳过路由，但 coze 积分消耗速度不同，改成 100」。**方案裁定**：宿主 `schedulerRecord()` 只返回排序后第一个 scheduler 插件（全局单例，在任者 copilot-provider），coze 抢槽会顶掉 workbuddy 调度内核，且插件 auth 的 `priority` 不被读取 ⇒ 放弃声明 Scheduler，改**执行入口闸门**。
+  - **实现**：`coze/policy.go`（红线 100 + 缓存判定 + 403 `creditsBelowRedlineError`）、`coze/credit_loop.go`（后台刷新 300s、并发 4、发布 `creditPoolSnapshot`）、两个执行入口在 `parseStoredAuth` 后加闸门、面板 `low_credits` 徽标；配置项 `min_routable_credits`（`*int64`，缺省保持 100、显式 0 关闭）。闸门**只读内存快照**，禁止在请求路径调 `host.auth.list`（由 `TestVerifyAccountCreditsUsesMemorySnapshotOnly` 守护）。
+  - **验证**：cgo-shim 全绿；新增 12 用例；8 项变异全部精确 FAIL（其中「删快照发布」与「未知积分当 0」首轮存活，补强用例后捕获）。**发布链**：`b46969c` + registry `b07d209` → CI `39452488433` success → 6/6 assets OK → 生产热重载 `active_version=0.5.2`（零重启）→ `.so` sha256 `1b13157e…3663e` 与 zip 一致。
+  - **生产验收（request_id 86564019）**：5 个号中 4 个 0 分、1 个 437 分；0 分号 2–10ms 内 403 拦截零上游消耗，换健康号后连续 3 次 200；面板 `low_credits` 正确标出 4 个 0 分号。
   - 文档：`coze/CHANGELOG.md` 0.5.2 章节。
 
 - 当前会话（2026-10-19）：**coze 0.4.6 发布生产：64KB 内容超限不再拖垮账号池**：
