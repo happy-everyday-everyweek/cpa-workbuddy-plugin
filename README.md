@@ -1,16 +1,14 @@
 # cpa-workbuddy-plugin — CLIProxyAPI 插件集合
 
-[CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的 Go 原生插件集合，将主流 AI 服务与私有逆向协议封装为 **OpenAI / Anthropic 兼容 Provider**，供 CPA 网关统一调度。套件支持多账号运维管理、账号故障禁用与探活自愈、40x 同请求换号重试、会话粘性路由、动态模型发现与别名映射、流式长推理稳定性加固（首包即停与 liveBody 实时流）、每日自动签到与积分生命周期管理、额度领取与客户端指纹模拟，以及统一 Token 用量统计与实时看板。
+[CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的 Go 原生插件集合，将主流 AI 服务与私有逆向协议封装为 **OpenAI / Anthropic 兼容 Provider**，供 CPA 网关统一调度。套件支持多账号运维管理、账号故障写盘禁用与探活自愈、40x 同请求换号重试、会话粘性路由、动态模型发现与别名映射、流式长推理稳定性加固（首包即停与 liveBody 实时流）、每日自动签到与积分生命周期管理，以及统一 Token 用量统计与实时看板。
 
-每个插件采用独立模块、独立版本与独立 Release 生命周期管理。本文档重点说明以下六个插件：
+每个插件采用独立模块、独立版本与独立 Release 生命周期管理。本文档重点说明以下四个插件：
 
 | 插件 ID | 源码目录 | 服务商 / 目标服务 | 当前版本 |
 |---|---|---|:---:|
 | [`workbuddy-provider`](#workbuddy-provider--腾讯-codebuddy-provider) | [`workbuddy/`](workbuddy/) | 腾讯 CodeBuddy（CN + Global） | `v0.17.1` |
-| [`workbuddy-ai-provider`](#workbuddy-ai-provider--workbuddy-ai-国际版) | [`workbuddy-ai/`](workbuddy-ai/) | WorkBuddy AI 国际版（workbuddy.ai） | `v0.1.21` |
 | [`traework-provider`](#traework-provider--trae-solo-provider) | [`traework/`](traework/) | TRAE SOLO（字节跳动 AI IDE） | `v0.3.0` |
 | [`qoderwork-provider`](#qoderwork-provider--qoderwork-cn-provider) | [`qoderwork/`](qoderwork/) | QoderWork CN（qoder.com.cn） | `v0.10.0` |
-| [`zcode-provider`](#zcode-provider--zcode-provider) | [`zcode/`](zcode/) | ZCode（智谱 BigModel Coding Plan） | `v0.1.34` |
 | [`workbuddy-token-usage`](#workbuddy-token-usage--用量统计-dashboard) | [`token-usage-tracker/`](token-usage-tracker/) | 统一 Token 用量统计与实时看板 | `v0.2.8` |
 
 > 注：版本以 [registry.json](registry.json)（CPA 插件商店官方可直接安装版本）为准；源码目录内 `VERSION` 可能包含已开发完毕的更高版本。
@@ -52,35 +50,6 @@
 
 ---
 
-### workbuddy-ai-provider — WorkBuddy AI 国际版
-
-针对腾讯 CodeBuddy 独立国际版 `www.workbuddy.ai` 定制的专属 Provider：
-
-- **独立国际版端点** — 聊天走 `/v2/chat/completions`、模型目录走 `/v3/config`，端点硬编码不做多站点切换；凭据统一使用 `workbuddyai-` 前缀，与国内版 `workbuddy-` 账号互不混淆。
-- **面板授权登录** — 面板内置 `/login/start` → `/login/poll` 浏览器授权流程，state 有效期 5 分钟、面板每 2 秒轮询；登录成功即消费 state，支持凭据 JSON 导入导出。
-- **补注册与 Pro 试用** — CLI 授权的新账号 `areaInfoComplete=false`，插件在落盘前尽力补齐注册地、云账号并领取 `/billing/ide/trial`（250 积分 / 14 天）；已领过时上游返回 14051 记为已领取而非失败，任一步失败都不影响授权落盘。
-- **每日签到与 Token 保活** — 签到每 4 小时（00/04/08/12/16/20）触发并叠加 ≤5 分钟随机抖动；Token 保活共用同一六槽时刻表；watchdog 每 10 分钟刷新积分并发一次活跃 ping。
-- **调度与故障处置** — 健康候选按**高积分优先**排序；故障为纯内存阶梯冷却（60s 起、每档 +60s、上限 10 分钟），冷却到期前 20 秒开始每秒回放探活，不写盘 `disabled`；支持 `retry_on_4xx`（默认 10）与 1 小时会话粘性。
-- **模型发现** — 动态拉取上游模型目录 + 5 分钟缓存与失败负缓存；支持宿主 `oauth-model-alias` 与 `oauth-excluded-models` 治理。
-- **控制面板** — `/v0/resource/plugins/workbuddy-ai-provider/panel`：账号列表、积分与签到、批量操作、试用领取、补注册、模型列表与测试探活。
-- **用量 Feed** — 每次请求的 token 消耗异步追加至共享 feed。
-
----
-
-### zcode-provider — ZCode Provider
-
-将智谱 BigModel / Z.ai Coding Plan 封装为 CPA Provider，走 **Anthropic 兼容协议**：
-
-- **桌面客户端指纹模拟（Mimic）** — `internal/mimic/fingerprint.go` 的 `ApplyRequest` 统一注入 20 个请求头：既有 `Content-Type` / `anthropic-version` / `x-api-key` 协议头，也有 `X-ZCode-App-Version`、`X-Device-Mid`、`x-zcode-trace-id`、`x-zcode-agent`、`X-Platform`、`X-Os-Category`、`X-Client-Language` 等指纹头；配置项 `mimic.enabled` 默认开启，关闭时只发 `x-api-key`。
-- **双路由与 OAuth 登录** — 按账号套餐分流：`start-plan` 的 JWT 打 `zcode.z.ai/api/v1/zcode-plan/anthropic`，业务令牌打 `api.z.ai/api/anthropic`；支持 Z.ai 官方 OAuth（chat.z.ai / bigmodel.cn）与 Token / API Key 导入，凭据落 `~/.antigravity_cockpit/zcode_accounts/`。
-- **额度领取与按模型额度** — `POST /claim` 由 `/billing/preview` 动态解析 planId 并携带阿里云验证头领取额度；额度按模型（entitlement）分别展示进度，数据源主 `/billing/balance`、回退 `/billing/current`。
-- **调度与故障处置** — 候选池按**轮询**取号并过滤禁用、`test_failed`、冷却与过期套餐；故障为内存阶梯冷却（60s 起、每档 +60s、上限 10 分钟），冷却前 20 秒每秒回放探活；探活失败才写盘 `test_failed`。
-- **模型发现** — 动态拉取上游 `/v1/models`；支持宿主 `oauth-model-alias` 与 `oauth-excluded-models` 治理。
-- **控制面板** — `/v0/resource/plugins/zcode-provider/panel`：OAuth 授权、导入导出、批量启停、刷新额度、筛选排序、按模型测试探活、领取额度；主题与宿主 `data-theme` 同步。
-- **不做签到** — 本插件不支持每日签到；活跃探活只在额度刷新成功后触发，且同一账号 4 小时内最多一次，无常驻 watchdog。
-
----
-
 ### qoderwork-provider — QoderWork CN Provider
 
 基于对阿里通义灵码衍生国内版 QoderWork 桌面客户端的逆向工程封装：
@@ -101,7 +70,7 @@
 记录、统计并可视化跨插件各账户的真实 Token 消耗与费用：
 
 ```text
-各 Provider 插件（workbuddy / workbuddy-ai / traework / qoderwork / zcode 等）  workbuddy-token-usage 插件
+各 Provider 插件（workbuddy / traework / qoderwork 等）        workbuddy-token-usage 插件
 ┌───────────────────────────────────────────────┐   NDJSON   ┌─────────────────────────────────────┐
 │ 每次推理请求完成                               │ append ▶  │ 轮询读取（增量同步与断点续传）        │
 │ publishUsage / usage_feed 汇聚点 ─────────────┼──────────▶│ 导入自身专用数据库                  │
@@ -119,20 +88,19 @@
 
 ## 核心架构与工程规范
 
-以下规范适用于上述六个插件；个别条目的适用插件已就地标注。
+以下规范适用于上述四个插件（及其余同构 Provider 插件）：
 
 ### 1. 统一调度与账号健康隔离
 
 1. **硬排除不可用账号**：带 `test_failed` 标签、处于故障禁用（盘上 `disabled: true`）、或剩余积分低于 `min_routable_credits` 红线的账号，调度器无条件硬排除，绝不分配流量。
-2. **存活账号按积分排序**：workbuddy / workbuddy-ai / traework / qoderwork 按剩余积分降序取号（未测 -1 排最后），并在同一健康阶梯内平摊负载；zcode 采用轮询取号。
+2. **存活账号高积分优先**：健康候选按剩余积分降序排序（未测 -1 排最后），并在同一健康阶梯内平摊负载；面板默认选中「可用账号中积分最高者」。
 3. **全灭 Defer 跨 Provider 容灾**：当该 Provider 下所有账号均被排除时，执行全灭 defer（`Handled: false`），将请求交还 CPA 宿主调度其他 Provider，严禁死锁在故障 Provider 上。
 4. **会话粘性绑定**：开启 `session` 模式时，同一会话的后续请求绑定到同一账号；换号重试前主动解绑失效会话。
 
 ### 2. 账号故障处置与探活自愈
 
-- **失败双写（workbuddy / traework / qoderwork）**：一次上游失败同时写内存阶梯冷却（60s 起、线性递增、上限 10 分钟）与盘上 `disabled: true`；冷却只负责写盘生效前的毫秒窗口与写盘失败兜底。
-- **纯内存冷却（workbuddy-ai / zcode）**：不做故障写盘，只在内存里阶梯冷却（同样 60s 起、每档 +60s、上限 10 分钟），冷却结束前 20 秒开始每秒回放探活。
-- **只探失败模型**：每个账号的每个模型额度彼此独立，在别的模型上探通不能证明失败模型已恢复。workbuddy / traework / qoderwork 后台每 10 分钟串行探活，只回放当初失败的那一个模型；没有记录失败模型则跳过，保持禁用比盲目放回安全。
+- **失败双写**：一次上游失败同时写内存阶梯冷却（60s 起、线性递增、上限 10 分钟）与盘上 `disabled: true`；冷却只负责写盘生效前的毫秒窗口与写盘失败兜底。
+- **只探失败模型**：每个账号的每个模型额度彼此独立，在别的模型上探通不能证明失败模型已恢复。后台每 10 分钟串行探活，只回放当初失败的那一个模型；没有记录失败模型则跳过，保持禁用比盲目放回安全。
 - **刷新路径保留禁用态**：宿主挑刷新候选不看 `Disabled`，插件若在回传里固定 `disabled: false`，禁用中的号会被一次后台刷新静默解封、完全绕开探活，因此 token 刷新与保活路径必须原样带回 `disabled` 与本机制标记。
 
 ### 3. 流式终止与测试探活提速规范
@@ -153,10 +121,8 @@
 ```text
 cpa-workbuddy-plugin/
 ├── workbuddy/                  # 腾讯 CodeBuddy Provider（国内版与 Global 版）
-├── workbuddy-ai/               # WorkBuddy AI 国际版 Provider（补注册 / 试用 / 独立端点）
 ├── traework/                   # TRAE SOLO Provider（浏览器授权 / 签到防风控 / 流式加固）
 ├── qoderwork/                  # QoderWork CN Provider（COSY 签名 / 双登录 / 消除假成功）
-├── zcode/                      # ZCode Provider（Anthropic 兼容 / 客户端指纹 Mimic / 额度领取）
 ├── token-usage-tracker/        # 统一 Token 用量看板（共享 NDJSON / 明细表 / 维度分析）
 ├── registry.json               # 插件商店自定义源元数据（schema v2，direct install，包含 sha256 与 size）
 ├── release-assets/             # 本地资产缓存（.gitignore 忽略；二进制托管在 GitHub Release）
@@ -238,9 +204,6 @@ plugins:
     workbuddy-provider:
       enabled: true
       retry_on_4xx: 3
-    workbuddy-ai-provider:
-      enabled: true
-      retry_on_4xx: 10
     traework-provider:
       enabled: true
       scheduler_mode: "session"
@@ -248,11 +211,6 @@ plugins:
     qoderwork-provider:
       enabled: true
       retry_on_4xx: 3
-    zcode-provider:
-      enabled: true
-      base_url: "https://api.z.ai/api/anthropic"
-      mimic:
-        enabled: true
     workbuddy-token-usage:
       enabled: true
 ```
@@ -271,9 +229,7 @@ python scripts/cgo-shim-build.py traework
 
 # 验证其他插件
 python scripts/cgo-shim-build.py workbuddy
-python scripts/cgo-shim-build.py workbuddy-ai
 python scripts/cgo-shim-build.py qoderwork
-python scripts/cgo-shim-build.py zcode
 python scripts/cgo-shim-build.py token-usage-tracker
 
 # 校验 registry.json 格式与哈希合法性
