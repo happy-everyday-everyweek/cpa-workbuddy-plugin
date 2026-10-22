@@ -35,6 +35,15 @@
 
 ## 活动会话进展摘要
 
+- 当前会话（2026-10-23）：**workbuddy-ai 0.1.22 与 zcode 0.1.35 版本就绪并生产落盘（未启用）**：
+  - 用户先问「f961f2eb 会话的合并改动是否一起提交发布了」，查清：该会话产出 `121931d`（README 六插件说明，纯文档 +51/−7、父提交我的 `bde747d`），**已提交且已在远端 main**；但它同时合并进来的两处**代码修复从未发布过二进制**。
+  - **两处未发布修复**：① `5ab431d`（10-22 23:37，contributor Guichena）workbuddy-ai `backendHeaders` 补四个会话追踪头（`X-Conversation-ID`/`X-Conversation-Request-ID`/`X-Conversation-Message-ID`/`X-Root-Request-ID`，标准库 UUID v4，根请求 ID 与当前关联），修国际版部分账号持续 `400/11128` 渠道校验失败；② `00a7e88`（10-13）zcode 显式声明 `pluginSchemaVersion=6`，避免宿主把 OAuth URL 的 `&` 转成 `&amp;` 致 `response_type`/`redirect_uri`/`state` 丢失，**要求宿主 ≥ v7.2.155**。
+  - **发布前生产事实**：10 个插件只有 3 个真正启用（qoderwork / workbuddy / token-usage），workbuddy-ai 与 zcode 均 `registered=false enabled=false`，zcode 连 `configured=false`、磁盘只到 0.1.27（从未装 0.1.34）。用户选「只发版不启用」。
+  - **发布链**：`d879fb6`(版本就绪) → 各自 dispatch → workbuddy-ai CI `39812602344` 19/19 success；zcode 首个 run `39812612168` 的 **Release job 卡在 `actions/checkout@v4` 30+ 分钟**（18 个 Test/Build 已全 success）→ 取消重发 `39817830371` 19/19 success → 各 6/6 assets sha256 OK → 产物字节探针（workbuddy-ai `0.1.22`×2 / `0.1.21`×0，zcode `0.1.35`×2 / `0.1.34`×0）→ `de343c6`(registry 双插件) → 远端 12/12 sha+size ALL PASS、无旧版本残留。
+  - **生产部署（零容器重启）**：workbuddy-ai `hot reloaded active_version=0.1.22 retired_version=0.1.21`、落盘 sha256 `d4bb6d1b…ba2de5`；zcode `plugin loaded` + `plugin registered`（**证明宿主接受 schema 6**）、落盘 sha256 `eff83df4…cb0644`，两者均与本地 zip 逐字节一致。
+  - **踩坑（重要）**：`plugin-store install` 会**自动写 `plugins_enabled:true`**，即「install 必然启用」——与用户「只发版不启用」相悖。已用 `PUT /v0/management/plugins/<id>/config {"enabled":false}` 把两者改回停用；但中途误用 `DELETE /v0/management/plugins/workbuddy-ai-provider`（以为它是"禁用"）把该插件从配置中移除，随后重新 install 恢复。**最终状态**：workbuddy-ai 与 zcode 均 `enabled=false registered=false`，其余 8 个插件状态逐项未变，容器 Up 4 days 未重启；唯一与原始状态的差异是 zcode 的 `configured` 由 `false` 变 `true`（install 必留配置项，属预期）。
+  - **遗留待办**：① zcode 启用需宿主 ≥ v7.2.155（本次实测可加载 schema 6，未接流量验证）；② workbuddy-ai 启用前需确认账号迁移完成。
+
 - 当前会话（2026-10-23）：**workbuddy-provider 0.18.0：下线 Global 耗尽自动删号 + 低额红线登记为可配置项**：
   - 用户提出两点：「Global 账号耗尽自动删除凭据」删掉（理由：已有 workbuddy-ai 专做国际版）；「安全缓冲红线默认 400 点」改为「可以在配置文件配置修改」。
   - **第 1 点是行为而非文案**：`lifecycleActionFor` 的 `region=="global" → lifecycleDelete` 会由 `reconcileOneAccount` 物理删号。改为 CN/Global 一视同仁只写盘禁用；同时把恢复分支的 `region == "cn"` 前置条件去掉，否则 Global 一旦被禁用将永久无法自动恢复（这是改行为的隐藏陷阱）。`shouldReenableCN` 更名 `shouldReenable`。
@@ -89,22 +98,8 @@
   - **生产验收（request_id 86564019）**：5 个号中 4 个 0 分、1 个 437 分；0 分号 2–10ms 内 403 拦截零上游消耗，换健康号后连续 3 次 200；面板 `low_credits` 正确标出 4 个 0 分号。
   - 文档：`coze/CHANGELOG.md` 0.5.2 章节。
 
-- 当前会话（2026-10-19）：**coze 0.4.6 发布生产：64KB 内容超限不再拖垮账号池**：
-  - 用户报障：`doubao-seed-2-0-lite` 持续 `503 auth_unavailable ... last upstream error: 提交消息失败：数据库错误（code=1000003）`。
-  - **根因（直连上游二分实测）**：`message/chat` 的 content 有 **65535 字节硬上限**（65536 即失败），越界返回的是 `1000003 数据库错误` 而非参数错误。插件原样上抛，宿主因无状态码按 5xx 判定为账号级故障，依次冷却两个账号 → 此后所有请求 3–5ms 短路 503。**单次超长请求放大成整池故障**。
-  - **修复**：① 同步入口 `handleExecExecute` / `handleExecStream` 按 UTF-8 字节预检，超限返回 **413** 请求级错误，不触达上游；② `envelopeError` 补 `HTTPStatus`/`Retryable`，新增 `requestFaultEnvelope` 与 `writeExecutionError`，让宿主能识别请求级故障（跳过冷却与换号）；③ 其余上游错误（`1000521` 积分耗尽、`700012006` 会话失效）保持原账号级语义不变。
-  - **验证**：cgo-shim build+vet+test 全绿（新增 6 用例）；变异反证 3 次全部精确捕获（移除预检 / 413 改 500 / 信封丢状态码）。
-  - **发布链**：`af492ec`(fix 8 文件) → CI run `39262011655` success → assets 6/6 `ALL CHECKSUMS OK` → registry `ec51b56` → 远端 6/6 assets 200 → 生产 `plugin-store install?version=0.4.6` 返回 `restart_required:false`，`hot reloaded active_version=0.4.6 retired_version=0.4.5`（21:55:17），落盘 `.so` sha256 `5a8964e9…` 与本地 zip 逐字节一致，**零容器重启**。
-  - **生产行为验收**：70016 字节请求 **0.03s 返回 413**（修复前 5.8s / 500），随后三次正常短请求全部 200，账号池未被冷却。
-  - **踩坑**：生产生效配置是容器内 `/CLIProxyAPI/config.yaml`（明文 secret-key），**不是** MySQL spool 的 `/CLIProxyAPI/mysqlstore/mysqlstore/config/config.yaml`（后者 secret-key 为 bcrypt 哈希，用它认证必然 401）。
-  - 文档：`doc/4-bugs/2026-10-19_212000_coze超长内容触发池级冷却根因诊断.md`、`doc/6-review/2026-10-19_212500_Coze超长内容池级冷却修复_6-review.md`。
-- 当前会话（2026-10-19）：**定时任务并发治理三连（均未发布生产）**：
-  - **① 4h 槽位抖动 + traework 签到重试并发上限**：6 插件槽位循环改走 `next*FireTime(now)`，新增 `schedulerJitterMax = 5 * time.Minute` + 可注入 `schedulerJitterFn`（`math/rand/v2`）；纯函数 `nextCheckinTime` 保持无副作用，抖动只加在创建定时器那一步。traework `checkinRetryLoop` 原 `for { go processCheckinRetry(e) }` 无上限（全仓唯一无界点）→ 抽出 `runCheckinRetryRound()` + `checkinRetryConcurrency = 4` + `wg.Wait()`，并抽出注入缝 `processCheckinRetryFn`。
-  - **② 六个 watchdog 首轮抖动**：`watchdogFirstTickDelay()` 复用 `schedulerJitterFn`，插在 `waitHostReadyForWatchdog` 之后、drain 之前。只抖首轮（后续轮从各自上轮结束起算，相位不再对齐）；等待**不可被 tick 打断**——configure 在插件加载时即投递 tick，若提前结束等待会让六插件重新同刻对齐。等待期 tick 由 drain 丢弃，语义与原「等待期内丢弃 tick」一致。
-  - **③ 全仓定时任务并发复查（只读）**：唯一无上限扇出是 **coze `/accounts`**（每账号一 goroutine、无信号量、失败不写缓存，账号越多瞬时并发越大，建议补 `sem=4`）；其次为 zcode 每账号 `listAllAuthFiles()` 全量重扫（O(N²)，并发不高）与三份 workbuddy 面板每 10 分钟自动刷新与 watchdog 同周期叠加。
-  - **验证**：六/十插件 `cgo-shim-build.py` 全绿；gofmt 干净；`POLLUTION: PASS`。三处变异均精确捕获并还原：抖动改 0 → `唤醒时刻 = 08:00:00, want 08:01:30`；去掉信号量 → `峰值并发 = 20，超过上限 4`；`watchdogFirstTickDelay` 返回 0 → `首轮抖动 = 0s, want 90s`。
-  - **未覆盖**：生产侧尖峰是否真被摊平需发布后观测；跨插件共享限流未做；coze `/accounts` 无上限扇出未修。
-  - 文档：`doc/3-实施/2026-10-19_220000_定时刷新抖动与签到重试并发上限实施总览.md`（§3.4/§3.5 为本轮追加）。
+- 当前会话（2026-10-19）：**coze 0.4.6 发布生产：64KB 内容超限不再拖垮账号池**：`message/chat` 的 content 有 65535 字节硬上限，越界返回 `1000003 数据库错误`（无状态码）→ 宿主按 5xx 判账号级故障、依次冷却两号 → 单次超长请求放大成整池 503。修复：两个入口按 UTF-8 字节预检返回 **413** 请求级错误；`envelopeError` 补 `HTTPStatus`/`Retryable` 与 `requestFaultEnvelope`，宿主识别为请求级故障即跳过冷却与换号。验证 6 用例 + 3 次变异精确捕获；生产实测 70016 字节请求 **0.03s 返回 413**（修复前 5.8s/500）。**踩坑**：生产生效配置是容器内 `/CLIProxyAPI/config.yaml`（明文 secret-key），不是 MySQL spool 那份（bcrypt 哈希，用它认证必 401）。
+- 当前会话（2026-10-19）：**定时任务并发治理三连（均未发布生产）**：① 6 插件 4h 槽位改走 `next*FireTime(now)` + `schedulerJitterMax=5m` 可注入抖动；traework `checkinRetryLoop` 原无界 goroutine → 收敛为 `runCheckinRetryRound()` + 并发 4；② 六个 watchdog 首轮加抖动（插在 `waitHostReadyForWatchdog` 之后，等待不可被 tick 打断，否则重新同刻对齐）；③ 只读复查发现唯一无上限扇出是 coze `/accounts`（建议补 `sem=4`，未修）。验证：全插件 cgo-shim 全绿、三处变异精确捕获。
 - 当前会话（2026-10-19）：**账号故障冷却基数 30s → 60s（未发布生产）**：
   - 用户需求：「统一的 30s 冷却递增改成 60s 开始递增 60s」，裁定为 **60s、120s、180s…线性递增、上限仍 10 分钟**。
   - **实现**：各插件 `failoverCooldownBase` 30s→60s（已下线插件当时也在范围），`LadderCap` 由 `max/base` 自动从 20 档变 10 档；公式不变（仍 `base × count`），账号×模型双层冷却共用同一函数。
