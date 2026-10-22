@@ -1,5 +1,17 @@
 # WorkBuddy AI Plugin Changelog
 
+## 0.1.22
+
+### Fix - 补齐会话追踪头，修复国际版部分账号 11128
+
+- 变更要点:
+  1. 现象：国际版部分账号聊天返回 `HTTP 400 / code 11128`（request illegal，未通过渠道校验），同一出口与同一模型下只有部分账号持续失败。
+  2. 根因：`backendHeaders` 缺少上游渠道校验所要求的会话追踪头，请求被判为非法来源。
+  3. 修复：在 `backendHeaders` 统一补齐 `X-Conversation-ID`、`X-Conversation-Request-ID`、`X-Conversation-Message-ID`、`X-Root-Request-ID` 四个头；用标准库生成 UUID v4，根请求 ID 与当前请求 ID 关联。普通聊天、流式、换号重试与主动探活共用该入口，不新增依赖，不改 UA / 模型 / 提示词 / 账号配置。
+  4. 边界说明：本修复针对已复现的渠道校验失败，不把所有 11128 归为同一原因（账号级 11128 仍走既有账号×模型冷却）。
+  5. 新增回归用例校验四个头存在、UUID v4 格式与跨请求唯一性。
+- 涉及文件: `main.go` `conversation_headers_test.go` `VERSION`
+
 ## 0.1.21
 
 ### Fix - 11128 模型级拦截并入账号×模型冷却，移除独立熔断

@@ -1,9 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## 0.1.35
 
-### Fixed
-- 使用 schema 6 的原始管理 JSON 响应契约，避免官方 OAuth 授权链接的 `&` 被宿主转成 `&amp;`，导致 `response_type`、`redirect_uri`、`state` 参数缺失；需要支持 schema 6 的 CPA 宿主。
+### Fix - 保留 OAuth 授权链接原始查询参数
+
+- 变更要点:
+  1. 现象：点击面板「激活开通」后，ZCode 官方授权页提示 `response_type`、`redirect_uri`、`state` 三个查询参数缺失。
+  2. 根因：插件固定依赖的 v7 SDK 将 `pluginabi.SchemaVersion` 定义为 3，而 CPA 对 schema < 6 的插件管理 JSON 会做 HTML 实体转义，`authorize_url` 的 `&` 变成 `&amp;`，浏览器把参数名解析成 `amp;redirect_uri` 等。
+  3. 修复：ZCode 显式声明 `pluginSchemaVersion = 6`，让管理接口返回原始授权 URL；面板继续用 `esc()` / `textContent` 在显示边界处理文本，不依赖宿主转义。
+  4. **兼容性**：需要支持 schema 6 的 CPA 宿主（v7.2.155 起）；旧宿主会拒绝加载本插件。
+  5. 测试：`main_test` 断言 `reg.SchemaVersion >= 6`（改回 3 时精确失败）；`management_test` 用含百分号编码回调地址的完整授权链接，断言 JSON 往返不改分隔符并覆盖四个参数；`test/zcode/panel_raw_json_repro.mjs` 执行真实面板脚本校验转义与参数保留。
+- 涉及文件: `main.go` `main_test.go` `management_test.go` `README.md` `VERSION`
 
 ## 0.1.34
 
