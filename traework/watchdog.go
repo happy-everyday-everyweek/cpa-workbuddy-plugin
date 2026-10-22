@@ -193,6 +193,6 @@ func watchdogLoop() {
 
 func init() {
 	go watchdogLoop()
-	// 冷却前探活需要 5s 粒度，与 watchdog 的 10 分钟节拍分开跑。
-	go cooldownProbeLoop()
+	// 禁用探活自带 10 分钟固定周期与不重叠保护，与 watchdog 的巡检节拍分开跑。
+	go failoverProbeLoop()
 }

@@ -211,6 +211,14 @@ func handleAccounts() map[string]any {
 			Disabled:   phys.Disabled || f.Disabled,
 			TestFailed: isTestFailed(f.ID),
 		}
+		// 禁用原因读盘：本机制的内存集合在插件热重载后为空，只靠它会让盘上仍
+		// disabled 的号在面板里分不清是「探活中」还是人工禁用。只在盘上确实
+		// disabled 时才认这个标记——宿主 UI 手工启用会把 disabled 改回 false
+		// 但保留自定义元数据，此时不该显示禁用徽章。
+		if doc := parseFailoverAuthDoc(phys.JSON); doc.failoverDisable && doc.disabled {
+			view.FailoverDisabled = true
+			view.FailoverModel = doc.failoverModel
+		}
 		// Cumulative success/failed counters (plugin-owned, survive restart).
 		if strings.TrimSpace(a.UserID) != "" {
 			ensureCounterLoaded(a.UserID, phys.JSON)
@@ -239,6 +247,12 @@ func handleAccounts() map[string]any {
 			if view.CoolingDown {
 				view.CooldownUntil = until.Unix()
 			}
+		}
+		// 禁用侧补漏：行构建读到的物理文件可能早于本次禁用落盘（写盘到 watcher
+		// 生效的毫秒级窗口），此时盘上还没有标记但内存已登记，仍要显示「禁用探活中」。
+		if !view.FailoverDisabled && isFailoverDisabledLocal(f.ID) {
+			view.FailoverDisabled = true
+			view.FailoverModel = failoverProbeModelFor(f.ID)
 		}
 		view.CheckinToday = checkinDoneToday(f.AuthIndex)
 		view.Active = strings.TrimSpace(f.ID) == getActiveAuthID()

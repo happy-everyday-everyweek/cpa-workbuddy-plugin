@@ -111,8 +111,12 @@ type traeAccountView struct {
 	CoolingDown   bool         `json:"cooling_down"`
 	FailCount     int          `json:"fail_count"`
 	CooldownUntil int64        `json:"cool_until,omitempty"`
-	Active        bool         `json:"active"`
-	Error         string       `json:"error,omitempty"`
+	// 双写下的禁用侧：盘上的 failover_disable 标记才是恢复的唯一通道，冷却到期
+	// 不会让账号回来，所以面板必须把它和冷却分开显示。
+	FailoverDisabled bool   `json:"failover_disabled,omitempty"`
+	FailoverModel    string `json:"failover_model,omitempty"` // 探活回放的模型（唯一目标）
+	Active           bool   `json:"active"`
+	Error            string `json:"error,omitempty"`
 }
 
 // ensureDefaultActiveAuth keeps the panel selection consistent with routing

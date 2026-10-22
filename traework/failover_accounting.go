@@ -47,7 +47,7 @@ func noteForcedAccountFailure(authID string, body string) bool {
 }
 
 // noteForcedAccountFailureForModel 是带模型维度的强制记账入口。
-// 伪完成归账号级冷却，但会把失败模型写入 lastModel，供冷却前探活回放。
+// 伪完成归账号级冷却，但会把失败模型写入 lastModel，供禁用探活回放。
 // [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；body：失败原因文本。
 // [返回] true 表示失败已计入。
 // 最近修改时间：2026-10-19 01:20:00；改动原因：新增，让伪完成冷却也能被探活覆盖。

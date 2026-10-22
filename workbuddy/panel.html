@@ -62,7 +62,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .card.selected{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-ring)}
 .card h2{font-size:15px;margin:0 0 2px;display:flex;justify-content:space-between;align-items:center}
 .uid{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:12px}
-.growth-line{color:var(--mut);font-size:11px;line-height:1.5;word-break:break-word;margin-top:-6px;margin-bottom:12px;min-height:16px}
+
 .badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border)}
 .badge.exhausted{background:var(--err-soft);color:var(--err);border:1px solid var(--err-border)}
 .badge.low-credits{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-border)}
@@ -248,7 +248,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     <button type="button" class="ftag active" data-region="all" onclick="filterRegion('all',this)">全部 <span class="cnt" id="cntAll">0</span></button>
     <button type="button" class="ftag" data-region="available" onclick="filterRegion('available',this)" title="未耗尽 · 未打「测试」标签，可用积分能正常路由">可用 <span class="cnt" id="cntAvailable">0</span></button>
     <button type="button" class="ftag" data-region="exhausted" onclick="filterRegion('exhausted',this)">耗尽 <span class="cnt" id="cntExhausted">0</span></button>
-    <button type="button" class="ftag" data-region="failed" onclick="filterRegion('failed',this)" title="累计失败 > 0 或连败中（fail_count > 0）的账号；卡片上的「失败/连败/冷却」段即数据来源">失败 <span class="cnt" id="cntFailed">0</span></button>
+    <button type="button" class="ftag" data-region="failed" onclick="filterRegion('failed',this)" title="累计失败 > 0、连败中（fail_count > 0）或被失败禁用的账号；卡片上的「失败/连败/冷却/失败禁用」段即数据来源">失败 <span class="cnt" id="cntFailed">0</span></button>
     <button type="button" class="ftag" data-region="test" onclick="filterRegion('test',this)" title="定时活跃测试失败且仍有积分的账号；建议人工复核后清理">测试 <span class="cnt" id="cntTest">0</span></button>
   </div>
   <div class="summary card" id="summaryBox" style="display:none"></div>
@@ -430,6 +430,11 @@ function progressHTML(c, a){
       statSegments.push(`<span class="pb-segment cooling-text" data-cool-until="${Number(a.cool_until)||0}" data-cool-count="${Number(a.fail_count)||0}">冷却 ${Math.max(0,(Number(a.cool_until)||0)-Math.floor(Date.now()/1000))}s</span>`);
     }
   }
+  // 双写下的禁用侧才是恢复通道：冷却到期不会让号回来，只有 10 分钟探活探通才解除。
+  // 所以两个段同时显示，避免用户把冷却倒计时误读成「多少秒后自动恢复」。
+  if(a&&a.failover_disabled){
+    statSegments.push(`<span class="pb-segment" style="color:var(--warn)">失败禁用${a.failover_model?" · "+esc(a.failover_model):""}（10 分钟探活中）</span>`);
+  }
   if(isAccountLowCredits(a)){
     statSegments.push(`<span class="pb-segment" style="color:var(--warn)">低额保护(&lt;20)</span>`);
   }
@@ -452,7 +457,6 @@ function bindCardActions(root){
       const act=ev.currentTarget.dataset.action;
       const idx=ev.currentTarget.dataset.authIndex;
       if(act==="checkin") checkin(idx, ev.currentTarget);
-      else if(act==="growth") growthOne(idx, ev.currentTarget);
       else if(act==="claim") claimTrial(idx, ev.currentTarget);
       else if(act==="select") selectAuth(idx, ev.currentTarget);
       else if(act==="refresh") refreshCredits(idx, ev.currentTarget);
@@ -510,23 +514,20 @@ function card(a){
     const btnClass=checked?"done":"sec";
     const btnText=checked?"已签到":"签到";
     const btnDisabled=checked?" disabled=\"disabled\"":"";
-    // 成长中心（CN 独有）：一键执行旅行/任务/补登/兑换/抽奖/盲盒全部领奖段。
-    const growthBtn=`<button class="sec" data-action="growth" data-auth-index="${esc(a.auth_index)}" title="执行成长中心自动领奖（旅行/任务/补登/兑换/抽奖/盲盒）">成长中心</button>`;
-    actionHTML=`<button class="${btnClass}" data-action="checkin" data-auth-index="${esc(a.auth_index)}"${btnDisabled}>${btnText}</button>`+growthBtn;
+    actionHTML=`<button class="${btnClass}" data-action="checkin" data-auth-index="${esc(a.auth_index)}"${btnDisabled}>${btnText}</button>`;
   }
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
   const testFailedBadge=a.test_failed?`<span class="badge test-failed" title="定时活跃测试失败且仍有积分；建议人工复核后清理">测试</span>`:"";
   const lowCredits=isAccountLowCredits(a);
   const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(20)，已暂停路由，防止推理中途断开">低额保护</span>`:"";
   const badges=testFailedBadge+(exhausted?`<span class="badge exhausted">耗尽</span>`:lowCreditsBadge)+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
-  return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-test="${a.test_failed?"1":"0"}" data-low="${lowCredits?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0)?"1":"0"}">
+  return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-test="${a.test_failed?"1":"0"}" data-low="${lowCredits?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled)?"1":"0"}">
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}<button type="button" class="card-del" data-action="delete" data-auth-index="${esc(a.auth_index)}" title="删除账号（需二次确认）" aria-label="删除账号">×</button></span></h2>
   <div class="uid">${esc(a.uid||"")} · ${esc(a.name||"")}</div>
   ${a.created_at?`<div class="uid">创建 ${esc(fmtCST(a.created_at))}</div>`:''}
   ${progressHTML(cr,a)}
   ${a.error?`<div class="row"><span class="k">错误</span><span class="v err">${esc(a.error)}</span></div>`:""}
   <div class="actions">${refreshBtn}${actionHTML}<button class="sec" data-action="test" data-auth-index="${esc(a.auth_index)}" title="测试账号活跃并发送一次推理请求">测试</button></div>
-  <div class="growth-line" data-growth-summary="${esc(a.auth_index)}"></div>
   </div>`;
 }
 // 冷却倒计时：每秒刷新积分首行中的冷却剩余秒数。
@@ -776,8 +777,8 @@ function updateFilterCounts(accounts){
     if((a.region||"cn")==="global") gl++; else cn++;
     if(isAccountExhausted(a)) ex++;
     if(a.test_failed) test++;
-    // 失败 = 累计失败 > 0 或连败中（fail_count > 0）
-    if((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0) fail++;
+    // 失败 = 累计失败 > 0 / 连败中（fail_count > 0）/ 被失败禁用（盘上标记，重启后仍在）
+    if((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled) fail++;
     // 可用 = 未打「测试」标签 / 未耗尽 / 未低额保护
     const isUnavailable=!!a.test_failed||isAccountExhausted(a)||isAccountLowCredits(a);
     if(!isUnavailable) ava++;
@@ -810,7 +811,7 @@ function accountsForFilter(accounts){
     return list.filter(a=>!!a.test_failed);
   }
   if(currentFilter==="failed"){
-    return list.filter(a=>(Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0);
+    return list.filter(a=>(Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled);
   }
   return list.filter(a=>(a.region||"cn")===currentFilter);
 }
@@ -1082,48 +1083,6 @@ async function checkin(idx, btn){
     await load();
   }catch(e){
     toast("签到请求失败","err",e.message);
-    busy(btn,false);
-  }
-}
-// 成长中心：一键执行该账号的成长中心领奖，并把摘要写入卡片摘要行。
-async function growthOne(idx, btn){
-  busy(btn,true);
-  const line=document.querySelector(`[data-growth-summary="${CSS.escape(idx)}"]`);
-  try{
-    const d=await api("/growth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({auth_index:idx})});
-    if(d.error){
-      toast("成长中心失败","err",d.error);
-      if(line)line.textContent="成长中心：失败";
-      busy(btn,false);
-      return;
-    }
-    const res=(d.results||[])[0]||{};
-    const credits=Number(res.credits_gained)||0;
-    const energy=Number(res.energy_gained)||0;
-    const balance=Number(res.energy_balance)||0;
-    const tasks=(Number(res.tasks_accepted)||0)+(Number(res.tasks_claimed)||0);
-    const errs=(res.errors||[]);
-    let text;
-    if(credits||energy||tasks){
-      text=`+${credits} 积分 / +${energy} 能量 / ${tasks} 任务`;
-    }else if(errs.length){
-      // 有失败原因时不得显示「今日已领完」，否则用户误以为无任务可做（0.16.3）
-      text=`${errs.length} 项失败`;
-    }else{
-      text="今日已领完";
-    }
-    if(balance)text+=`（能量余额 ${balance}）`;
-    if(line)line.textContent="成长中心："+text;
-    if(errs.length){
-      toast("成长中心部分失败","warn",errs.join("; "));
-    }else{
-      toast("成长中心完成","ok",text);
-    }
-    await load();
-  }catch(e){
-    toast("成长中心失败","err",e.message||String(e));
-    if(line)line.textContent="成长中心：失败";
-  }finally{
     busy(btn,false);
   }
 }

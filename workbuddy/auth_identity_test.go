@@ -22,7 +22,7 @@ func sampleNestedAuthJSON(uid string) []byte {
     "expiresAt": 9999999999
   },
   "account": {
-    "uid": "` + uid + `",
+    "uid": "`+uid+`",
     "nickname": "nick"
   }
 }`, providerName))
@@ -117,12 +117,15 @@ func TestToAuthDataForRefresh_EmptyFileNameAndID(t *testing.T) {
 		Auth:    storedTokens{AccessToken: "a", RefreshToken: "r", Domain: "www.codebuddy.cn"},
 		Account: storedAccount{UID: "u-1", Nickname: "n"},
 	}
-	ad := toAuthDataForRefresh(sa)
+	ad := toAuthDataForRefresh(sa, nil)
 	if ad.FileName != "" {
 		t.Fatalf("FileName=%q want empty", ad.FileName)
 	}
 	if ad.ID != "" {
 		t.Fatalf("ID=%q want empty", ad.ID)
+	}
+	if ad.Disabled {
+		t.Fatal("宿主元数据缺省时刷新不得引入禁用状态")
 	}
 	// Storage still carries uid for runtime use
 	var nested map[string]any

@@ -115,6 +115,11 @@ func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, r
 	if err == nil && manualDisableFromAuthJSON(phys.JSON) {
 		merged["manual_disable"] = true
 	}
+	// 本机制写的失败禁用标记必须原样搬运：buildAuthFileJSON 是白名单重建，
+	// 不搬运就会把 failover_disable 抹掉，探活循环从此找不到该账号（静默遗忘）。
+	if err == nil && phys != nil {
+		merged = putFailoverMarkersIntoExtra(merged, phys.JSON)
+	}
 	// Determine whether this is a manual toggle or an auto-lifecycle call.
 	// Manual toggle (extra contains manual_disable:true) writes disabled:true
 	// with the intent marker. The auto exhaustion path (policy update
@@ -275,6 +280,7 @@ func deleteAuth(authIndex, authID string, sa *storedAuth) error {
 		if exhaustedDisableFromAuthJSON(phys.JSON) {
 			extra["exhausted_disable"] = true
 		}
+		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
 		raw, berr := buildAuthFileJSON(sa, existingDisabled, note, extra)
 		if berr != nil {
 			return fmt.Errorf("no path and build failed: %w", berr)
@@ -391,6 +397,7 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 		if exhaustedDisableFromAuthJSON(phys.JSON) {
 			extra["exhausted_disable"] = true
 		}
+		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
 	}
 	if lifecycleStateUnchanged(authID, disabled, note) {
 		return nil

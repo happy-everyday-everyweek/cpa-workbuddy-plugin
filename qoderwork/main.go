@@ -151,6 +151,8 @@ func init() {
 	// host bridge + auth discovery before its first tick (see watchdog.go).
 	// 同步自 workbuddy-provider。
 	go preserveWatchdogLoop()
+	// 禁用探活与 watchdog 分频：固定 10 分钟一轮，只探已知坏号。
+	startFailoverProbe()
 }
 
 func main() {}
@@ -346,7 +348,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.49"
+var version = "0.10.0"
 
 func wbRegistration() registration {
 	return registration{
@@ -658,11 +660,14 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	// By leaving ID empty, CPA falls back to authIDForPath(path) which
 	// derives ID from the file path → always matches the watcher's key.
 	// FileName is also echoed back to avoid rename-based duplicates.
-	ad := toAuthDataOpts(sa, nil, false)
+	ad := toAuthDataOpts(sa, nil, parseDisabledFromAuthJSON(req.RawJSON))
 	ad.ID = "" // let host compute from path (prevents ID mismatch dupes)
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
 	}
+	// 盘上本机制的顶层键必须随这次回传一起交回宿主：宿主吸收文件后，会用我们
+	// 给出的 StorageJSON + Metadata 反向重建物理文档，不回传就抹掉标记。
+	carryFailoverKeysIntoMetadata(ad.Metadata, req.RawJSON)
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
 		Auth:    ad,
@@ -855,13 +860,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// the historical accounting path: note the failure on the LAST
 		// account actually contacted and propagate the error.
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, completionErr.Error(), reasoningEffort, 0, accountLabel, sessionKey)
-		reconcileAfterExecutorError(usedAuthID, statusCode, completionErr.Error())
+		reconcileAfterExecutorErrorForModel(usedAuthID, upstreamModel, statusCode, completionErr.Error())
 		if statusCode == 0 {
-			noteAccountFailure(usedAuthID, 0, completionErr.Error())
+			noteAccountFailureForModel(usedAuthID, upstreamModel, 0, completionErr.Error())
 		} else if statusCode == 200 {
 			// SSE error frame on HTTP 200: remap to 403 so isAccountFailure
 			// correctly triggers the laddered failover cooldown.
-			noteAccountFailure(usedAuthID, http.StatusForbidden, completionErr.Error())
+			noteAccountFailureForModel(usedAuthID, upstreamModel, http.StatusForbidden, completionErr.Error())
 		}
 		return nil, completionErr
 	}
@@ -901,7 +906,7 @@ func doExecuteOnceQoder(encodedBody string, sa *storedAuth, upstreamModel, reque
 	if statusCode >= 400 {
 		payload := readAllUpstreamErr(reader)
 		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, payload)
+			go reconcileByUIDForModel(sa.Account.UID, upstreamModel, statusCode, payload)
 		}
 		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(payload, 200))
 	}
@@ -986,11 +991,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			// internally and applies the hard-credit lifecycle when relevant).
 			// statusCode=200 → SSE error frame, must trigger failover cooldown.
 			if statusCode == 0 {
-				noteAccountFailure(req.AuthID, 0, errCollect.Error())
+				noteAccountFailureForModel(req.AuthID, upstreamModel, 0, errCollect.Error())
 			} else if statusCode < 400 {
-				noteAccountFailure(req.AuthID, http.StatusForbidden, errCollect.Error())
+				noteAccountFailureForModel(req.AuthID, upstreamModel, http.StatusForbidden, errCollect.Error())
 			} else {
-				reconcileAfterExecutorError(req.AuthID, statusCode, errCollect.Error())
+				reconcileAfterExecutorErrorForModel(req.AuthID, upstreamModel, statusCode, errCollect.Error())
 			}
 			return nil, errCollect
 		}

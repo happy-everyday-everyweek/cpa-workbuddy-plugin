@@ -568,6 +568,7 @@ function card(a){
   const badges=[];
   if(a.active)badges.push(tag("active","活跃"));
   if(a.disabled)badges.push(tag("disabled","停用"));
+  if(a.failover_disabled)badges.push(tag("test-failed","禁用探活中"));
   if(a.exhausted)badges.push(tag("exhausted","耗尽"));
   else if(a.low_credits)badges.push(tag("low-credits","低额保护"));
   if(a.test_failed)badges.push(tag("test-failed","测试"));
@@ -649,7 +650,7 @@ function applyCardVisibility(){
     let show=(currentFilter==="all"||c.dataset.f===currentFilter);
     if(currentFilter==="failed"){
       const a=(lastAccounts||[]).find(x=>x.auth_index===c.dataset.auth);
-      show=!!(a&&((Number(a.failed_count)||0)>0||(Number(a.fail_count)||0)>0));
+      show=!!(a&&((Number(a.failed_count)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled));
     }
     if(show&&currentSearch){
       const hay=((c.dataset.nickname||"")+" "+(c.dataset.label||"")+" "+(c.dataset.name||"")+" "+(c.dataset.uid||"")).toLowerCase();
@@ -681,7 +682,7 @@ function updateFilterCounts(accounts){
     else if(a.exhausted)cnt.exhausted++;
     else if(a.low_credits){} // 低额保护不计入可用
     else cnt.available++;
-    if((a.failed_count||0)>0||(a.fail_count||0)>0)cnt.failed++;
+    if((a.failed_count||0)>0||(a.fail_count||0)>0||a.failover_disabled)cnt.failed++;
   });
   ["all","available","exhausted","failed","disabled","test"].forEach(k=>{
     const el=document.getElementById("cnt"+k.charAt(0).toUpperCase()+k.slice(1));
@@ -695,7 +696,7 @@ function accountsForFilter(list){
   const accounts=list||[];
   if(currentFilter==="all")return accounts;
   if(currentFilter==="failed"){
-    return accounts.filter(a=>(Number(a.failed_count)||0)>0||(Number(a.fail_count)||0)>0);
+    return accounts.filter(a=>(Number(a.failed_count)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled);
   }
   if(currentFilter==="test"){
     return accounts.filter(a=>!!a.test_failed);

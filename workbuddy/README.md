@@ -117,12 +117,6 @@ plugins:
       # Runs every 4 hours at 00/04/08/12/16/20 local time.
       checkin_auto: true
 
-      # Growth-center auto-claim (default true since 0.16.2): runs on the same
-      # 4-hour tick — buddy travel claim/depart, task accept/claim, makeup
-      # cards, streak redemption, lottery, energy blind boxes. Global accounts
-      # have no growth center and are skipped. Set false to disable.
-      growth_auto: true
-
       # Credit lifecycle: disable CN on exhaust, delete Global on exhaust,
       # re-enable CN after check-in restores credits (default false).
       lifecycle_auto: false

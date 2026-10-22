@@ -90,6 +90,9 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 	if err == nil {
 		name, path, legacyPath = resolveAuthFileTarget(sa, phys)
 	}
+	// 生命周期恢复启用只对带 exhausted_disable 的文档可达，与本机制的
+	// failover_disable 天然互斥，因此这里不搬运本机制标记——号已重新可用，
+	// 不该再被禁用探活认领。
 	raw, err := buildAuthFileJSON(sa, false, note, nil)
 	if err != nil {
 		return err
@@ -141,6 +144,9 @@ func deleteAuth(authIndex, authID string, sa *storedAuth) error {
 		if exhaustedDisableFromAuthJSON(phys.JSON) {
 			extra["exhausted_disable"] = true
 		}
+		// 本机制写的失败禁用标记必须原样搬运：buildAuthFileJSON 是白名单重建，
+		// 不搬运就会把 failover_disable 抹掉，探活循环从此找不到该账号（静默遗忘）。
+		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
 		raw, berr := buildAuthFileJSON(sa, existingDisabled, note, extra)
 		if berr != nil {
 			return fmt.Errorf("no path and build failed: %w", berr)
@@ -191,6 +197,11 @@ func clearDeletedAccountState(keys ...string) {
 		clearActiveAuthIfMatch(k)
 		clearFailoverStateForAuth(k)
 		evictSessionBindingsForAuth(k)
+		// 本机制的本地排除集合与当日探活配额同样要清：账号删除后宿主列表里
+		// 不再有它，对账逻辑也找不到它，留着只会让内存表无限增长。
+		clearFailoverDisabledLocal(k, "")
+		forgetFailoverProbeModel(k)
+		resetFailoverProbeQuota(k)
 	}
 }
 
@@ -243,6 +254,8 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 		if exhaustedDisableFromAuthJSON(phys.JSON) {
 			extra["exhausted_disable"] = true
 		}
+		// 同上：备注刷新绝不能顺手抹掉本机制的禁用标记。
+		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
 	}
 	if lifecycleStateUnchanged(authID, disabled, note) {
 		return nil
@@ -368,9 +381,25 @@ func reconcileAllAccounts(force bool) []map[string]any {
 // failure was counted. Session bindings pinned to the failed account are
 // evicted so conversations re-assign on the next pick (see session_auth.go).
 func noteAccountFailure(authID string, status int, body string) bool {
+	return noteAccountFailureForModel(authID, "", status, body)
+}
+
+// noteAccountFailureForModel 是带模型维度的记账入口。
+//
+// qoderwork 的冷却阶梯只有账号层，模型维度不参与冷却判定；这里记录模型名只有一个
+// 用途——禁用探活只回放当初失败的那个模型，没有这个键账号就无法被验证恢复。
+//
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// [返回] true 表示失败已计入冷却阶梯。
+// 最近修改时间：2026-10-22；改动原因：新增，供禁用探活回放失败模型。
+func noteAccountFailureForModel(authID, model string, status int, body string) bool {
 	if !failoverActive() || strings.TrimSpace(authID) == "" {
 		return false
 	}
+	// 模型名必须先落进内存表：recordAccountFailure 内部双写时会读取它，
+	// 若在记账之后才写，本次禁用就会带着空模型落盘（探活退化为全量轮测）。
+	rememberFailoverProbeModel(authID, model)
 	if !recordAccountFailure(authID, status, body) {
 		return false
 	}
@@ -380,6 +409,7 @@ func noteAccountFailure(authID string, status int, body string) bool {
 		if id == "" || id == authID {
 			return
 		}
+		rememberFailoverProbeModel(id, model)
 		if recordAccountFailure(id, status, body) {
 			evictSessionBindingsForAuth(id)
 		}
@@ -391,13 +421,22 @@ func noteAccountFailure(authID string, status int, body string) bool {
 // AuthID from the executor may be the credential ID (UID) rather than runtime auth_index;
 // we resolve via host.auth.list when direct get fails.
 func reconcileAfterExecutorError(authID string, status int, body string) {
+	reconcileAfterExecutorErrorForModel(authID, "", status, body)
+}
+
+// reconcileAfterExecutorErrorForModel 是带模型维度的版本，供执行器把失败的模型
+// 一并带进来——禁用探活要靠它回放原故障现场。
+// [参数] authID：账号标识；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// 最近修改时间：2026-10-22；改动原因：新增，让生命周期路径也能记录失败模型。
+func reconcileAfterExecutorErrorForModel(authID, model string, status int, body string) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
 	}
 	// Failover first — independent of lifecycle_auto: any upstream failure
 	// (429/402/5xx/transport) counts toward cooldown.
-	noteAccountFailure(authID, status, body)
+	noteAccountFailureForModel(authID, model, status, body)
 	// Hard credit errors additionally trigger the disable/delete lifecycle.
 	if !lifecycleEnabled() || !isHardCreditError(status, body) {
 		return
@@ -460,6 +499,14 @@ func resolveAuthIndexAndID(authID string) (string, string) {
 
 // reconcileByUID finds qoderwork auth by account UID and applies executor-error lifecycle.
 func reconcileByUID(uid string, status int, body string) {
+	reconcileByUIDForModel(uid, "", status, body)
+}
+
+// reconcileByUIDForModel 是带模型维度的版本。
+// [参数] uid：账号 UID；model：已归一化的上游模型名，可为空；
+// status：上游 HTTP 状态码；body：上游响应正文。
+// 最近修改时间：2026-10-22；改动原因：新增，让 UID 形态的记账也记录失败模型。
+func reconcileByUIDForModel(uid, model string, status int, body string) {
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
 		return
@@ -467,7 +514,7 @@ func reconcileByUID(uid string, status int, body string) {
 	// Failover first — independent of lifecycle_auto. reconcileByUID receives
 	// the account UID; noteAccountFailure resolves it to the auth.ID key the
 	// scheduler uses.
-	noteAccountFailure(uid, status, body)
+	noteAccountFailureForModel(uid, model, status, body)
 	if !lifecycleEnabled() || !isHardCreditError(status, body) {
 		return
 	}

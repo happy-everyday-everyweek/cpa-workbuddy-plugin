@@ -142,3 +142,13 @@ func watchdogLoop() {
 func preserveWatchdogLoop() {
 	watchdogLoop()
 }
+
+// startFailoverProbe 启动禁用账号探活循环。与 watchdog 分开起，因为两者的
+// 调度语义不同：探活自带 10 分钟固定周期与不重叠保护，而 watchdog 管的是签到/
+// 额度一类的 10 分钟巡检，混在一个 ticker 里会让探活受巡检耗时影响。
+//
+// 单独成函数是为了让 main.go 的启动序列显式可读（qoderwork 没有 init 启动惯用法）。
+// 最近修改时间：2026-10-22；改动原因：探活周期改为 10 分钟，注释同步。
+func startFailoverProbe() {
+	go failoverProbeLoop()
+}

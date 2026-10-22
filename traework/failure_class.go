@@ -63,7 +63,7 @@ func classifyUpstreamFailure(status int, body string) failureScope {
 	if status == 0 || status >= 500 {
 		return failureScopeAccount
 	}
-	// 3. 请求被拦截（11128）按账号×模型冷却：冷却探活会用同一模型回放，
+	// 3. 请求被拦截（11128）按账号×模型冷却：禁用探活会把该模型排在回放序列首位，
 	//    验证该账号在这个模型上是否真的恢复。先于限流文案判定，因为 11128
 	//    的 displayMsg 可能带「请重新发送」这类无关文案。
 	if isModelBlockedError(status, body) {

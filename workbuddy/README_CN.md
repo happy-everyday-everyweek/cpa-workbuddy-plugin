@@ -102,11 +102,6 @@ plugins:
       # CN 账号每日自动签到（默认 true），每 4 小时一次（00/04/08/12/16/20 本地时间）。
       checkin_auto: true
 
-      # 成长中心自动领奖（默认 true，0.16.2 起）：随签到同槽每 4 小时执行
-      # 旅行收礼/派出、任务接单领奖、补登卡、连登兑换、抽奖、能量盲盒；
-      # Global 账号无成长中心能力，自动跳过。设为 false 可关闭。
-      growth_auto: true
-
       # 积分生命周期：CN 耗尽禁用 / Global 耗尽删除 / CN 回血恢复（默认 false）。
       lifecycle_auto: false
 

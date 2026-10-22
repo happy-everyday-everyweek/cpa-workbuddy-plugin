@@ -1,5 +1,19 @@
 # TraeWork Plugin Changelog
 
+## 0.3.0
+
+### Feat - 账号故障改为写盘禁用 + 每 10 分钟只探失败模型
+
+- 变更要点:
+  1. 失败双写：一次上游失败同时写内存阶梯冷却与盘上 `disabled: true`（宿主路由判据），冷却只负责写盘生效前的毫秒窗口与写盘失败时的兜底。
+  2. 探活只回放失败的那一个模型，它探通才写回 `disabled: false`；没有记录到失败模型则跳过该账号，不退化为全量轮测。
+  3. 探活周期固定 10 分钟（账号规模将到 200 个，60 秒扫一轮不可行）；单轮串行、上一轮未完成则本轮直接跳过。
+  4. 删除冷却探活（`cooldown_probe*.go`）与 `failover_disable` 之外的第二条恢复通道。
+  5. 写盘后轮询 `host.auth.list` 确认宿主内存已吸收新状态：写盘成功但宿主未吸收等于「写了就算禁了」，请求仍会打到已知坏号。
+  6. token 刷新与保活路径原样带回 `disabled` 与本机制标记：宿主挑刷新候选不看 `Disabled`，插件若在回传里固定 `disabled:false`，禁用中的号会被一次后台刷新静默解封、完全绕开探活。
+  7. 面板新增「禁用探活中」徽章与失败筛选口径，与冷却倒计时分开显示。
+- 涉及文件: `failover_disable.go`（新增）`failover_disable_test.go`（新增）`accountFailover.go` `active_auth.go` `auth_model_cooldown_test.go` `executor.go` `failover_accounting.go` `failure_class.go` `host_auth.go` `management.go` `model_circuit.go` `model_circuit_test.go` `panel.html` `watchdog.go` `main.go` `VERSION`，删除 `cooldown_probe*.go`（3 个）
+
 ## 0.2.16
 
 ### Fix - 11128 模型级拦截并入账号×模型冷却，移除独立熔断

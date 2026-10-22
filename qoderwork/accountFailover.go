@@ -195,23 +195,29 @@ func setCooldownRecordLocked(authID string, until time.Time, count int, bumpCoun
 	}
 }
 
-// recordAccountFailure 递增账号连续失败计数并按阶梯延长冷却窗口。
-// 返回 true 表示该失败已计入。调用方须使用与调度器相同的 auth.ID 作为键。
+// recordAccountFailure 递增账号连续失败计数并按阶梯延长冷却窗口，同时把账号
+// 写盘禁用（双写）。返回 true 表示该失败已计入。调用方须使用与调度器相同的
+// auth.ID 作为键。
 //
 // 瞬时过载类失败（429 无额度标记、软限流文案、上游零字节断流，见
 // isTransientThrottle）与硬失败（额度耗尽 / 401/403/404/405 / 5xx / 传输错误）
 // 共用同一条计数与阶梯路径：软失败不再豁免计数，网关抖动会让账号沿阶梯
 // 逐次冷却更久，直到出现一次成功请求才清零回落到 60s。
 //
+// 为什么必须双写：冷却只存在插件内存里，宿主选择器看不见它，同一个请求内宿主仍会
+// 把这个已知的坏号发过来、拿一次失败再换下一个号。禁用走的是宿主自己的路由判据，
+// 同请求轮转与跨请求路由一起被挡住；冷却负责覆盖写盘到 watcher 生效之间的毫秒级
+// 窗口，并在写盘失败（宿主 RPC 不通）时作为唯一的排除手段。
+//
 // Qoder 系专属红线（不改）：排队帧 isQueueFrame 是上游容量状态而非账号故障，
 // 保持「不计数不冷却」；110 日限额 isDailyCountExceeded 走独立 24h 持久化冷却
-// （daily_cooling），不在本阶梯路径内。
+// （daily_cooling），不在本阶梯路径内，也不由本机制禁用。
 //
 // 异常池隔离已于 2026-09-08 移除：失败只延长冷却窗口，账号到期后自动重新
 // 进入路由，不冻结、不做每日刷新、不需要人工解冻。
 // [参数] authID: 账号唯一标识；status: 上游 HTTP 状态码；body: 上游响应正文。
 // [返回] true 表示失败已计入冷却阶梯，false 表示按判定不予记账。
-// 最近修改时间：2026-10-16 23:29:50；改动原因：软失败并入阶梯计数，移除 coolDownAccount 旁路。
+// 最近修改时间：2026-10-22；改动原因：失败双写——冷却阶梯 + 盘上禁用。
 func recordAccountFailure(authID string, status int, body string) bool {
 	if !failoverActive() {
 		return false
@@ -227,6 +233,26 @@ func recordAccountFailure(authID string, status int, body string) bool {
 	if !isAccountFailure(status, body) && !isTransientThrottle(status, body) {
 		return false
 	}
+	if !recordCooldownState(authID) {
+		return false
+	}
+	// 禁用写在内存锁外：disableAccountForFailover 会发宿主 RPC（解析 auth_index、
+	// 读盘、写盘），压在 failoverMu 上会把所有并发记账串行化。
+	//
+	// 模型名传给禁用侧：qoderwork 的冷却没有模型维度，但探活必须回放当初失败的
+	// 模型才最省额度。这里取状态里记住的最近模型（由 noteAccountFailure 写入）。
+	disableAccountForFailover(authID, failoverProbeModelFor(authID))
+	return true
+}
+
+// recordCooldownState 只写内存阶梯冷却，是冷却侧的唯一写入落点。
+//
+// 从 recordAccountFailure 拆出，只为让宿主 RPC 留在锁外；冷却语义与拆分前完全一致。
+//
+// [参数] authID：账号唯一标识。
+// [返回] true 表示已写入冷却。
+// 最近修改时间：2026-10-22；改动原因：拆出锁内部分，供双写在锁外追加禁用。
+func recordCooldownState(authID string) bool {
 	now := time.Now()
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
@@ -259,6 +285,11 @@ func isAccountCoolingDown(authID string) bool {
 	if authID == "" {
 		return false
 	}
+	// 双写判据第一层：本进程已把该号写盘禁用。禁用探活把它恢复前，
+	// 无论阶梯是否已到期，都不应再承载流量——冷却到期不代表故障消除。
+	if isFailoverDisabledLocal(authID) {
+		return true
+	}
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
 	now := time.Now()
@@ -284,12 +315,12 @@ func isAccountCoolingDown(authID string) bool {
 	return false
 }
 
-// resetAccountFailover clears the failure counter and cooldown after a
-// successful request. Call it on every upstream success.
-func resetAccountFailover(authID string) {
-	if !failoverActive() {
-		return
-	}
+// resetCooldownState 清掉账号在内存里的全部冷却痕迹（计数与窗口）。
+// 成功请求与禁用恢复路径都用它，避免两处各写一遍清零字段清单。
+//
+// [参数] authID：账号唯一标识。
+// 最近修改时间：2026-10-22；改动原因：抽出，供成功路径与禁用恢复路径复用。
+func resetCooldownState(authID string) {
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
 	keys := []string{authID}
@@ -302,6 +333,37 @@ func resetAccountFailover(authID string) {
 			st.cooldownUntil = time.Time{}
 		}
 	}
+}
+
+// resetAccountFailover clears the failure counter and cooldown after a
+// successful request. Call it on every upstream success.
+//
+// 双写之下它还要负责解除盘上禁用：冷却与禁用是同一个故障的两份记录，只清内存会
+// 留下「宿主仍在跳过、插件已认为可用」的割裂状态。
+// 最近修改时间：2026-10-22；改动原因：成功路径同时解除本机制写入的禁用。
+func resetAccountFailover(authID string) {
+	if !failoverActive() {
+		return
+	}
+	resetCooldownState(authID)
+	// 只有本进程确实写过禁用，才值得为它发两次宿主 RPC（解析 index + 读盘 +
+	// 写盘）。本函数在每个成功请求上调用，无条件解析会把 RPC 塞进热路径；
+	// 而盘上被禁用的号宿主本就不会路由过来，走不到这里。
+	//
+	// 锁顺序：此处已释放 failoverMu 才能取 failoverProbeModelMu，两处判据不得嵌套。
+	if !isFailoverDisabledLocal(authID) {
+		return
+	}
+	// 本地排除先无条件清掉，且早于任何 RPC：写盘通道不可用时下面的 index 解析
+	// 会失败，若只依赖 reenable 的清理，这个号在本进程里就再也无法被判为可用，
+	// 而盘上根本没禁它（宿主仍会路由过来），等于自造静默遗忘。
+	clearFailoverDisabledLocal(authID, "")
+	forgetFailoverProbeModel(authID)
+	authIndex, _ := failoverResolveIndexFn(strings.TrimSpace(authID))
+	if strings.TrimSpace(authIndex) == "" {
+		return
+	}
+	reenableAccountForFailover(authIndex, authID)
 }
 
 // pruneFailoverStates removes zero-count states (successfully reset, no

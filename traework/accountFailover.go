@@ -13,7 +13,11 @@
 // 文件、不写 DB，进程重启即清空。可通过插件配置 `account_failover: false`
 // 整体关闭该机制。
 //
-// 最近修改时间：2026-10-19；改动原因：阶梯基数由 30s 调整为 60s（仍为 base × count、上限 10 分钟），软失败并入计数。
+// 2026-10-22 起与盘上禁用双写：失败同时写这份内存冷却与物理文件的 disabled 标记
+// （见 failover_disable.go），恢复由 10 分钟禁用探活统一裁决。冷却因此不再是唯一的
+// 排除手段，它只覆盖写盘到宿主 watcher 生效之间的窗口与写盘失败的情况。
+//
+// 最近修改时间：2026-10-22；改动原因：失败记账改为冷却 + 禁用双写，冷却探活移除。
 package main
 
 import (
@@ -58,7 +62,7 @@ var (
 type authFailoverState struct {
 	count         int       // consecutive failures; reset to 0 on success
 	cooldownUntil time.Time // zero means not cooling down
-	// lastModel 记录最近一次触发冷却的上游模型（已归一化），供冷却前探活回放。
+	// lastModel 记录最近一次触发冷却的上游模型（已归一化），供禁用探活回放。
 	lastModel string
 	// modelStates 保存账号×模型级冷却，键为归一化后的上游模型名。
 	modelStates map[string]*modelFailoverState
@@ -224,13 +228,38 @@ func recordAccountFailureForModel(authID, model string, status int, body string)
 	return recordFailureScoped(authID, model, classifyUpstreamFailure(status, body))
 }
 
-// recordFailureScoped 按给定维度写入冷却状态，是记账的唯一落点。
-// 调用方必须已完成分类与开关判定。
+// recordFailureScoped 按给定维度记账，是失败处理的唯一落点：先写内存阶梯冷却，
+// 再把账号写盘禁用（双写）。
+//
+// 为什么必须双写：冷却只存在插件内存里，宿主选择器看不见它，同一个请求内宿主仍会
+// 把这个已知的坏号发过来、拿一次失败再换下一个号。禁用走的是宿主自己的路由判据，
+// 同请求轮转与跨请求路由一起被挡住；冷却负责覆盖写盘到 watcher 生效之间的毫秒级
+// 窗口，并在写盘失败（宿主 RPC 不通）时作为唯一的排除手段。
+//
+// 禁用写在锁外：disableAccountForFailover 会发宿主 RPC（解析 auth_index、读盘、
+// 写盘），压在 failoverMu 上会把所有并发记账串行化。
+//
 // [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
 // scope：记账维度。
 // [返回] true 表示已写入；scope 为 none 时返回 false。
-// 最近修改时间：2026-10-19 01:20:00；改动原因：抽出唯一写入落点，避免多处复制阶梯逻辑。
+// 最近修改时间：2026-10-22；改动原因：失败双写——冷却阶梯 + 盘上禁用。
 func recordFailureScoped(authID, model string, scope failureScope) bool {
+	if !recordCooldownScoped(authID, model, scope) {
+		return false
+	}
+	disableAccountForFailover(authID, model)
+	return true
+}
+
+// recordCooldownScoped 按给定维度写入内存阶梯冷却，是冷却侧的唯一写入落点。
+//
+// 从 recordFailureScoped 拆出，只为让 RPC 留在锁外；冷却语义与拆分前完全一致。
+//
+// [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；
+// scope：记账维度。
+// [返回] true 表示已写入冷却；scope 为 none 时返回 false。
+// 最近修改时间：2026-10-22；改动原因：拆出锁内部分，供双写在锁外追加禁用。
+func recordCooldownScoped(authID, model string, scope failureScope) bool {
 	if scope == failureScopeNone {
 		return false
 	}
@@ -320,7 +349,7 @@ func recordForcedFailure(authID string, body string) bool {
 // recordForcedFailureForModel 在强制记账的基础上补记失败模型。
 //
 // 伪完成（HTTP 200 + done + 近空输出）本质是上游对账号的窗口性限流，仍归账号级；
-// 但记录模型名能让冷却前探活用正确的模型回放，否则这类冷却永远无法被探测。
+// 但记录模型名能让禁用探活用正确的模型回放，否则这类禁用只能全量轮测、白烧额度。
 //
 // [参数] authID：账号唯一标识；model：已归一化的上游模型名，可为空；body：失败原因文本。
 // [返回] true 表示已计入冷却。
@@ -342,6 +371,11 @@ func isAccountCoolingDown(authID string) bool {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return false
+	}
+	// 双写判据第一层：本进程已把该号写盘禁用。禁用探活把它恢复前，
+	// 无论阶梯是否已到期，都不应再承载流量——冷却到期不代表故障消除。
+	if isFailoverDisabledLocal(authID) {
+		return true
 	}
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
@@ -407,12 +441,12 @@ func isAuthModelCoolingDown(authID, model string) bool {
 	return false
 }
 
-// resetAccountFailover clears the failure counter and cooldown after a
-// successful request. Call it on every upstream success.
-func resetAccountFailover(authID string) {
-	if !failoverActive() {
-		return
-	}
+// resetCooldownState 清掉账号在内存里的全部冷却痕迹（计数、窗口、失败模型、
+// 模型维度）。成功请求与探活成功都用它，避免两处各写一遍清零字段清单。
+//
+// [参数] authID：账号唯一标识。
+// 最近修改时间：2026-10-22；改动原因：抽出，供成功路径与禁用恢复路径复用。
+func resetCooldownState(authID string) {
 	failoverMu.Lock()
 	defer failoverMu.Unlock()
 	for _, k := range failoverKeysLocked(authID) {
@@ -427,8 +461,39 @@ func resetAccountFailover(authID string) {
 	}
 }
 
+// resetAccountFailover clears the failure counter and cooldown after a
+// successful request. Call it on every upstream success.
+//
+// 双写之下它还要负责解除盘上禁用：冷却与禁用是同一个故障的两份记录，只清内存会
+// 留下「宿主仍在跳过、插件已认为可用」的割裂状态。
+// 最近修改时间：2026-10-22；改动原因：成功路径同时解除本机制写入的禁用。
+func resetAccountFailover(authID string) {
+	if !failoverActive() {
+		return
+	}
+	resetCooldownState(authID)
+	// 只有本进程确实写过禁用，才值得为它发两次宿主 RPC（解析 index + 读盘 +
+	// 写盘）。本函数在每个成功请求上调用，无条件解析会把 RPC 塞进热路径；
+	// 而盘上被禁用的号宿主本就不会路由过来，走不到这里。
+	//
+	// 锁顺序：此处已释放 failoverMu 才能取 failoverProbeModelMu，两处判据不得嵌套。
+	if !isFailoverDisabledLocal(authID) {
+		return
+	}
+	// 本地排除先无条件清掉，且早于任何 RPC：写盘通道不可用时下面的 index 解析
+	// 会失败，若只依赖 reenable 的清理，这个号在本进程里就再也无法被判为可用，
+	// 而盘上根本没禁它（宿主仍会路由过来），等于自造静默遗忘。
+	clearFailoverDisabledLocal(authID, "")
+	forgetFailoverProbeModel(authID)
+	authIndex, _ := failoverResolveIndexFn(strings.TrimSpace(authID))
+	if strings.TrimSpace(authIndex) == "" {
+		return
+	}
+	reenableAccountForFailover(authIndex, authID)
+}
+
 // resetAuthModelFailover 只清除指定账号×模型的冷却，保留账号级状态。
-// 供冷却前探活确认「该模型已恢复」时调用，避免把其它模型的冷却一起抹掉。
+// 供模型维度清理使用，避免把其它模型的冷却一起抹掉。
 // [参数] authID：账号唯一标识；model：已归一化的上游模型名。
 // 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供探活精确清除模型维度。
 func resetAuthModelFailover(authID, model string) {
@@ -534,10 +599,10 @@ func authModelFailoverSnapshot(authID, model string) (count int, cooldownUntil t
 	return ms.count, ms.cooldownUntil, true
 }
 
-// lastFailoverModel 返回账号最近一次触发冷却的模型名，供冷却前探活回放。
+// lastFailoverModel 返回账号最近一次触发冷却的模型名，供诊断与禁用探活回放。
 // [参数] authID：账号唯一标识。
 // [返回] 归一化后的上游模型名；无记录时为空串。
-// 最近修改时间：2026-10-19 01:20:00；改动原因：新增，供冷却前探活读取失败模型。
+// 最近修改时间：2026-10-22；改动原因：注释对齐禁用探活口径（冷却探活已移除）。
 func lastFailoverModel(authID string) string {
 	failoverMu.Lock()
 	defer failoverMu.Unlock()

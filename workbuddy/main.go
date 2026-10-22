@@ -128,8 +128,9 @@ func init() {
 	// documented in checkin.go:31 from closing stop channels during plugin
 	// teardown.
 	go watchdogLoop()
-	// 冷却前探活：独立于 watchdog 的 5s 粒度循环，见 cooldown_probe.go。
-	go cooldownProbeLoop()
+	// 禁用探活：每 10 分钟串行遍历被本机制禁用的账号，回放失败模型，成功即解除禁用。
+	// 冷却本身不再探测（cooldown_probe.go 已移除），见 failover_disable.go。
+	go failoverProbeLoop()
 	go func() {
 		ticker := time.NewTicker(loginStatesPruneInterval)
 		defer ticker.Stop()
@@ -337,7 +338,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.16.9"
+var version = "0.17.0"
 
 func wbRegistration() registration {
 	return registration{
@@ -642,6 +643,9 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	// derives ID from the file path → always matches the watcher's key.
 	// FileName is also echoed back to avoid rename-based duplicates.
 	ad := toAuthDataOpts(sa, nil, parseDisabledFromAuthJSON(req.RawJSON))
+	// 盘上本机制的顶层键必须随这次回传一起交回宿主：宿主吸收文件后，会用我们
+	// 给出的 StorageJSON + Metadata 反向重建物理文档，不回传就抹掉标记。
+	carryFailoverKeysIntoMetadata(ad.Metadata, req.RawJSON)
 	ad.ID = "" // let host compute from path (prevents ID mismatch dupes)
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
@@ -787,9 +791,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// 5xx/0/402 keep the cooldown-only path (cross-request rotation
 		// via recordAccountFailure) and skip this loop.
 		statusCode := parseUpstreamStatusFromErr(completionErr)
-		// 11128：把命中的账号×模型写入冷却，并立即停止本轮换号。
-		// 上游拦截的是这个组合，其余账号大概率同样命中；冷却探活会在
-		// 到期前用同一模型回放验证。
+		// 11128：双写记账（模型冷却 + 账号禁用写盘），并立即停止本轮换号。
+		// 上游拦截的是这个组合，其余账号大概率同样命中；恢复统一由 60 秒
+		// 禁用探活裁决，它会把这个模型排在回放序列最前。
 		if isModelBlockedError(statusCode, completionErr.Error()) {
 			if curSA != nil {
 				currentID := strings.TrimSpace(curSA.Auth.AccessToken)

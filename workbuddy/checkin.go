@@ -6,7 +6,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -15,7 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// hostAuthListFn / hostAuthGetFn 是签到与成长中心链路的包级测试接缝（沿用
+// hostAuthListFn / hostAuthGetFn 是签到链路的包级测试接缝（沿用
 // workbuddy-ai 同名模式）：生产指向真实 host RPC，单测替换为内存桩，避免为
 // 可测性把 hostAuthList / hostAuthGet 本身改成变量而影响全部调用方。
 var hostAuthListFn = hostAuthList
@@ -125,13 +124,13 @@ func schedulerLoop(stop chan struct{}) {
 //
 // [参数] 无。
 // [返回] 无。
-// 最近修改时间：2026-10-15 21:50:00 提前返回条件纳入 growth_auto（TASK-2.2）
+// 最近修改时间：2026-10-22；改动原因：成长中心已整体下线，提前返回条件恢复为签到 + lifecycle。
 func runAutoCheckin() {
 	checkinAutoMu.RLock()
 	doCheckin := checkinAuto
 	checkinAutoMu.RUnlock()
-	// Lifecycle may still run when check-in is off (credit gate); growth too.
-	if !doCheckin && !growthEnabled() && !lifecycleEnabled() {
+	// Lifecycle may still run when check-in is off (credit gate).
+	if !doCheckin && !lifecycleEnabled() {
 		return
 	}
 	files, err := hostAuthListFn()
@@ -156,21 +155,19 @@ func runAutoCheckin() {
 // processAutoCheckinAccount handles one account's scheduled tick. Extracted so
 // runAutoCheckin can fan out per-account work without duplicating logic.
 //
-// [参数] f：账号条目；doCheckin：本轮是否执行签到（growth_auto 独立判定）。
+// [参数] f：账号条目；doCheckin：本轮是否执行签到。
 // [返回] 无。
-// 最近修改时间：2026-10-15 21:50:00 CN 分支追加成长中心调用（TASK-2.2）
+// 最近修改时间：2026-10-22；改动原因：成长中心下线，去掉取号条件里的 growth 分支与执行段。
 func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
-	doGrowth := growthEnabled()
-	// A-24: only fetch sa when needed (checkin or growth). For lifecycle-only
-	// paths, let reconcileOneAccount do the single hostAuthGetBundle internally.
-	if doCheckin || doGrowth {
+	// A-24: only fetch sa when needed (checkin). For lifecycle-only paths,
+	// let reconcileOneAccount do the single hostAuthGetBundle internally.
+	if doCheckin {
 		sa, err := hostAuthGetFn(f.AuthIndex)
 		if err != nil {
 			return
 		}
 		if isGlobalDomain(sa.Auth.Domain) {
-			// Global: never check-in, auto-claim trial, or run growth (Global
-			// has no growth center). Lifecycle only.
+			// Global: never check-in, auto-claim trial. Lifecycle only.
 			// Invalidate cache (copy entry, set credits=nil, keep plan/checkin).
 			if v, ok := accountCache.Load(f.ID); ok {
 				if e, ok2 := v.(*accountCacheEntry); ok2 {
@@ -185,65 +182,51 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 			}
 			return
 		}
-		if doCheckin {
-			// CN: daily check-in when enabled.
-			ci, err := fetchCheckinStatus(sa)
-			if err == nil && ci != nil && ci.Active && !ci.TodayCheckedIn {
-				if _, callErr := performCheckinCall(sa); callErr == nil {
-					// Refresh once after a successful checkin call so cache reflects
-					// the post-call state. If the status call fails keep the pre-call
-					// snapshot rather than dropping it (v0.6.31: avoid shadowing ci
-					// with a second fetch that could race with concurrent readers).
-					if ci2, _ := fetchCheckinStatus(sa); ci2 != nil {
-						ci = ci2
-					}
-					// P1-5: checkin grants new credits — refresh the credits cache
-					// immediately so the panel shows the updated balance without
-					// waiting for the async reconcile pass.
-					if cr2, crErr := fetchUserResource(sa); crErr == nil && cr2 != nil {
-						if v, ok := accountCache.Load(f.ID); ok {
-							if prev, ok2 := v.(*accountCacheEntry); ok2 {
-								fresh := *prev
-								fresh.credits = cr2
-								fresh.fetched = time.Now()
-								accountCache.Store(f.ID, &fresh)
-							}
+		// CN: daily check-in when enabled.
+		ci, err := fetchCheckinStatus(sa)
+		if err == nil && ci != nil && ci.Active && !ci.TodayCheckedIn {
+			if _, callErr := performCheckinCall(sa); callErr == nil {
+				// Refresh once after a successful checkin call so cache reflects
+				// the post-call state. If the status call fails keep the pre-call
+				// snapshot rather than dropping it (v0.6.31: avoid shadowing ci
+				// with a second fetch that could race with concurrent readers).
+				if ci2, _ := fetchCheckinStatus(sa); ci2 != nil {
+					ci = ci2
+				}
+				// P1-5: checkin grants new credits — refresh the credits cache
+				// immediately so the panel shows the updated balance without
+				// waiting for the async reconcile pass.
+				if cr2, crErr := fetchUserResource(sa); crErr == nil && cr2 != nil {
+					if v, ok := accountCache.Load(f.ID); ok {
+						if prev, ok2 := v.(*accountCacheEntry); ok2 {
+							fresh := *prev
+							fresh.credits = cr2
+							fresh.fetched = time.Now()
+							accountCache.Store(f.ID, &fresh)
 						}
 					}
 				}
 			}
-			// Refresh cache with latest checkin status (merge, don't wipe credits/plan).
-			if ci != nil {
-				var prev *accountCacheEntry
-				if v, ok := accountCache.Load(f.ID); ok {
-					prev, _ = v.(*accountCacheEntry)
-				}
-				entry := &accountCacheEntry{checkin: ci, fetched: time.Now()}
-				if prev != nil {
-					entry.credits = prev.credits
-					entry.plan = prev.plan
-				}
-				accountCache.Store(f.ID, entry)
+		}
+		// Refresh cache with latest checkin status (merge, don't wipe credits/plan).
+		if ci != nil {
+			var prev *accountCacheEntry
+			if v, ok := accountCache.Load(f.ID); ok {
+				prev, _ = v.(*accountCacheEntry)
 			}
+			entry := &accountCacheEntry{checkin: ci, fetched: time.Now()}
+			if prev != nil {
+				entry.credits = prev.credits
+				entry.plan = prev.plan
+			}
+			accountCache.Store(f.ID, entry)
 		}
 		if lifecycleEnabled() {
 			_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 		}
-		// Growth center: CN-only capability (Global has none). Runs after
-		// check-in so a fresh check-in credit is already reflected upstream.
-		if doGrowth {
-			time.Sleep(growthInterAccountDelayFn())
-			gr := runGrowthForAccount(sa, f.AuthIndex)
-			log.Printf("[workbuddy] growth for %s: +%d credits, +%d energy, %d accepted, %d claimed, %d errors",
-				sa.Account.UID, gr.CreditsGained, gr.EnergyGained, gr.TasksAccepted, gr.TasksClaimed, len(gr.Errors))
-			// 错误原因一并落日志：只打条数时「任务未完成」无法自查（0.16.3）
-			for _, e := range gr.Errors {
-				log.Printf("[workbuddy] growth error for %s: %s", sa.Account.UID, e)
-			}
-		}
 		return
 	}
-	// Lifecycle-only (checkin & growth off): reconcile handles its own get.
+	// Lifecycle-only (checkin off): reconcile handles its own get.
 	if lifecycleEnabled() {
 		_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 	}

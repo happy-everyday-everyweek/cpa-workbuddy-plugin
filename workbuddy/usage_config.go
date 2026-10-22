@@ -22,13 +22,6 @@ var (
 	checkinAuto   = true // enabled by default
 	checkinAutoMu sync.RWMutex
 
-	// growthAuto gates the growth-center auto-claim run inside the check-in
-	// tick. Default true (0.16.2): the flows are production-verified and the
-	// growth center is meant to run unattended; set `growth_auto: false` to
-	// opt out.
-	growthAuto   = true
-	growthAutoMu sync.RWMutex
-
 	// usageReportURL / usageReportKey: POST NDJSON to CPA-Manager-Plus
 	// /v0/management/usage/import (only path that reaches request monitoring;
 	// c-shared plugins cannot use host usage.DefaultManager/redisqueue).
@@ -65,11 +58,10 @@ const fallbackUsageReportURL = "http://cpa-manager-plus:18317/v0/management/usag
 // configure decodes plugin config from the lifecycle request.
 // [参数] raw：宿主流式下发的 config_yaml 原文。
 // [返回] 无。
-// 最近修改时间：2026-10-16 02:00:00 growth_auto 缺省值改为开启（0.16.2）
+// 最近修改时间：2026-10-22；改动原因：成长中心下线，移除 growth_auto 解析。
 func configure(raw []byte) {
 	// Parse config without holding any lock (fixes nested-lock hazard).
 	nextCheckinAuto := true
-	nextGrowthAuto := true
 	nextLifecycleAuto := false
 	// scheduler default: session (per-conversation round-robin). Explicit
 	// scheduler_mode in config_yaml overrides it; unknown values fall back to
@@ -104,11 +96,6 @@ func configure(raw []byte) {
 				if strings.HasPrefix(line, "checkin_auto:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_auto:"))
 					nextCheckinAuto = v == "true" || v == "1" || v == "yes" || v == "on"
-				}
-				if strings.HasPrefix(line, "growth_auto:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "growth_auto:"))
-					v = strings.Trim(v, "\"'")
-					nextGrowthAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
 				if strings.HasPrefix(line, "lifecycle_auto:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
@@ -187,10 +174,6 @@ func configure(raw []byte) {
 	checkinAutoMu.Lock()
 	checkinAuto = nextCheckinAuto
 	checkinAutoMu.Unlock()
-
-	growthAutoMu.Lock()
-	growthAuto = nextGrowthAuto
-	growthAutoMu.Unlock()
 
 	lifecycleAutoMu.Lock()
 	lifecycleAuto = nextLifecycleAuto
@@ -389,7 +372,7 @@ func indentOf(s string) int {
 }
 
 // normalizeConfigKeyLine 去除键名两端的引号，兼容宿主持久化产生的引号键形态。
-// 宿主管理 API 写回配置时保留 YAML 引号样式（如 "growth_auto": false），下发
+// 宿主管理 API 写回配置时保留 YAML 引号样式（如 "checkin_auto": false），下发
 // 插件的 config_yaml 会原样带引号；裸前缀匹配会静默忽略这类行，导致开关
 // 无法生效（0.16.2 修复）。仅处理冒号前的键名，值部分原样保留。
 // [参数] line：已 TrimSpace 的配置行。

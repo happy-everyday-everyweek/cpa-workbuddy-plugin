@@ -231,7 +231,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		stream, statusCode, _, err := hostHTTPDoStream(curReq)
 		if err != nil {
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, 0, err.Error(), reasoningEffort, 0, curAccountLabel, sessionKey)
-			noteAccountFailure(curAuthID, 0, err.Error())
+			noteAccountFailureForModel(curAuthID, upstreamModel, 0, err.Error())
 			streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 			return
 		}
@@ -244,9 +244,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 				logDailyCooldownPersistFailure(curAuthID, triggerDailyCooldown("", curAuthID))
 			}
 			if curAuthUID != "" {
-				go reconcileByUID(curAuthUID, statusCode, errPayload)
+				go reconcileByUIDForModel(curAuthUID, upstreamModel, statusCode, errPayload)
 			}
-			noteAccountFailure(curAuthID, statusCode, errPayload)
+			noteAccountFailureForModel(curAuthID, upstreamModel, statusCode, errPayload)
 			// Retry policy (v0.9.1 — 429 included): account-level 4xx
 			// (401/403/404/405) and 429 soft rate limit benefit from
 			// switching accounts. 5xx/0/402 are already surfaced as
@@ -386,7 +386,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			if isDailyCountExceeded(statusCode, sseErr) {
 				logDailyCooldownPersistFailure(curAuthID, triggerDailyCooldown("", curAuthID))
 			}
-			noteAccountFailure(curAuthID, http.StatusForbidden, sseErr)
+			noteAccountFailureForModel(curAuthID, upstreamModel, http.StatusForbidden, sseErr)
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, statusCode, sseErr, reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
 			// 200 内业务错误帧与 HTTP 4xx 同责：零泄漏（emitted=false）且账号级
 			// 分类命中且预算允许时换号续试；已泄漏分片时换号会造成输出重复或
@@ -425,7 +425,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// failures count toward the ladder too; no freeze), not a success.
 			const emptyStreamErr = "upstream stream closed before first payload"
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, statusCode, emptyStreamErr, reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
-			noteAccountFailure(curAuthID, statusCode, emptyStreamErr)
+			noteAccountFailureForModel(curAuthID, upstreamModel, statusCode, emptyStreamErr)
 			return
 		}
 		publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), false, 0, "", reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)

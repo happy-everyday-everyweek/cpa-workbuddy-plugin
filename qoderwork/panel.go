@@ -41,6 +41,13 @@ type wbAccount struct {
 	DailyCooling       bool   `json:"daily_cooling,omitempty"`
 	DailyCoolingUntil  int64  `json:"daily_cooling_until,omitempty"`
 	DailyCoolingRemain string `json:"daily_cooling_remain,omitempty"`
+	// 双写下的禁用侧：盘上的 failover_disable 标记才是恢复的唯一通道，冷却到期
+	// 不会让账号回来，所以面板必须把它和冷却分开显示。
+	FailoverDisabled bool   `json:"failover_disabled,omitempty"`
+	FailoverModel    string `json:"failover_model,omitempty"` // 探活回放的模型（唯一目标）
+	// 当日探活配额：达到上限后当日不再探测，本地 0 点恢复。
+	ProbeFails int `json:"probe_fails,omitempty"`
+	ProbeLimit int `json:"probe_limit,omitempty"`
 }
 
 // credits/checkin/plan fields are left empty — the panel renders skeletons
@@ -103,6 +110,13 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 			// Physical file is source of truth for disabled (host list may lag).
 			if phys != nil {
 				acct.Disabled = phys.Disabled
+				// 禁用原因读盘：只在盘上确实 disabled 且带本机制标记时才显示
+				// 「禁用探活中」。宿主 UI 手工启用会把 disabled 改回 false 但
+				// 保留自定义元数据，此时不该继续显示禁用徽章。
+				if doc := parseFailoverAuthDoc(phys.JSON); doc.failoverDisable && doc.disabled {
+					acct.FailoverDisabled = true
+					acct.FailoverModel = doc.failoverModel
+				}
 				if phys.Name != "" {
 					acct.Name = phys.Name
 				}
@@ -209,6 +223,17 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				out[i].Cooling = true
 				out[i].CoolUntil = until.Unix()
 			}
+		}
+		// 禁用侧补漏：本机制的内存集合在插件热重载后为空，只靠它会让盘上仍
+		// disabled 的号在面板里分不清是「探活中」还是人工禁用。盘上有标记
+		// 且确实 disabled 才算；外部启用后 disabled=false，这里自然不再标。
+		if !out[i].FailoverDisabled && isFailoverDisabledLocal(out[i].AuthID) {
+			out[i].FailoverDisabled = true
+			out[i].FailoverModel = failoverProbeModelFor(out[i].AuthID)
+		}
+		if out[i].FailoverDisabled {
+			out[i].ProbeFails = failoverProbeQuotaSnapshot(out[i].AuthID)
+			out[i].ProbeLimit = failoverProbeQuotaBudget()
 		}
 		if isAccountDailyCooling(out[i].AuthID) {
 			out[i].DailyCooling = true

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -75,4 +76,35 @@ func hostAuthGetBundle(authIndex string) (*traeAuth, *hostAuthPhysical, error) {
 		return nil, phys, err
 	}
 	return a, phys, nil
+}
+
+// waitAuthDisabledState polls host.auth.list until the account's in-memory
+// disabled state matches want. The host applies direct file writes through its
+// async file watcher, so a toggle must confirm the new state before the panel
+// reloads — otherwise the dashboard reads the stale pre-write memory state.
+//
+// 禁用的确认尤其重要：写盘成功但宿主没吸收 = 「写了就算禁了」的静默失效，
+// 请求仍会被路由到这个已知坏号。
+//
+// [参数] authIndex：宿主 auth_index；want：期望的 disabled 状态；timeout：最长等待。
+// [返回] true 表示宿主内存状态已与期望一致。
+// 最近修改时间：2026-10-22；改动原因：新增，供禁用探活机制确认写盘已被宿主吸收。
+func waitAuthDisabledState(authIndex string, want bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		files, err := hostAuthList()
+		if err == nil {
+			for _, f := range files {
+				if f.AuthIndex != authIndex {
+					continue
+				}
+				if f.Disabled == want {
+					return true
+				}
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }

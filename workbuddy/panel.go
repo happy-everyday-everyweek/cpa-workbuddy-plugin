@@ -39,6 +39,10 @@ type wbAccount struct {
 	FailCount int   `json:"fail_count,omitempty"`
 	Cooling   bool  `json:"cooling,omitempty"`
 	CoolUntil int64 `json:"cool_until,omitempty"` // cooldown deadline (unix secs); 0 = not cooling
+	// 双写下的禁用侧：盘上的 failover_disable 标记才是恢复的唯一通道，冷却到期
+	// 不会让账号回来，所以面板必须把它和冷却分开显示。
+	FailoverDisabled bool   `json:"failover_disabled,omitempty"`
+	FailoverModel    string `json:"failover_model,omitempty"` // 探活回放的模型（唯一目标）
 }
 
 // credits/checkin/plan fields are left empty — the panel renders skeletons
@@ -74,10 +78,9 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		}
 		return true
 	})
-	// Also prune stale lifecycle state, checkin locks and growth locks for gone accounts.
+	// Also prune stale lifecycle state and checkin locks for gone accounts.
 	pruneLifecycleState()
 	pruneCheckinLocks()
-	pruneGrowthLocks()
 	out := make([]wbAccount, len(files))
 	// Accounts are independent — fetch their dashboards concurrently. With 4
 	// accounts this cuts cold-load latency from ~4×(3 serial upstream calls)
@@ -117,6 +120,14 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 			if phys != nil {
 				acct.Disabled = phys.Disabled
 				acct.TestFailed = parseTestFailedFromAuthJSON(phys.JSON)
+				// 禁用原因读盘：本机制的内存集合在插件热重载后为空，只靠它会让
+				// 盘上仍 disabled 的号在面板里分不清是「探活中」还是人工禁用。
+				// 只在盘上确实 disabled 时才认这个标记——宿主 UI 手工启用会把
+				// disabled 改回 false 但保留自定义元数据，此时不该显示禁用徽章。
+				if doc := parseFailoverAuthDoc(phys.JSON); doc.failoverDisable && doc.disabled {
+					acct.FailoverDisabled = true
+					acct.FailoverModel = doc.failoverModel
+				}
 				if phys.Name != "" {
 					acct.Name = phys.Name
 				}
@@ -239,6 +250,12 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				out[i].Cooling = true
 				out[i].CoolUntil = until.Unix()
 			}
+		}
+		// 禁用侧补漏：行构建读到的物理文件可能早于本次禁用落盘（写盘到 watcher
+		// 生效的毫秒级窗口），此时盘上还没有标记但内存已登记，仍要显示「禁用探活中」。
+		if !out[i].FailoverDisabled && isFailoverDisabledLocal(out[i].AuthID) {
+			out[i].FailoverDisabled = true
+			out[i].FailoverModel = failoverProbeModelFor(out[i].AuthID)
 		}
 	}
 	resp := map[string]any{

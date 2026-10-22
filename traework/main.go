@@ -278,7 +278,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.2.16"
+var version = "0.3.0"
 
 func wbRegistration() registration {
 	return registration{
@@ -354,11 +354,14 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	}
 	// CRITICAL: echo back the host-provided FileName AND leave ID empty so
 	// CPA derives ID from the file path (prevents duplicate auth records).
-	ad := toAuthDataOpts(a, false)
+	ad := toAuthDataOpts(a, parseDisabledFromAuthJSON(req.RawJSON))
 	ad.ID = ""
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
 	}
+	// 盘上本机制的顶层键必须随这次回传一起交回宿主：宿主吸收文件后，会用我们
+	// 给出的 StorageJSON + Metadata 反向重建物理文档，不回传就抹掉标记。
+	carryFailoverKeysIntoMetadata(ad.Metadata, req.RawJSON)
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
 		Auth:    ad,

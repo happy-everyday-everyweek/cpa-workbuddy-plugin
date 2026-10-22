@@ -188,7 +188,11 @@ func persistAuthTokens(authIndex string, sa *storedAuth) error {
 			note = s
 		}
 	}
-	raw, err := buildAuthFileJSON(sa, phys.Disabled, note, nil)
+	// 本机制写的失败禁用标记必须原样搬运：buildAuthFileJSON 是白名单重建，
+	// 不搬运就会把 failover_disable 抹掉——token 保活每 4 小时跑一次，账号于是
+	// 停在「宿主仍禁用、探活再也找不到标记」的死角，只能人工启用。
+	extra := putFailoverMarkersIntoExtra(nil, phys.JSON)
+	raw, err := buildAuthFileJSON(sa, phys.Disabled, note, extra)
 	if err != nil {
 		return err
 	}

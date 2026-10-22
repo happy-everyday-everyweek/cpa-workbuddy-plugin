@@ -233,8 +233,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 			// surfaces here. When the error classifies as account-level, rotate
 			// to the next candidate on the SAME request (mirrors the HTTP 4xx
 			// branch below); otherwise surface it immediately.
-			// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后
-			// 直接返回，由冷却探活验证恢复，不再把剩余账号逐个赔进往返。
+			// 11128（含 200 承载的 event:error 帧）：双写记账（模型冷却 + 账号禁用
+			// 写盘）后直接返回，恢复由 10 分钟禁用探活裁决，不再把剩余账号逐个赔进往返。
 			if isModelBlockedError(resp.StatusCode, aggErr.Error()) {
 				noteModelBlockedHit(usedAuthID, circuitKeyModel)
 				reconcileAfterExecutorErrorForModel(usedAuthID, circuitKeyModel, resp.StatusCode, aggErr.Error())
@@ -257,7 +257,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		}
 
 		statusCode := parseUpstreamStatusFromErr(callErr)
-		// 11128：写入账号×模型冷却后直接返回，由冷却探活验证恢复。
+		// 11128：双写记账（模型冷却 + 账号禁用写盘）后直接返回，恢复由禁用探活裁决。
 		if isModelBlockedError(statusCode, callErr.Error()) {
 			noteModelBlockedHit(usedAuthID, circuitKeyModel)
 			reconcileAfterExecutorErrorForModel(usedAuthID, circuitKeyModel, statusCode, callErr.Error())
@@ -434,7 +434,7 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 			log.Printf("[traework] exec stream async open error: request_id=%s stream_id=%s model=%s auth_hash=%s attempt=%d status=%d err=%s",
 				requestID, ctx.StreamID, ctx.Model, authLogHash(curAuthID), attempt+1, statusCode, truncateRedacted(openErr.Error(), 200))
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, statusCode, openErr.Error(), "", 0, curAuthUID, ctx.SessionKey)
-			// 11128：写入账号×模型冷却后停止换号，由冷却探活验证恢复。
+			// 11128：双写记账后停止换号，恢复由 10 分钟禁用探活裁决。
 			if isModelBlockedError(statusCode, openErr.Error()) {
 				noteModelBlockedHit(curAuthID, circuitKeyModel)
 				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(openErr.Error(), 200)), deps)
@@ -532,8 +532,8 @@ func runTraeAsyncStream(initialAuth *traeAuth, initialAuthID string, ctx traeAsy
 			// 每个 attempt 的用量先按实际账号记失败（与 openErr / pseudo 分支同款），
 			// 再决定透传错误还是换号续试。
 			publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usageDetailForAttempt(result.Usage, result.Chunks), true, statusCode, result.Err.Error(), "", ttftNSBetween(ctx.Started, result.FirstOutputAt), curAuthUID, ctx.SessionKey)
-			// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后返回，
-			// 由冷却探活验证恢复。
+			// 11128（含 200 承载的 event:error 帧）：双写记账后返回，
+			// 恢复由 10 分钟禁用探活裁决。
 			if isModelBlockedError(statusCode, result.Err.Error()) {
 				noteModelBlockedHit(curAuthID, circuitKeyModel)
 				emitTraeAsyncError(ctx.StreamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(result.Err.Error(), 200)), deps)
@@ -660,7 +660,7 @@ func runTraeSyncStream(initialAuth *traeAuth, payload map[string]any, ctx traeSy
 		if callErr != nil {
 			statusCode := parseUpstreamStatusFromErr(callErr)
 			log.Printf("[traework] exec stream upstream error: model=%s auth_hash=%s status=%d err=%s", ctx.Model, authLogHash(curAuthID), statusCode, truncateRedacted(callErr.Error(), 200))
-			// 11128：写入账号×模型冷却后直接返回，由冷却探活验证恢复。
+			// 11128：双写记账（模型冷却 + 账号禁用写盘）后直接返回，恢复由禁用探活裁决。
 			if isModelBlockedError(statusCode, callErr.Error()) {
 				noteModelBlockedHit(curAuthID, circuitKeyModel)
 				publishUsage(ctx.Model, ctx.UpstreamModel, curAuthUID, ctx.Started, usage.Detail{}, true, statusCode, callErr.Error(), "", 0, curAuthUID, ctx.SessionKey)
@@ -738,8 +738,8 @@ func runTraeSyncStream(initialAuth *traeAuth, payload map[string]any, ctx traeSy
 		}
 
 		// 3. HTTP 200 内的账号级 SSE 错误可继续换号，其余错误立即返回。
-		// 11128（含 200 承载的 event:error 帧）：写入账号×模型冷却后返回，
-		// 由冷却探活验证恢复。
+		// 11128（含 200 承载的 event:error 帧）：双写记账后返回，
+		// 恢复由 10 分钟禁用探活裁决。
 		if isModelBlockedError(resp.StatusCode, collectErr.Error()) {
 			noteModelBlockedHit(curAuthID, circuitKeyModel)
 			reconcileAfterExecutorErrorForModel(curAuthID, circuitKeyModel, resp.StatusCode, collectErr.Error())

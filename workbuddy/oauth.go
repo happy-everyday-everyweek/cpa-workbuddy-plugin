@@ -208,7 +208,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// refreshed credential itself after Refresh returns (conductor.go
 	// refreshAuth → m.Update → persist). Writing from the plugin too would
 	// double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa, req.Metadata)})
 }
 
 // preserveExpiry reuses the previous token's expiresAt when the refresh
@@ -231,8 +231,19 @@ func preserveExpiry(newExpiry, oldExpiry int64) int64 {
 // NEW file, and the old one stays → duplicate auth records.
 //
 // Returning empty FileName = "keep what you had" → no rename, no dup.
-func toAuthDataForRefresh(sa *storedAuth) pluginapi.AuthData {
-	ad := toAuthDataOpts(sa, nil, false)
+//
+// hostMeta 是宿主在刷新请求里带进来的当前记录元数据。禁用状态与探活标记都必须
+// 照原样回传：刷新只换 token，不表达「这个号可以重新接流量」。宿主选取刷新候选
+// 时不看 Disabled（auto_refresh_loop.go nextRefreshCheckAt 无禁用判据），若这里
+// 固定回 disabled:false，禁用中的号会被一次后台刷新静默解封、绕开 10 分钟探活。
+//
+// [参数] sa：已刷新凭据的账号；hostMeta：宿主带来的当前元数据。
+// [返回] 供宿主落盘与更新内存记录的 AuthData。
+// 最近修改时间：2026-10-22；改动原因：回传禁用状态与本机制标记，避免刷新解封。
+func toAuthDataForRefresh(sa *storedAuth, hostMeta map[string]any) pluginapi.AuthData {
+	disabled, _ := hostMeta["disabled"].(bool)
+	ad := toAuthDataOpts(sa, nil, disabled)
+	carryFailoverKeysIntoMetadata(ad.Metadata, hostMeta)
 	ad.FileName = "" // let host backfill original
 	ad.ID = ""       // let host compute from path (prevents ID mismatch dupes)
 	return ad

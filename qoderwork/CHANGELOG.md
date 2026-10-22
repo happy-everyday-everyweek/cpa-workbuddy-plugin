@@ -1,5 +1,19 @@
 # QoderWork Plugin Changelog
 
+## 0.10.0
+
+### Feat - 账号故障改为写盘禁用 + 每 10 分钟只探失败模型
+
+- 变更要点:
+  1. 失败双写：一次上游失败同时写内存阶梯冷却与盘上 `disabled: true`（宿主路由判据），冷却只负责写盘生效前的毫秒窗口与写盘失败时的兜底。改动前 qoderwork 的冷却只有账号单层、且完全不做自动探活，失败账号只能等冷却自然到期。
+  2. 探活只回放失败的那一个模型，它探通才写回 `disabled: false`；没有记录到失败模型则跳过该账号，不退化为全量轮测。
+  3. 探活周期固定 10 分钟（账号规模将到 200 个，60 秒扫一轮不可行）；单轮串行、上一轮未完成则本轮直接跳过。
+  4. 新增单账号单日探活失败上限 10 次：达到上限后当日不再探测，本地 0 点恢复。失败号不值得每小时重复打十次。
+  5. 写盘后轮询 `host.auth.list` 确认宿主内存已吸收新状态：写盘成功但宿主未吸收等于「写了就算禁了」，请求仍会打到已知坏号。
+  6. token 刷新与保活路径原样带回 `disabled` 与本机制标记：宿主挑刷新候选不看 `Disabled`，插件若在回传里固定 `disabled:false`，禁用中的号会被一次后台刷新静默解封、完全绕开探活。
+  7. 面板新增「失败禁用 · <模型>（10 分钟探活中）」段与当日探活配额，与冷却倒计时分开显示。
+- 涉及文件: `failover_disable.go`（新增）`failover_disable_test.go`（新增）`accountFailover.go` `active_ping.go` `host_auth.go` `keepalive.go` `lifecycle.go` `management.go` `oauth.go` `panel.go` `stream.go` `watchdog.go` `main.go` `VERSION`
+
 ## 0.9.49
 
 ### Fix - 模型对外 ID 改用官方展示名，并补齐执行链回译

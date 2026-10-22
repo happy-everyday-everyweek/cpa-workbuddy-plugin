@@ -540,7 +540,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.RefreshToken = tok.RefreshToken
 		sa.Auth.ExpiresAt = preserveExpiry(deviceExpiryUnix(tok), sa.Auth.ExpiresAt)
 		invalidateCosySession(sa.Account.UID)
-		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa, req.Metadata)})
 	}
 
 	// Legacy PAT family: Tier 1 jrt- refresh → Tier 2 PAT re-exchange.
@@ -564,7 +564,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// Host persists the refreshed credential itself after Refresh returns
 	// (conductor.go refreshAuth → m.Update → persist). Writing from the
 	// plugin too would double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa, req.Metadata)})
 }
 
 // preserveExpiry reuses the previous token's expiresAt when the refresh
@@ -580,8 +580,18 @@ func preserveExpiry(newExpiry, oldExpiry int64) int64 {
 // toAuthDataForRefresh mirrors the workbuddy helper: blank out FileName and
 // ID so the host backfills from the original auth path (prevents ID mismatch
 // duplicate files when Refresh round-trips the record).
-func toAuthDataForRefresh(sa *storedAuth) pluginapi.AuthData {
-	ad := toAuthDataOpts(sa, nil, false)
+//
+// disabled 与 failover 标记必须原样带回：宿主挑选刷新候选时不看 Disabled，
+// 插件若在刷新回传里固定 disabled:false，禁用中的号会被一次后台 token 刷新
+// 静默解封、完全绕开 10 分钟禁用探活。
+//
+// [参数] sa：刷新后的凭据；hostMeta：宿主交来的 Metadata（可为 nil）。
+// [返回] 回传给宿主的 AuthData。
+// 最近修改时间：2026-10-22；改动原因：新增元数据入参，避免刷新路径解封禁用号。
+func toAuthDataForRefresh(sa *storedAuth, hostMeta map[string]any) pluginapi.AuthData {
+	disabled, _ := hostMeta["disabled"].(bool)
+	ad := toAuthDataOpts(sa, nil, disabled)
+	carryFailoverKeysIntoMetadata(ad.Metadata, hostMeta)
 	ad.FileName = "" // let host backfill original
 	ad.ID = ""       // let host compute from path (prevents ID mismatch dupes)
 	return ad

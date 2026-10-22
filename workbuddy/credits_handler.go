@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -175,125 +174,6 @@ func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {
 	cur := checkinAuto
 	checkinAutoMu.Unlock()
 	return map[string]any{"checkin_auto": cur, "persistent": false}
-}
-
-// handleGrowth serves POST /growth: runs the growth-center auto-claim flow for
-// one account (body.auth_index) or the whole CN fleet.
-//
-// 单账号模式（body.auth_index 非空）：直接对目标账号执行一次
-// runGrowthForAccount，返回该账号的分段结果；Global 账号直接拒绝。
-// 批量模式（auth_index 为空）：对全部 CN 账号扇出（sem=4），Global 账号计入
-// skipped_global 且不发任何上游请求。响应沿用 {results, summary} 面板契约。
-//
-// [参数] req：管理请求（可选 body.auth_index）。
-// [返回] {results, summary} 或 {error}。
-// 最近修改时间：2026-10-15 22:30:00 新增成长中心管理路由与面板入口（TASK-3.1）
-func handleGrowth(req pluginapi.ManagementRequest) map[string]any {
-	// 1. 解析可选 auth_index：非空即单账号模式
-	var body struct {
-		AuthIndex string `json:"auth_index"`
-	}
-	_ = json.Unmarshal(req.Body, &body)
-	authIndex := strings.TrimSpace(body.AuthIndex)
-	single := authIndex != ""
-
-	// 2. 选取目标账号：单账号按 auth_index 过滤，批量取全部
-	files, err := hostAuthListFn()
-	if err != nil {
-		return map[string]any{"error": err.Error()}
-	}
-	var targets []pluginapi.HostAuthFileEntry
-	for _, f := range files {
-		if !single || f.AuthIndex == authIndex {
-			targets = append(targets, f)
-		}
-	}
-	if len(targets) == 0 {
-		return map[string]any{"error": "no matching account"}
-	}
-
-	// 3. 扇出执行（sem=4），逐账号独立执行互不阻塞
-	results := make([]map[string]any, len(targets))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
-	for i, f := range targets {
-		wg.Add(1)
-		go func(i int, f pluginapi.HostAuthFileEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			results[i] = growthOneAccount(f)
-		}(i, f)
-	}
-	wg.Wait()
-
-	// 4. 汇总计数（字段名为面板契约：panel.html growthOne 读取
-	//    success/fail/skipped_global/credits_gained/energy_gained）
-	var creditsN, energyN int64
-	successN, failN, globalN := 0, 0, 0
-	for _, out := range results {
-		if out == nil {
-			continue
-		}
-		if out["error"] != nil {
-			failN++
-			continue
-		}
-		if out["skipped_global"] == true {
-			globalN++
-			continue
-		}
-		successN++
-		creditsN += jsonI64(out, "credits_gained")
-		energyN += jsonI64(out, "energy_gained")
-	}
-	return map[string]any{
-		"results": results,
-		"summary": map[string]any{
-			"total":          len(targets),
-			"success":        successN,
-			"fail":           failN,
-			"skipped_global": globalN,
-			"credits_gained": creditsN,
-			"energy_gained":  energyN,
-		},
-	}
-}
-
-// growthOneAccount 对单个账号执行一次成长中心领奖并归一化返回字段。
-// Global 账号无成长中心能力，直接标记 skipped_global 且不发上游请求。
-// [参数] f：账号条目。
-// [返回] 单账号结果 map（含 credits_gained / energy_gained / energy_balance / segments 等）。
-// 最近修改时间：2026-10-16 02:00:00 新增 energy_balance 字段（0.16.2）
-func growthOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
-	// 1. 取账号凭据；失败即回传错误
-	out := map[string]any{"auth_index": f.AuthIndex}
-	sa, err := hostAuthGetFn(f.AuthIndex)
-	if err != nil {
-		out["error"] = err.Error()
-		return out
-	}
-	out["nickname"] = sa.Account.Nickname
-	// 2. Global 账号无成长中心能力：直接标记跳过，不发任何上游请求
-	if isGlobalDomain(sa.Auth.Domain) {
-		out["success"] = false
-		out["skipped_global"] = true
-		out["message"] = "国际版账号无成长中心，请使用签到/加油包"
-		return out
-	}
-	// 3. CN 账号执行成长中心并把分段结果归一化到面板契约字段
-	gr := runGrowthForAccount(sa, f.AuthIndex)
-	out["success"] = len(gr.Errors) == 0
-	out["credits_gained"] = gr.CreditsGained
-	out["energy_gained"] = gr.EnergyGained
-	out["energy_balance"] = gr.EnergyBalance
-	out["tasks_accepted"] = gr.TasksAccepted
-	out["tasks_claimed"] = gr.TasksClaimed
-	out["segments"] = gr.Segments
-	if len(gr.Errors) > 0 {
-		out["errors"] = gr.Errors
-	}
-	return out
 }
 
 // handleClaimTrial claims the expert trial pack for one Global account.

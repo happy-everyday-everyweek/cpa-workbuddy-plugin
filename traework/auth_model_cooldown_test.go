@@ -129,7 +129,7 @@ func TestResetAuthModelFailoverKeepsAccountState(t *testing.T) {
 	}
 }
 
-// TestLastFailoverModelRecorded 验证最后失败模型被记录，供冷却前探活回放。
+// TestLastFailoverModelRecorded 验证最后失败模型被记录，供禁用探活回放。
 func TestLastFailoverModelRecorded(t *testing.T) {
 	resetFailover(t)
 
