@@ -2,7 +2,7 @@
 // workbuddy-<uid>.json naming rule, UID sanitization (path-traversal defense),
 // path safety checks, and the read / write / delete helpers that talk to the
 // host's auth store via host.auth.* RPC. Callers above (lifecycle reconcile)
-// decide when to disable / re-enable / delete; this file decides how.
+// decide when to disable / re-enable an account; this file decides how.
 package main
 
 import (
@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 // authFileNameFor matches toAuthData naming: always workbuddy-<uid>.json when UID is known.
@@ -100,10 +99,6 @@ func resolveAuthFileTarget(sa *storedAuth, phys *hostAuthPhysical) (name, path s
 	return name, path, legacyPath
 }
 
-// hostAuthPersist saves via host API only. Dual-writing the physical path after
-// a successful host.auth.save is redundant (host already WriteFile) and can
-// re-fire the watcher → extra re-parse / transient dual registration risk.
-
 type hostAuthPhysical struct {
 	AuthIndex string
 	Name      string
@@ -133,64 +128,6 @@ func hostAuthGetPhysical(authIndex string) (*hostAuthPhysical, error) {
 		JSON:      resp.JSON,
 		Disabled:  parseDisabledFromAuthJSON(resp.JSON),
 	}, nil
-}
-
-// hostAuthSaveJSON persists credential JSON via host.auth.save.
-
-func hostAuthPersist(name, path string, raw []byte) error {
-	_ = path // reserved for callers that still pass physical path for migrate logic
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("empty auth file name")
-	}
-	return hostAuthSaveJSON(name, raw)
-}
-
-// hostAuthPersistMigrate is like hostAuthPersist but also removes a legacy path
-// when the canonical name differs (workbuddy.json → workbuddy-<uid>.json).
-
-func hostAuthPersistMigrate(name, path, legacyPath string, raw []byte) error {
-	if err := hostAuthPersist(name, path, raw); err != nil {
-		return err
-	}
-	// If path was legacy and name is canonical, also write canonical path next to it.
-	if legacyPath != "" && !strings.EqualFold(filepath.Base(legacyPath), name) {
-		// host.auth.save already wrote name under auth dir; drop legacy file.
-		// A-36: use deleteAuthFileInDir (abs path + dir confine) for consistency.
-		if isLegacyWorkbuddyAuthName(filepath.Base(legacyPath)) {
-			_ = deleteAuthFileInDir(legacyPath, filepath.Dir(legacyPath))
-		}
-	}
-	// If path points at legacy but name is uid form, do not dual-write path (would keep legacy alive).
-	return nil
-}
-
-// buildAuthFileJSON produces host-save payload: nested storage + top-level metadata.
-// extra merges additional top-level keys (optional).
-
-func hostAuthSaveJSON(name string, raw []byte) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("empty auth file name")
-	}
-	saveReq := pluginapi.HostAuthSaveRequest{
-		Name: name,
-		JSON: raw,
-	}
-	saveBody, _ := json.Marshal(saveReq)
-	rawResp, err := hostCall(pluginabi.MethodHostAuthSave, saveBody)
-	if err != nil {
-		return fmt.Errorf("host.auth.save: %w", err)
-	}
-	var env envelope
-	if err := json.Unmarshal(rawResp, &env); err != nil || !env.OK {
-		msg := "host.auth.save failed"
-		if env.Error != nil && env.Error.Message != "" {
-			msg = truncateRedacted(env.Error.Message, 200)
-		}
-		return fmt.Errorf("%s", msg)
-	}
-	return nil
 }
 
 // writeAuthFileDirect atomically replaces the physical auth file with raw.
@@ -251,7 +188,8 @@ func persistAuthDirect(name, path, legacyPath string, raw []byte) error {
 	return nil
 }
 
-// lifecycleStateUnchanged avoids redundant saves when note/disabled unchanged.
+// buildAuthFileJSON produces host-save payload: nested storage + top-level metadata.
+// extra merges additional top-level keys (optional).
 
 func buildAuthFileJSON(sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
 	if sa == nil {

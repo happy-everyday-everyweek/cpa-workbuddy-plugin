@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -90,6 +93,46 @@ func TestMinRoutableCredits_Configurable400Boundary(t *testing.T) {
 	}
 	if !accountRoutable("wb-700") {
 		t.Fatal("explicit min_routable_credits: 0 must disable the low-credit gate")
+	}
+}
+
+// TestMinRoutableCredits_RegisteredAsConfigField 锁定「红线可在配置文件修改」
+// 这一对外承诺：只被 configure() 解析还不够，必须同时登记到插件 ConfigFields，
+// 管理端才会把该键渲染成可编辑项；漏登记会让配置项实际存在却无处可改。
+func TestMinRoutableCredits_RegisteredAsConfigField(t *testing.T) {
+	fields := wbRegistration().Metadata.ConfigFields
+	for _, f := range fields {
+		if f.Name != "min_routable_credits" {
+			continue
+		}
+		if f.Type != pluginapi.ConfigFieldTypeInteger {
+			t.Fatalf("min_routable_credits type = %v, want integer", f.Type)
+		}
+		if !strings.Contains(f.Description, fmt.Sprintf("%d", defaultMinRoutableCredits)) {
+			t.Fatalf("description must state the %d default, got %q", defaultMinRoutableCredits, f.Description)
+		}
+		return
+	}
+	t.Fatal("min_routable_credits 未登记到 ConfigFields：用户在配置里改了也不会被管理端暴露")
+}
+
+// TestNoAutomaticAccountDeletion 锁定「耗尽不再自动删号」：删号行为已下线
+// （国际版由 workbuddy-ai 插件专门承载），生命周期只允许禁用/恢复。
+// 直接扫生产源码，防止任何人重新接回一条自动删除通道。
+func TestNoAutomaticAccountDeletion(t *testing.T) {
+	files := []string{"policy.go", "lifecycle.go"}
+	forbidden := []string{"deleteAuthFileInDir", "deleteAuth(", "lifecycleDelete", "os.Remove("}
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		src := string(data)
+		for _, bad := range forbidden {
+			if strings.Contains(src, bad) {
+				t.Fatalf("%s 仍包含自动删除通道 %q；生命周期只允许禁用/恢复", name, bad)
+			}
+		}
 	}
 }
 

@@ -50,10 +50,9 @@ usage_config.go   configure + resolveUsageReport + probe* + config vars
 host_auth.go      hostAuthList/Get/GetBundle (host auth-store RPC)
 
 lifecycle.go      reconcileOneAccount/AllAccounts/AfterExecutorError/ByUID +
-                  applyExhaustedPolicy + lifecycleState
+                  lifecycleState
 policy.go         lifecycleAction decisions (pure functions) + displayNote + labelForAuth
-authfile.go       authFileNameFor/sanitizeUIDForFileName/hostAuthPersist/deleteAuth +
-                  path safety checks
+authfile.go       authFileNameFor/sanitizeUIDForFileName + path safety checks + direct writes
 
 anomaly.go        anomalySet + persistAnomalyToggle + refreshAnomalySetFromDisk +
                   clearAllAnomalies + freezeAccountForAnomaly + anomalyRefreshLoop +
@@ -100,9 +99,9 @@ schedulerLoop → runAutoCheckin (sem=4 concurrent)
   → processAutoCheckinAccount per account
       → fetchCheckinStatus → performCheckinCall if needed
       → update accountCache (merge, not wipe)
-      → reconcileOneAccount → applyExhaustedPolicy
-          → policy.go decides: disable (CN) / delete (Global) / reenable (CN)
-          → authfile.go applies: hostAuthPersist / deleteAuth
+      → reconcileOneAccount
+          → policy.go decides: disable / reenable / none
+          → authfile.go applies: persistAuthDirect
 ```
 
 ### Dashboard load

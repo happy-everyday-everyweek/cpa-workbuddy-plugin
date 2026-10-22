@@ -72,35 +72,32 @@ func TestLifecycleActionFor(t *testing.T) {
 	ex := &creditsSummary{TotalRemain: 0, TotalUsed: 5}
 	ok := &creditsSummary{TotalRemain: 10, TotalUsed: 1}
 	cases := []struct {
-		name   string
-		region string
-		cr     *creditsSummary
-		want   lifecycleAction
+		name string
+		cr   *creditsSummary
+		want lifecycleAction
 	}{
-		{"cn exhausted", "cn", ex, lifecycleDisable},
-		{"global exhausted", "global", ex, lifecycleDelete},
-		{"cn ok", "cn", ok, lifecycleNone},
-		{"global ok", "global", ok, lifecycleNone},
-		{"unknown", "cn", nil, lifecycleNone},
+		{"exhausted", ex, lifecycleDisable},
+		{"healthy", ok, lifecycleNone},
+		{"unknown", nil, lifecycleNone},
 	}
 	for _, tc := range cases {
-		if got := lifecycleActionFor(tc.region, tc.cr); got != tc.want {
+		if got := lifecycleActionFor(tc.cr); got != tc.want {
 			t.Fatalf("%s: got %v want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestShouldReenableCN(t *testing.T) {
-	if shouldReenableCN(false, &creditsSummary{TotalRemain: 10}) {
+func TestShouldReenable(t *testing.T) {
+	if shouldReenable(false, &creditsSummary{TotalRemain: 10}) {
 		t.Fatal("enabled account should not reenable")
 	}
-	if shouldReenableCN(true, nil) {
+	if shouldReenable(true, nil) {
 		t.Fatal("unknown credits must not reenable")
 	}
-	if shouldReenableCN(true, &creditsSummary{TotalRemain: 0, TotalUsed: 5}) {
+	if shouldReenable(true, &creditsSummary{TotalRemain: 0, TotalUsed: 5}) {
 		t.Fatal("exhausted must not reenable")
 	}
-	if !shouldReenableCN(true, &creditsSummary{TotalRemain: 3}) {
+	if !shouldReenable(true, &creditsSummary{TotalRemain: 3}) {
 		t.Fatal("disabled + remain should reenable")
 	}
 }
@@ -303,13 +300,13 @@ func TestDeleteAuthFileInDir(t *testing.T) {
 }
 
 func TestLifecycleActionFor_IdempotentPolicy(t *testing.T) {
-	// Applying action twice with same inputs must stay disable/delete (not flip).
+	// Applying action twice with same inputs must stay disable (not flip).
 	ex := &creditsSummary{TotalRemain: 0, TotalUsed: 1}
-	if lifecycleActionFor("cn", ex) != lifecycleDisable {
-		t.Fatal("cn")
+	if lifecycleActionFor(ex) != lifecycleDisable {
+		t.Fatal("exhausted must disable")
 	}
-	if lifecycleActionFor("global", ex) != lifecycleDelete {
-		t.Fatal("global")
+	if lifecycleActionFor(ex) != lifecycleDisable {
+		t.Fatal("second call must stay disable")
 	}
 	// Soft rate limit body never hard-credit alone.
 	if isHardCreditError(429, "too many requests") {

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.0
+
+### Breaking - 下线 Global 耗尽自动删号；低额红线改为可配置项
+
+- 变更要点:
+  1. **删除「Global 账号耗尽自动删除凭据」**：国际版改由 `workbuddy-ai` 插件专门承载，本插件不再对 Global 物理删号。耗尽与 CN 一致只写盘 `disabled: true` + `exhausted_disable` 标记，凭据保留，额度恢复后自动重新启用。
+  2. 生命周期语义随之统一：`lifecycleActionFor` 去掉 region 分叉（Global→delete），恢复分支不再限定 CN；`shouldReenableCN` 更名 `shouldReenable`。
+  3. 联动删除孤儿实现：`lifecycleDelete` 枚举与 String 分支、`applyExhaustedPolicy`、`deleteAuth`、`peerAuthDir`、`hostAuthPersist`、`hostAuthPersistMigrate`、`hostAuthSaveJSON`（后三者在删号链移除后已无任何调用方）。
+  4. **`min_routable_credits` 登记为插件配置项**（Integer，默认 400，显式 `0` 关闭）：此前只能被 `configure()` 解析、未进 `ConfigFields`，管理端看不到该键，用户无法在配置文件/管理界面修改。默认值本身不变。
+  5. 文档口径同步：根 `README.md`、`workbuddy/README.md`、`README_CN.md`、`docs/architecture.md`、面板副标题不再出现「Global 删除」，并把红线描述改为「可在配置文件配置修改」。
+  6. 新增守卫用例：`TestMinRoutableCredits_RegisteredAsConfigField`（配置项必须登记且类型/默认值口径一致）、`TestNoAutomaticAccountDeletion`（生产源码不得再出现自动删除通道）。两项均经变异反证确认可捕获回归。
+- 涉及文件: `policy.go` `lifecycle.go` `authfile.go` `main.go` `lifecycle_test.go` `min_routable_credits_test.go` `panel.html` `README.md` `README_CN.md` `docs/architecture.md` `VERSION` `../../README.md`
+
 ## 0.17.1
 
 ### Fix - 安全缓冲额度红线默认值 20 → 400

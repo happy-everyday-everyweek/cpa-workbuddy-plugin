@@ -1,20 +1,19 @@
 // lifecycle.go implements credit-based auth lifecycle for workbuddy:
-//   - CN exhausted → AUTO-DISABLE: write disabled:true + top-level marker
+//   - Exhausted → AUTO-DISABLE: write disabled:true + top-level marker
 //     exhausted_disable:true (policy update 2026-09-08, user mandate: 耗尽
 //     停用保留，但必须能自动恢复). The 4h check-in reconcile then re-enables
 //     the account automatically once refreshed credits are > 0.
-//   - Global exhausted → delete auth file (one-shot quota)
+//   - 国际版（Global）账号不再自动删号：Global 由 workbuddy-ai 插件专门承载，
+//     本插件对 CN / Global 一视同仁，只写盘禁用、保留凭据。
 //   - Manual disable (manual_disable marker, or a disabled doc without the
 //     exhausted_disable marker written by the host UI) is NEVER auto-touched:
 //     no automatic path re-enables or re-disables it.
 //   - Unknown credits → no-op (never mis-kill)
 //   - Hard credit errors from executor → recheck credits then apply policy
-//   - Soft rate limits → do not delete Global
+//   - Soft rate limits → do not touch the account
 package main
 
 import (
-	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -81,7 +80,7 @@ func pruneLifecycleState() {
 //     reconcile never auto-re-enables a manually disabled account, even
 //     when credits recover.
 //   - Auto exhaustion path (extra=nil, the only remaining automatic caller
-//     set — applyExhaustedPolicy / reconcileOneAccount lifecycleDisable):
+//     is reconcileOneAccount lifecycleDisable):
 //     writes disabled:true + exhausted_disable:true when the account is
 //     currently enabled (耗尽自动停用). The 4h check-in reconcile clears the
 //     pair once refreshed credits are > 0 (自动恢复). If the file is already
@@ -214,7 +213,7 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if !shouldReenableCN(true, cr) {
+	if !shouldReenable(true, cr) {
 		return nil
 	}
 	note := displayNote(sa, cr, false)
@@ -243,77 +242,6 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 	return nil
 }
 
-// deleteAuth removes Global exhausted credentials from disk.
-func deleteAuth(authIndex, authID string, sa *storedAuth) error {
-	mu := checkinLockFor(authIndex)
-	mu.Lock()
-	defer mu.Unlock()
-
-	phys, err := hostAuthGetPhysical(authIndex)
-	if err != nil {
-		return err
-	}
-	path := strings.TrimSpace(phys.Path)
-	if path == "" {
-		// Try to reconstruct path from peer workbuddy files' directory + canonical name.
-		name := authFileNameFor(sa)
-		if phys.Name != "" && !isLegacyWorkbuddyAuthName(phys.Name) {
-			name = phys.Name
-		} else if strings.TrimSpace(phys.Name) != "" && isLegacyWorkbuddyAuthName(phys.Name) {
-			name = authFileNameFor(sa)
-		}
-		if dir := peerAuthDir(); dir != "" && name != "" {
-			candidate := filepath.Join(dir, name)
-			if isSafeWorkbuddyAuthPath(candidate) {
-				path = candidate
-			}
-		}
-	}
-	if path == "" {
-		// Last resort: preserve the existing disabled flag (never auto-disable).
-		existingDisabled := parseDisabledFromAuthJSON(phys.JSON)
-		note := displayNote(sa, nil, existingDisabled)
-		extra := map[string]any{}
-		if manualDisableFromAuthJSON(phys.JSON) {
-			extra["manual_disable"] = true
-		}
-		if exhaustedDisableFromAuthJSON(phys.JSON) {
-			extra["exhausted_disable"] = true
-		}
-		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
-		raw, berr := buildAuthFileJSON(sa, existingDisabled, note, extra)
-		if berr != nil {
-			return fmt.Errorf("no path and build failed: %w", berr)
-		}
-		name := authFileNameFor(sa)
-		if phys.Name != "" && !isLegacyWorkbuddyAuthName(phys.Name) {
-			name = phys.Name
-		}
-		if err := hostAuthPersistMigrate(name, "", "", raw); err != nil {
-			return err
-		}
-		rememberLifecycleState(authID, true, note)
-		accountCache.Delete(authID)
-		clearActiveAuthIfMatch(authID)
-		return nil
-	}
-	if err := deleteAuthFileInDir(path, filepath.Dir(path)); err != nil {
-		return err
-	}
-	// Also remove legacy workbuddy.json if this UID was dual-named historically.
-	if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
-		if dir := filepath.Dir(path); dir != "" {
-			legacy := filepath.Join(dir, authFileName)
-			// A-36: same path safety as primary deleteAuthFileInDir.
-			if isLegacyWorkbuddyAuthName(filepath.Base(legacy)) {
-				_ = deleteAuthFileInDir(legacy, dir)
-			}
-		}
-	}
-	clearDeletedAccountState(authID, authIndex, sa.Account.UID)
-	return nil
-}
-
 // clearDeletedAccountState removes every in-memory trace of a deleted account
 // for each provided key (auth.ID, auth_index, and account UID may each have
 // been used as a key by different code paths). Covers lifecycle state, cached
@@ -331,38 +259,6 @@ func clearDeletedAccountState(keys ...string) {
 		clearActiveAuthIfMatch(k)
 		clearFailoverStateForAuth(k)
 		evictSessionBindingsForAuth(k)
-	}
-}
-
-// peerAuthDir returns the directory of any workbuddy auth file known to the host.
-// Uses HostAuthFileEntry.Path from the list response (A-38: was N+1 — list + getPhysical per file).
-func peerAuthDir() string {
-	files, err := hostAuthList()
-	if err != nil {
-		return ""
-	}
-	for _, f := range files {
-		p := strings.TrimSpace(f.Path)
-		if p != "" {
-			return filepath.Dir(p)
-		}
-	}
-	return ""
-}
-
-// applyExhaustedPolicy applies disable (CN) or delete (Global).
-func applyExhaustedPolicy(authIndex, authID string, sa *storedAuth, cr *creditsSummary, reason string) error {
-	if !lifecycleEnabled() {
-		return nil
-	}
-	action := lifecycleActionFor(accountRegion(sa), cr)
-	switch action {
-	case lifecycleDelete:
-		return deleteAuth(authIndex, authID, sa)
-	case lifecycleDisable:
-		return disableAuth(authIndex, authID, sa, cr, reason, nil)
-	default:
-		return nil
 	}
 }
 
@@ -458,8 +354,7 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 		}
 	}
 
-	region := accountRegion(sa)
-	if region == "cn" && disabled {
+	if disabled {
 		// Manual disable (manual_disable marker) must stick: never
 		// auto-re-enable an account the user explicitly disabled, even when
 		// credits recover.
@@ -475,7 +370,7 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 			_ = syncAuthNote(authIndex, authID, sa, cr, true)
 			return lifecycleNone, nil
 		}
-		if shouldReenableCN(true, cr) {
+		if shouldReenable(true, cr) {
 			if err := reenableAuth(authIndex, authID, sa, cr); err != nil {
 				return lifecycleReenable, err
 			}
@@ -486,18 +381,8 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 		return lifecycleNone, nil
 	}
 
-	act := lifecycleActionFor(region, cr)
+	act := lifecycleActionFor(cr)
 	switch act {
-	case lifecycleDelete:
-		// P1-4: confirm before deleting a Global account — a transient 402
-		// from the upstream billing API could otherwise cause an irreversible
-		// delete. Re-fetch credits once more; only proceed if still exhausted.
-		cr2, err2 := fetchUserResource(sa)
-		if err2 != nil || !isCreditsExhausted(cr2) {
-			// Credits may have recovered (or fetch failed) — don't delete.
-			return lifecycleNone, nil
-		}
-		return lifecycleDelete, deleteAuth(authIndex, authID, sa)
 	case lifecycleDisable:
 		return lifecycleDisable, disableAuth(authIndex, authID, sa, cr, "耗尽", nil)
 	default:

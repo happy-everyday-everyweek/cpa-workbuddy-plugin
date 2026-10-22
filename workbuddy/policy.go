@@ -1,8 +1,8 @@
 // policy.go is the pure decision layer for credit-driven lifecycle actions:
-// given an account's region and current credits, decide whether to disable
-// (CN), delete (Global), re-enable (CN after check-in restores credits), or
-// leave it alone. No I/O happens here — reconcileOneAccount consumes these
-// decisions and applies them via the lifecycle.go authfile helpers.
+// given an account's current credits, decide whether to disable or re-enable
+// it after a check-in restores credits, or leave it alone. No I/O happens
+// here — reconcileOneAccount consumes these decisions and applies them via the
+// lifecycle.go authfile helpers.
 package main
 
 import (
@@ -19,7 +19,6 @@ type lifecycleAction int
 const (
 	lifecycleNone lifecycleAction = iota
 	lifecycleDisable
-	lifecycleDelete
 	lifecycleReenable
 )
 
@@ -27,8 +26,6 @@ func (a lifecycleAction) String() string {
 	switch a {
 	case lifecycleDisable:
 		return "disable"
-	case lifecycleDelete:
-		return "delete"
 	case lifecycleReenable:
 		return "reenable"
 	default:
@@ -36,7 +33,7 @@ func (a lifecycleAction) String() string {
 	}
 }
 
-// lifecycleAuto gates automatic disable/delete/reenable. Default false.
+// lifecycleAuto gates automatic disable/reenable. Default false.
 var (
 	lifecycleAuto   = false
 	lifecycleAutoMu sync.RWMutex
@@ -310,20 +307,18 @@ func envelopeHTTPStatusForError(message string) int {
 	return 0
 }
 
-// lifecycleActionFor chooses disable/delete/none from region + credits.
-// Does not consider reenable (that needs disabled flag).
-func lifecycleActionFor(region string, cr *creditsSummary) lifecycleAction {
+// lifecycleActionFor chooses disable/none from credits.
+// 国际版账号不再由本插件自动删号：Global 归 workbuddy-ai 插件专门承载，
+// 耗尽与 CN 一致只写盘禁用，凭据保留（可人工充值或迁移后恢复）。
+func lifecycleActionFor(cr *creditsSummary) lifecycleAction {
 	if !shouldActOnCredits(cr) {
 		return lifecycleNone
-	}
-	if region == "global" {
-		return lifecycleDelete
 	}
 	return lifecycleDisable
 }
 
-// shouldReenableCN is true when a CN account is disabled but now has credits.
-func shouldReenableCN(disabled bool, cr *creditsSummary) bool {
+// shouldReenable is true when an auto-disabled account now has credits again.
+func shouldReenable(disabled bool, cr *creditsSummary) bool {
 	if !disabled {
 		return false
 	}

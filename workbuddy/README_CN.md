@@ -15,9 +15,9 @@
 - **执行器** — OpenAI 兼容 chat completions，流式（真 SSE，走 `host.stream.emit`）
   和非流式（SSE 折叠成单个 completion）都支持。内置 `tool_choice` 归一、
   Claude Code 模板清洗、按区域注入 system message。
-- **积分生命周期** — CN 账号耗尽自动 `disabled`，签到回血后自动恢复；
-  Global 账号耗尽**删除** auth 文件（一次性 trial 额度）。Executor 遇到硬
-  积分错误立即触发 reconcile。
+- **积分生命周期** — CN 与 Global 账号耗尽均自动 `disabled` 并保留 auth 文件；
+  额度恢复后自动重新启用（国际版由 `workbuddy-ai` 插件专门承载，本插件不再
+  自动删号）。Executor 遇到硬积分错误立即触发 reconcile。
 - **每日签到** — CN 账号每 4 小时自动签到一次（00/04/08/12/16/20 本地时间，可配置）。面板可手动
   全部签到。Per-account 互斥锁防止多浏览器标签并发重复签到。
 - **Trial 领取** — Global 账号可在面板领取一次性 250 积分专家加油包。
@@ -196,10 +196,13 @@ plugins:
 | 状态 | CN 账号 | Global 账号 |
 |---|---|---|
 | 积分 > 0 | active | active |
-| 积分 = 0 | `disabled: true`（auth 文件保留） | auth 文件**删除** |
-| 签到回血 | 自动恢复 | n/a（已删） |
+| 积分 = 0 | `disabled: true`（auth 文件保留） | `disabled: true`（auth 文件保留） |
+| 签到回血 | 自动恢复 | 自动恢复 |
 | Trial 可领 | n/a | 每账号一次 |
 | 积分未知 | 不动（永不误杀） | 不动 |
+
+> 国际版账号归 `workbuddy-ai` 插件专门承载；本插件对 Global 不再自动删除凭据，
+> 耗尽只写盘禁用，凭据可保留供人工充值或迁移后恢复。
 
 Executor 遇到硬积分错误（402、"insufficient credits"、"积分不足" 等）
 会立即触发该账号的 reconcile。

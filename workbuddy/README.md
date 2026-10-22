@@ -19,10 +19,11 @@ dashboard.
   via `host.stream.emit`) and non-streaming (SSE folded into a single
   completion). `tool_choice` normalization, Claude Code template sanitization,
   and per-realm system-message injection are built in.
-- **Credit lifecycle** — CN accounts auto-`disabled` when credits run out and
-  re-enabled when a check-in restores them. Global accounts are deleted on
-  exhaustion (one-shot trial quota). Hard credit errors from the executor
-  trigger an immediate reconcile.
+- **Credit lifecycle** — CN and Global accounts are both auto-`disabled` when
+  credits run out and re-enabled once credits recover; the auth file is always
+  kept (the international realm is served by the dedicated `workbuddy-ai`
+  plugin, so this plugin no longer deletes Global credentials). Hard credit
+  errors from the executor trigger an immediate reconcile.
 - **Daily check-in** — CN accounts are checked in every 4 hours (00/04/08/12/16/20
   local time, configurable). Manual "check in all" from the panel. Per-account
   mutex prevents duplicate claims from racing browser tabs.
@@ -117,9 +118,13 @@ plugins:
       # Runs every 4 hours at 00/04/08/12/16/20 local time.
       checkin_auto: true
 
-      # Credit lifecycle: disable CN on exhaust, delete Global on exhaust,
-      # re-enable CN after check-in restores credits (default false).
+      # Credit lifecycle: disable an account on exhaust (CN and Global alike,
+      # auth file kept), re-enable it once credits recover (default false).
       lifecycle_auto: false
+
+      # Safety buffer: accounts with fewer credits than this are pulled from
+      # the routing pool (default 400, set 0 to disable the gate).
+      min_routable_credits: 400
 
       # Scheduler behavior (default "session"):
       #   session → per-conversation round-robin: same conversation stays on
@@ -237,10 +242,14 @@ reviewed and deleted by hand.
 | State | CN account | Global account |
 |---|---|---|
 | Credits > 0 | active | active |
-| Credits = 0 | `disabled: true` (auth file kept) | auth file **deleted** |
-| Check-in restores credits | re-enabled | n/a (already deleted) |
+| Credits = 0 | `disabled: true` (auth file kept) | `disabled: true` (auth file kept) |
+| Credits recover | re-enabled | re-enabled |
 | Trial available | n/a | claimable once per account |
 | Unknown credits | untouched (never mis-kill) | untouched |
+
+Global credentials are never deleted automatically: the international realm is
+served by the dedicated `workbuddy-ai` plugin, so an exhausted Global account
+here is only disabled on disk and can be recharged or migrated later.
 
 Hard credit errors from the executor (status 402, "insufficient credits",
 "积分不足", etc.) trigger an immediate reconcile of the failing account.
