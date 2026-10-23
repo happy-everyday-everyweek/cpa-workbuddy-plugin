@@ -74,6 +74,7 @@ func configure(raw []byte) {
 	// whole cooldown mechanism (pre-failover behavior).
 	nextFailoverEnabled := true
 	nextMinRoutableCredits := defaultMinRoutableCredits
+	nextLowCreditDisableBelow := defaultLowCreditDisableBelow
 
 	// retry_on_4xx: per-request account-failover budget. Applied ONLY when
 	// the key is present in config_yaml: a valid value is clamped to
@@ -140,6 +141,13 @@ func configure(raw []byte) {
 						nextMinRoutableCredits = n
 					}
 				}
+				if strings.HasPrefix(line, "low_credit_disable_below:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "low_credit_disable_below:"))
+					v = strings.Trim(v, "\"'")
+					if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+						nextLowCreditDisableBelow = n
+					}
+				}
 			if strings.HasPrefix(line, "retry_on_4xx:") {
 				retryOn4xxSeen = true
 				if n, ok := parseRetryOn4xxLine(line); ok {
@@ -192,6 +200,16 @@ func configure(raw []byte) {
 	minRoutableCreditsMu.Lock()
 	minRoutableCredits = nextMinRoutableCredits
 	minRoutableCreditsMu.Unlock()
+
+	// 两条阈值必须保持「禁用线 < 保活线」的合法关系：配反时以保活线为准，
+	// 把禁用线压到它下面——宁可少禁几个号，也不能让「高于保活线却被禁用」
+	// 这种自相矛盾的状态出现。
+	if nextLowCreditDisableBelow > nextMinRoutableCredits && nextMinRoutableCredits > 0 {
+		nextLowCreditDisableBelow = nextMinRoutableCredits
+	}
+	lowCreditDisableBelowMu.Lock()
+	lowCreditDisableBelow = nextLowCreditDisableBelow
+	lowCreditDisableBelowMu.Unlock()
 
 	// management key: config_yaml > env > keep existing. Empty stays empty
 	// (plugin-layer auth disabled, host middleware still guards).

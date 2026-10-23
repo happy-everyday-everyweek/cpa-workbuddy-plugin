@@ -72,26 +72,18 @@ func pruneLifecycleState() {
 	})
 }
 
-// disableAuth applies the exhausted-disable decision for one account.
+// disableAuth 对单个账号执行耗尽停用决策。
 //
-// Dual-path semantics (policy update 2026-09-08):
-//   - Manual toggle path (extra contains manual_disable:true): writes
-//     disabled:true and carries the manual_disable intent marker. The
-//     reconcile never auto-re-enables a manually disabled account, even
-//     when credits recover.
-//   - Auto exhaustion path (extra=nil, the only remaining automatic caller
-//     is reconcileOneAccount lifecycleDisable):
-//     writes disabled:true + exhausted_disable:true when the account is
-//     currently enabled (耗尽自动停用). The 4h check-in reconcile clears the
-//     pair once refreshed credits are > 0 (自动恢复). If the file is already
-//     disabled, the existing flag is preserved untouched: manual_disable
-//     carries forward, exhausted_disable carries forward, and a marker-less
-//     disabled doc (host-UI toggle or unknown writer) gains NO marker — it
-//     stays exactly as the user left it.
-//
-// An existing manual_disable marker is ALWAYS carried forward, so an auto
-// note refresh of an already-manually-disabled account never erases the
-// user's choice. extra merges additional top-level keys into the auth file.
+// 双路径语义：
+//   - 手动路径（extra 含 manual_disable:true）：写 disabled:true 并携带手动意图标记，
+//     reconcile 永不自动解禁用户手动关掉的号。
+//   - 自动耗尽路径（extra=nil，唯一剩余调用方是 reconcileOneAccount 的 lifecycleDisable）：
+//     账号处于启用态时写 disabled:true + exhausted_disable:true；4 小时签到 reconcile
+//     在积分恢复后清除这对标记。已禁用的号原样保留既有标记，不额外加标记。
+// [参数] authIndex：宿主 auth_index；authID：账号标识；sa：凭据；cr：当前积分；
+// reason：附加到 note 的原因片段；extra：需要并入 auth 文件的额外顶层键。
+// [返回] 写盘错误。
+// 最近修改时间：2026-10-23；改动原因：白名单重建时同步搬运低积分禁用标记。
 func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, reason string, extra map[string]any) error {
 	mu := checkinLockFor(authIndex)
 	mu.Lock()
@@ -118,6 +110,7 @@ func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, r
 	// 不搬运就会把 failover_disable 抹掉，探活循环从此找不到该账号（静默遗忘）。
 	if err == nil && phys != nil {
 		merged = putFailoverMarkersIntoExtra(merged, phys.JSON)
+		merged = putLowCreditMarkersIntoExtra(merged, phys.JSON)
 	}
 	// Determine whether this is a manual toggle or an auto-lifecycle call.
 	// Manual toggle (extra contains manual_disable:true) writes disabled:true
@@ -262,8 +255,13 @@ func clearDeletedAccountState(keys ...string) {
 	}
 }
 
-// syncAuthNote writes note without changing disabled state.
+// syncAuthNote 只更新账号 note，不改变 disabled 状态。
+// [参数] authIndex：宿主 auth_index；authID：账号标识；sa：凭据；
+// cr：当前积分；disabled：写入 note 时依据的禁用态。
+// [返回] 写盘错误。
+// 最近修改时间：2026-10-23；改动原因：白名单重建时同步搬运低积分禁用标记。
 func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, disabled bool) error {
+	// 1. 凭据缺失或状态无变化时直接返回，避免无意义写盘。
 	if sa == nil {
 		return nil
 	}
@@ -271,6 +269,7 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 	if lifecycleStateUnchanged(authID, disabled, note) {
 		return nil
 	}
+	// 2. 加账号锁后按磁盘真实状态重算。
 	mu := checkinLockFor(authIndex)
 	mu.Lock()
 	defer mu.Unlock()
@@ -294,6 +293,8 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 			extra["exhausted_disable"] = true
 		}
 		extra = putFailoverMarkersIntoExtra(extra, phys.JSON)
+		// 低积分禁用标记同样必须搬运：它是分级恢复时「这号是不是我禁的」唯一判据。
+		extra = putLowCreditMarkersIntoExtra(extra, phys.JSON)
 	}
 	if lifecycleStateUnchanged(authID, disabled, note) {
 		return nil

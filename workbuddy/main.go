@@ -128,6 +128,10 @@ func init() {
 	// documented in checkin.go:31 from closing stop channels during plugin
 	// teardown.
 	go watchdogLoop()
+	// 积分扫描：每小时串行刷新全部账号（不区分启用/禁用），写 sidecar 后
+	// 逐个跑三档分级检查。与 watchdog 分工：watchdog 管探活，本循环管积分。
+	// 首轮带抖动，避免六个插件同刻对齐形成整点尖峰。
+	go creditSweepLoop()
 	// 禁用探活：每 10 分钟串行遍历被本机制禁用的账号，回放失败模型，成功即解除禁用。
 	// 冷却本身不再探测（cooldown_probe.go 已移除），见 failover_disable.go。
 	go failoverProbeLoop()
@@ -338,7 +342,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.18.0"
+var version = "0.18.1"
 
 func wbRegistration() registration {
 	return registration{
@@ -355,7 +359,8 @@ func wbRegistration() registration {
 				{Name: "token_keepalive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每4小时 access-token 自动刷新，防止 Keycloak 离线会话过期（默认开启）。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "可选模型列表。每个条目可包含 id、name、alias、context、max_tokens、enabled、reasoning 字段；配置后优先于自动获取的模型列表。"},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeSession, schedulerModeCredits, schedulerModeOff}, Description: "多账号选择策略：session（按会话轮询，同一会话 1 小时内固定同一账号；默认）／credits（面板指定的固定账号）／off（交给内置逻辑）。注意：off 且 lifecycle_auto=false 时，额度耗尽的账号仍可能被路由——请启用 lifecycle_auto 或保持 session/credits。"},
-				{Name: "min_routable_credits", Type: pluginapi.ConfigFieldTypeInteger, Description: "安全缓冲额度红线，默认 400 点：剩余积分低于该值的账号视为残血，摘出路由池（调度初筛/换号链/面板选中/会话粘性共用）。填 0 关闭低额保护。"},
+				{Name: "min_routable_credits", Type: pluginapi.ConfigFieldTypeInteger, Description: "保活线，默认 400 点：剩余积分低于该值但高于禁用线的账号打「保活」标，仍可路由但排在正常号之后。填 0 关闭保活降级。"},
+				{Name: "low_credit_disable_below", Type: pluginapi.ConfigFieldTypeInteger, Description: "硬禁用线，默认 100 点：每小时扫描或手动刷新发现剩余积分低于该值时，直接写盘停用该账号；积分回到线上且探活成功才自动解禁。填 0 关闭该机制。"},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "可选：覆盖 CPAMP 用量上报地址（默认 http://cpa-manager-plus:18317/v0/management/usage/import；也可用环境变量 USAGE_REPORT_URL）。"},
 				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "可选：覆盖 CPAMP 管理密钥。优先从环境变量 CPAMP_ADMIN_KEY / USAGE_REPORT_KEY 或密钥文件 /run/secrets/cpamp_admin_key 自动探测。"},
 				{Name: "usage_feed_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "将每次请求的 token 用量追加写入共享 NDJSON 数据流，供 token-usage-tracker 插件消费（默认开启）。"},

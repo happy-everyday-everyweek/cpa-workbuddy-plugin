@@ -76,24 +76,70 @@ var hardCreditMarkers = []string{
 	"not enough credit",
 }
 
-// defaultMinRoutableCredits 是安全缓冲额度红线默认值（400 点）。
-// 剩余额度低于该阈值的账号不再承载新请求，防止推理中途断开。
-// 最近修改时间：2026-10-22；改动原因：20 → 400，单次推理消耗量级已超过旧红线。
+// defaultMinRoutableCredits 是保活线默认值（400 点）。
+// 剩余额度低于该阈值的账号仍可承载请求，但排在健康号之后——它是软降级，
+// 不再是硬排除（2026-10-23 按用户裁定改造）：低于禁用线的号才写盘停用，
+// 禁用线与保活线之间的号属于「保活」档，保留路由能力但优先级最低。
+// 最近修改时间：2026-10-23；改动原因：硬排除改为保活降级，与三档分级对齐。
 const defaultMinRoutableCredits int64 = 400
+
+// defaultLowCreditDisableBelow 是硬禁用线默认值（100 点）。
+// 剩余额度低于该值的账号写盘 disabled:true，由宿主路由判据直接停用；
+// 恢复要求积分回到该值以上且探活成功（见 credit_disable.go）。
+// 最近修改时间：2026-10-23；改动原因：新增三档分级中的硬禁用线。
+const defaultLowCreditDisableBelow int64 = 100
 
 var (
 	minRoutableCredits   int64 = defaultMinRoutableCredits
 	minRoutableCreditsMu sync.RWMutex
+
+	lowCreditDisableBelow   int64 = defaultLowCreditDisableBelow
+	lowCreditDisableBelowMu sync.RWMutex
 )
 
-// loadedMinRoutableCredits 返回当前生效的安全缓冲额度红线。
+// loadedLowCreditDisableBelow 返回当前生效的硬禁用线。
+// [参数] 无。
+// [返回] 积分低于该值的账号会被写盘停用；0 表示关闭该机制。
+// 最近修改时间：2026-10-23；改动原因：新增。
+func loadedLowCreditDisableBelow() int64 {
+	lowCreditDisableBelowMu.RLock()
+	defer lowCreditDisableBelowMu.RUnlock()
+	return lowCreditDisableBelow
+}
+
+// setLowCreditDisableBelow 设置硬禁用线并返回清理函数，供单测使用。
+// [参数] n：新的硬禁用线，负数按 0 处理。
+// [返回] 还原旧值的函数。
+// 最近修改时间：2026-10-23；改动原因：新增。
+func setLowCreditDisableBelow(n int64) func() {
+	if n < 0 {
+		n = 0
+	}
+	lowCreditDisableBelowMu.Lock()
+	old := lowCreditDisableBelow
+	lowCreditDisableBelow = n
+	lowCreditDisableBelowMu.Unlock()
+	return func() {
+		lowCreditDisableBelowMu.Lock()
+		lowCreditDisableBelow = old
+		lowCreditDisableBelowMu.Unlock()
+	}
+}
+
+// loadedMinRoutableCredits 返回当前生效的保活线。
+// [参数] 无。
+// [返回] 保活线阈值；低于该值的账号降级到保活档。
+// 最近修改时间：2026-10-23；改动原因：语义由硬排除红线改为保活线。
 func loadedMinRoutableCredits() int64 {
 	minRoutableCreditsMu.RLock()
 	defer minRoutableCreditsMu.RUnlock()
 	return minRoutableCredits
 }
 
-// setMinRoutableCredits 设置安全缓冲额度红线并返回清理函数，供单测或动态配置使用。
+// setMinRoutableCredits 设置保活线并返回清理函数，供单测或动态配置使用。
+// [参数] n：新的保活线。
+// [返回] 还原旧值的函数。
+// 最近修改时间：2026-10-23；改动原因：语义由硬排除红线改为保活线。
 func setMinRoutableCredits(n int64) func() {
 	minRoutableCreditsMu.Lock()
 	old := minRoutableCredits
@@ -106,15 +152,34 @@ func setMinRoutableCredits(n int64) func() {
 	}
 }
 
-// isCreditsLowOrExhausted 判定账号是否额度耗尽或已低于安全缓冲额度红线。
-func isCreditsLowOrExhausted(cr *creditsSummary) bool {
+// isCreditsRoutable 判定账号积分是否仍允许承载新请求。
+//
+// 三档语义（2026-10-23）：低于硬禁用线或已知耗尽 → 不可路由；
+// 禁用线与保活线之间 → 可路由但降级（保活档）；保活线以上 → 正常。
+// 旧实现把「低于 400 一律摘出路由」，会让 100~400 的健康账号白白闲置；
+// 现在这档账号仍然接流量，只是排在正常号后面（见 scheduler.go 的排序）。
+// nil（积分未知）返回 true：没有数据不等于没钱，误判会把健康号踢出路由。
+// [参数] cr：积分汇总，可为 nil。
+// [返回] true 表示可承载请求。
+// 最近修改时间：2026-10-23；改动原因：三档分级，400 由硬排除改为保活降级。
+func isCreditsRoutable(cr *creditsSummary) bool {
 	if cr == nil {
-		return false
-	}
-	if isCreditsExhausted(cr) {
 		return true
 	}
-	return cr.TotalRemain < loadedMinRoutableCredits()
+	if isCreditsExhausted(cr) {
+		return false
+	}
+	disableBelow := loadedLowCreditDisableBelow()
+	return disableBelow <= 0 || cr.TotalRemain >= disableBelow
+}
+
+// isCreditsLowOrExhausted 判定账号是否已不可路由（旧名保留，语义收窄）。
+// 与 isCreditsRoutable 互为否定，仅供既有调用点过渡使用。
+// [参数] cr：积分汇总，可为 nil。
+// [返回] true 表示积分已不足以承载请求。
+// 最近修改时间：2026-10-23；改动原因：语义从「低于 400」收窄为「低于禁用线或耗尽」。
+func isCreditsLowOrExhausted(cr *creditsSummary) bool {
+	return !isCreditsRoutable(cr)
 }
 
 // isHardCreditError reports business "out of credits" style failures.

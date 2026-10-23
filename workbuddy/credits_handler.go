@@ -392,7 +392,10 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 			} else {
 				acct["credits"] = cr
 				acct["exhausted"] = isCreditsExhausted(cr)
-				acct["low_credits"] = cr != nil && !isCreditsExhausted(cr) && cr.TotalRemain < loadedMinRoutableCredits()
+				// 低额判定统一走三档入口，避免这里与调度/面板各留一份阈值比较。
+				tier := creditTierFor(crRemainOf(cr), loadedLowCreditDisableBelow(), loadedMinRoutableCredits())
+				acct["low_credits"] = tier == creditTierPreserve || tier == creditTierDisabled
+				acct["credit_tier"] = string(tier)
 				if isGlobalDomain(sa.Auth.Domain) {
 					acct["trial_claimed"] = hasTrialPack(cr)
 				}

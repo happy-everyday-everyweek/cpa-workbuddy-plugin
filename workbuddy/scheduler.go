@@ -60,39 +60,32 @@ func loadedSchedulerMode() string {
 	return schedulerMode
 }
 
-// handleSchedulerPick selects a workbuddy auth candidate based on the
-// panel-selected active account. Non-workbuddy candidates are always deferred
-// (Handled: false) so the built-in scheduler handles them.
+// handleSchedulerPick 根据面板选中的活动账号挑选 workbuddy 候选。
+// 非 workbuddy 候选一律延迟（Handled: false），交给宿主内置调度器处理。
 //
-// scheduler_mode:
-//   - "off"     → plugin does NOT handle routing; defer everything to built-in.
-//   - "credits" → plugin picks via panel-selected active account (sticky, with
-//     fallback when that account becomes exhausted/disabled).
-//   - "session" → per-conversation routing: same conversation sticks to one
-//     account for up to 1h, different conversations spread across accounts;
-//     requests without a session identity fall back to the panel-selected
-//     account (same as credits).
+// scheduler_mode 取值：
+//   - "off"：插件不接管路由，全部交给宿主。
+//   - "credits"：按面板选中的活动账号挑选，失效时回退。
+//   - "session"：按会话路由，同一会话粘在一个账号上，不同会话分散；
+//     无会话标识的请求回落到面板选中账号。
 //
-// Default is off (see schedulerMode init). Users opting into the plugin's
-// routing should set scheduler_mode: credits or session in plugin config.
+// 默认 off。需要在插件配置里把 scheduler_mode 设为 credits 或 session 才会接管。
+// [参数] raw：SchedulerPickRequest 的 JSON 原文。
+// [返回] 挑选结果的响应 JSON；不接管时返回 Handled:false。
+// 最近修改时间：2026-10-23；改动原因：积分判据改为三档，并新增保活档整体让位。
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 
-	// v0.6.31: actually honor the scheduler_mode toggle. Previously the config
-	// was parsed but never read here, so "off" silently behaved like "credits".
+	// 1. scheduler_mode 未开启时直接让位给宿主。
 	mode := loadedSchedulerMode()
 	if mode != schedulerModeCredits && mode != schedulerModeSession {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Collect workbuddy candidates only. Accounts in failover cooldown are
-	// skipped so new requests route to a healthy account instead. If EVERY
-	// workbuddy account is cooling down, defer (Handled: false) so the host's
-	// built-in scheduler can fail over to OTHER providers' accounts instead
-	// of pinning the request to a dead account.
+	// 2. 只保留本插件的候选，宿主侧已禁用的直接跳过。
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
 		if c.Provider != providerName {
@@ -107,24 +100,17 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Hard exclusion: 「测试」标签 (scheduled active ping failed while credits
-	// remained) / 冷却 (failover cooldown) accounts never carry traffic. Both
-	// are "not available" by product definition, so they are filtered
-	// unconditionally — there is NO "keep the full list" fallback: when every
-	// candidate is excluded we defer (Handled: false) so the host's built-in
-	// scheduler can fail over to OTHER providers instead of pinning the request
-	// to an account we just declared unusable.
-	// 冷却判定带模型维度：账号×模型级冷却只应挡住同一模型的请求，
-	// 否则一次限流就会把该账号从其它模型上一并摘掉。调度请求的 Model 是
-	// 客户端模型名，需与记账侧一样归一化后再比对。
+	// 3. 排除「测试」标签、账号×模型冷却、以及低于禁用线/已耗尽的账号。
+	// 全部被排除时延迟给宿主，让宿主切到其它 provider，而不是钉死在不可用账号上。
 	upstreamModel := resolveUpstreamModel(req.Model, nil)
 	available := make([]pluginapi.SchedulerAuthCandidate, 0, len(wbCandidates))
 	for _, c := range wbCandidates {
 		if isTestFailed(c.ID) || isAuthModelCoolingDown(c.ID, upstreamModel) {
 			continue
 		}
-		remain, lowOrExhausted := cachedCreditsScore(c.ID)
-		if lowOrExhausted || (remain >= 0 && remain < loadedMinRoutableCredits()) {
+		// 三档语义（2026-10-23）：只有低于硬禁用线或已耗尽的号才真正摘出；
+		// 禁用线与保活线之间的号仍可路由，只是被下面的档位过滤降到最后。
+		if _, lowOrExhausted := cachedCreditsScore(c.ID); lowOrExhausted {
 			continue
 		}
 		available = append(available, c)
@@ -134,8 +120,15 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 	wbCandidates = available
 
-	// 健康平摊轮询：废除残血优先（Low-Credit-First）反模式。
-	// 健康可用账号按高积分优先排序（未测 -1 排最后），并在同一健康阶梯内平摊负载。
+	// 4. 保活档整体让位：存在正常档候选时，保活档不参与本次挑选。
+	//
+	// 用过滤而非排序：pickActiveAuth 会尊重面板选中，保活号若正好被选中，
+	// 排序压不住它；过滤后保活档只在正常档全空时兜底，才是「优先级最低」。
+	if normal := filterCandidatesByTier(wbCandidates, creditTierNormal); len(normal) > 0 {
+		wbCandidates = normal
+	}
+
+	// 5. 同档内按积分降序平摊：未测 (-1) 排最后。
 	sort.SliceStable(wbCandidates, func(i, j int) bool {
 		left, _ := cachedCreditsScore(wbCandidates[i].ID)
 		right, _ := cachedCreditsScore(wbCandidates[j].ID)
@@ -145,9 +138,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return left > right
 	})
 
-	// Build thin view for active-auth picker. Exhausted accounts are passed
-	// through with Exhausted=true (rather than pre-filtered) so the picker can
-	// skip them and still report "no healthy account" when they are all spent.
+	// 6. 转成挑选器需要的瘦视图。
 	cands := make([]activeAuthCandidate, 0, len(wbCandidates))
 	for _, c := range wbCandidates {
 		_, exhausted := cachedCreditsScore(c.ID)
@@ -157,6 +148,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 			Exhausted: exhausted,
 		})
 	}
+	// 7. 会话模式按会话粘性挑，其余按面板选中挑；挑不出则延迟给宿主。
 	var picked string
 	if mode == schedulerModeSession {
 		picked = pickSessionAuth(extractSessionKey(req), cands)
@@ -172,7 +164,10 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	})
 }
 
-// candidateDisabled reports host-disabled auth from Status/metadata.
+// candidateDisabled 判定宿主侧是否已禁用该账号（Status / metadata）。
+// [参数] c：调度候选。
+// [返回] true 表示已禁用。
+// 最近修改时间：2026-10-23；改动原因：补函数头元信息。
 func candidateDisabled(c pluginapi.SchedulerAuthCandidate) bool {
 	st := strings.ToLower(strings.TrimSpace(c.Status))
 	if st == "disabled" {
@@ -189,6 +184,39 @@ func candidateDisabled(c pluginapi.SchedulerAuthCandidate) bool {
 		}
 	}
 	return false
+}
+
+// filterCandidatesByTier 返回属于指定档位的候选。
+// [参数] candidates：候选列表；tier：目标档位。
+// [返回] 新切片，不修改入参。
+// 最近修改时间：2026-10-23；改动原因：新增，保活档整体让位需要按档位过滤。
+func filterCandidatesByTier(candidates []pluginapi.SchedulerAuthCandidate, tier creditTier) []pluginapi.SchedulerAuthCandidate {
+	out := make([]pluginapi.SchedulerAuthCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if authCreditTier(c.ID) == tier {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// authCreditTier 返回账号当前所属积分档位，供排序把保活档整体沉底。
+//
+// 优先读 sidecar 快照：它是跨重启存活的唯一真相源，且已经固化了分级结果，
+// 不必在这里重算阈值。快照缺失时退回内存缓存现算，两者都没有则按正常档处理
+// （未知不等于没钱，误降级会让健康号被无谓地排到最后）。
+// [参数] authID：账号标识。
+// [返回] 该账号的档位。
+// 最近修改时间：2026-10-23；改动原因：新增，三档分级的排序唯一入口。
+func authCreditTier(authID string) creditTier {
+	if entry, ok := creditSnapshotGet(authID); ok && entry.Tier != "" {
+		return entry.Tier
+	}
+	remain, lowOrExhausted := cachedCreditsScore(authID)
+	if lowOrExhausted {
+		return creditTierDisabled
+	}
+	return creditTierFor(remain, loadedLowCreditDisableBelow(), loadedMinRoutableCredits())
 }
 
 // cachedCreditsScore returns (remain, exhaustedOrLow) from accountCache.

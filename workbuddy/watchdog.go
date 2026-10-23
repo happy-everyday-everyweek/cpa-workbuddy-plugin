@@ -1,18 +1,17 @@
 // watchdog.go runs the periodic account watchdog — every interval (default
-// 10 minutes) it refreshes the credits snapshot for every workbuddy account
-// and fires the scheduled active ping (the "hi" reasoning request) through
-// the same throttled refresh runner.
+// 10 minutes) it fires the scheduled active ping (the "hi" reasoning request)
+// for every workbuddy account whose 4h throttle has expired.
 //
 // The ping is what keeps accounts warm AND what produces the 「测试」tag: a
 // scheduled ping that fails while the account still has credits writes
 // `test_failed: true` (active_ping.go) so the panel can surface it for manual
-// cleanup. A later successful ping clears the tag. The credits refresh keeps
-// the routing/panel snapshot fresh so the high-credit-first picker and the
-// panel badges never read a stale balance.
+// cleanup. A later successful ping clears the tag.
 //
-// 保号 (preserve) 池已于 2026-09-29 移除：低积分不再把账号摘出路由，异常
-// 账号统一由「测试」标签承载。本循环因此只剩「刷新积分 + 定时活跃测试」两
-// 项职责，不再翻转任何账号状态。
+// 积分自动刷新已移交 credits_sweep.go（2026-10-23 用户裁定：每小时一轮、
+// 串行、全部账号、结果落 sidecar）。本循环只保留探活与「测试」标签同步。
+//
+// 保号 (preserve) 池已于 2026-09-29 移除；2026-10-23 以三档分级重建：
+// 低于禁用线的号写盘停用，禁用线与保活线之间的号降级排序（见 credit_disable.go）。
 //
 // Trigger sources (three entry points converge on this goroutine):
 //  1. Periodic tick — every watchdogIntervalDefault.
@@ -34,6 +33,7 @@
 package main
 
 import (
+	"log"
 	"time"
 )
 
@@ -105,26 +105,33 @@ func waitHostReadyForWatchdog(maxWait time.Duration, ready func() bool) bool {
 	}
 }
 
-// runWatchdogTick walks every workbuddy auth and hands the whole fleet to the
-// throttled concurrent refresh runner. The runner's per-account fetch
-// (refresh_runner.doFetchOne) pulls fresh credits and then fires the scheduled
-// active ping, which is what writes/clears the 「测试」tag. No upstream call
-// happens in-tick, so a tick is cheap and never blocks the loop.
+// runWatchdogTick 在本拍做两件事：同步「测试」标签镜像，以及触发定时探活。
+//
+// 积分自动更新已移交 credits_sweep.go（2026-10-23 用户裁定）：每小时一轮、
+// 串行、全部账号、结果落 sidecar。watchdog 不再驱动全量积分刷新，否则两条
+// 路径会各自打一轮上游，既浪费配额又让快照来源混乱。
+// 探活仍留在本拍：它是「账号是否还能用」的独立信号，与积分无关，且
+// doActivePing 自带 4 小时节流，所以每 10 分钟一拍实际只对到期账号真发请求。
+// [参数] 无。
+// [返回] 无。
+// 最近修改时间：2026-10-23；改动原因：全量积分刷新移交每小时串行扫描，保留定时探活。
 func runWatchdogTick() {
+	// 1. 从磁盘重建「测试」标签镜像，让探活写入的标签在本拍就影响路由。
+	refreshTestFailedSetFromDisk()
+
+	// 2. 逐个账号触发定时探活；doActivePing 自带 4 小时节流。
 	files, err := hostAuthList()
 	if err != nil {
 		return
 	}
-	// Rebuild the 「测试」label mirror from disk on the same cadence, so a tag
-	// written by the active-ping path (or another session) is reflected in
-	// routing even when the panel is never opened.
-	refreshTestFailedSetFromDisk()
-	targets := make([]refreshTarget, 0, len(files))
 	for _, f := range files {
-		targets = append(targets, refreshTarget{AuthIndex: f.AuthIndex, AuthID: f.ID})
-	}
-	if len(targets) > 0 {
-		globalRefresh.EnqueueAll(targets, "watchdog")
+		sa, errGet := hostAuthGet(f.AuthIndex)
+		if errGet != nil || sa == nil {
+			continue
+		}
+		if pingErr := triggerActivePing(f.AuthIndex, f.ID, sa); pingErr != nil {
+			log.Printf("[workbuddy] scheduled active ping account %s warning: %v", f.ID, pingErr)
+		}
 	}
 }
 

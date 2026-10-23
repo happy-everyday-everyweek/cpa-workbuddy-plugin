@@ -184,19 +184,18 @@ func ensureDefaultActiveAuth(accounts []wbAccount) string {
 	return next
 }
 
-// accountRoutable reports whether an auth ID may carry traffic at all: not
-// cooling down (failover), not test-failed (「测试」标签). Shared by the
-// panel-selection rules and documented as the same predicate family
-// scheduler.pick applies before ordering candidates.
+// accountRoutable 判定账号当前是否允许承载流量：未冷却、未测试失败、积分未低于禁用线。
+// [参数] authID：账号标识。
+// [返回] true 表示可承载请求。
+// 最近修改时间：2026-10-23；改动原因：积分判据随三档分级收窄为「低于禁用线或耗尽」。
 func accountRoutable(authID string) bool {
+	// 1. 冷却中或测试失败的号直接排除。
 	if isAccountCoolingDown(authID) || isTestFailed(authID) {
 		return false
 	}
-	remain, lowOrExhausted := cachedCreditsScore(authID)
-	if lowOrExhausted || (remain >= 0 && remain < loadedMinRoutableCredits()) {
-		return false
-	}
-	return true
+	// 2. 积分低于硬禁用线或已耗尽时不可路由。
+	_, lowOrExhausted := cachedCreditsScore(authID)
+	return !lowOrExhausted
 }
 
 // accountHigherCredits 比较两个健康账号的充裕度，积分更多者排在前面；未测 (-1) 排最后。

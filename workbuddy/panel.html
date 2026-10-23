@@ -440,7 +440,7 @@ function progressHTML(c, a){
     statSegments.push(`<span class="pb-segment" style="color:var(--warn)">失败禁用${a.failover_model?" · "+esc(a.failover_model):""}（10 分钟探活中）</span>`);
   }
   if(isAccountLowCredits(a)){
-    statSegments.push(`<span class="pb-segment" style="color:var(--warn)">低额保护(&lt;${minRoutableCredits})</span>`);
+    statSegments.push(`<span class="pb-segment" style="color:var(--warn)">保活(&lt;${minRoutableCredits})</span>`);
   }
   const statHTML=statSegments.join('');
   const primaryHTML=`<span class="pb-primary"><span class="pb-segment">可用积分</span>${statHTML}</span>`;
@@ -488,9 +488,11 @@ function isAccountExhausted(a){
   const size=Number(cr.total_size)||0;
   return used>0||size>0||(Array.isArray(cr.packages)&&cr.packages.length>0);
 }
-// 低额保护判定：剩余积分低于后端下发的安全红线即不可承载新推理。
+// 保活档判定：剩余积分落在 [禁用线, 保活线) 区间。
+// 这类账号仍然可路由，只是排在健康号之后（2026-10-23 三档分级）。
 function isAccountLowCredits(a){
   if(!a || isAccountExhausted(a)) return false;
+  if(a.credit_tier==="preserve") return true;
   if(a.low_credits) return true;
   if(!minRoutableCredits) return false;
   const cr=a.credits;
@@ -524,7 +526,7 @@ function card(a){
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
   const testFailedBadge=a.test_failed?`<span class="badge test-failed" title="定时活跃测试失败且仍有积分；建议人工复核后清理">测试</span>`:"";
   const lowCredits=isAccountLowCredits(a);
-  const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于安全红线(${minRoutableCredits})，已暂停路由，防止推理中途断开">低额保护</span>`:"";
+  const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于保活线(${minRoutableCredits})，仍可路由但排在健康号之后">保活</span>`:"";
   const badges=testFailedBadge+(exhausted?`<span class="badge exhausted">耗尽</span>`:lowCreditsBadge)+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
   return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-test="${a.test_failed?"1":"0"}" data-low="${lowCredits?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0||a.failover_disabled)?"1":"0"}">
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}<button type="button" class="card-del" data-action="delete" data-auth-index="${esc(a.auth_index)}" title="删除账号（需二次确认）" aria-label="删除账号">×</button></span></h2>
@@ -1013,18 +1015,14 @@ async function load(){
     else toast("加载账号失败，已保留上次数据","err",msg);
   }
 }
-// 进入页面统一入口：先渲染缓存数据，再自动触发一次后台异步刷新。
-// 数据新鲜度由「进入即刷 + 每 10 分钟定时兜底」双层保证（见下方 PERIODIC_REFRESH_MS）。
-// 首屏仍直接读现有数据展示，异步刷新在前端无感知进行，不会拖慢打开速度。
+// 进入页面统一入口：只读落盘积分快照渲染，不再自动刷新积分。
+//
+// 2026-10-23 用户裁定：积分由插件每小时串行刷新一次并落盘，面板进页面直接读
+// 这份快照，不再触发任何上游调用。手动刷新按钮（单卡「刷新」与顶部批量刷新）
+// 仍然可用，刷新后后端会立刻重跑三档分级检查。
 async function enterPanel(){
   await load();
-  startBackgroundRefresh();
 }
-// 每 10 分钟自动触发一轮后台异步刷新（1s/账号，幂等，前端无感知）。
-// 页面打开期间生效；随后轮询 /refresh/status 逐账号局部刷新。
-// 若已有一轮刷新在跑（幂等），后端忽略本次请求，仍继续轮询展示进度。
-const PERIODIC_REFRESH_MS=10*60*1000;
-setInterval(()=>{ startBackgroundRefresh(); }, PERIODIC_REFRESH_MS);
 // POST /refresh 属于 mutating 端点，走每 IP 令牌桶（burst 5，1 token/6s）。
 // 手动操作（选中/删除/签到）与定时刷新撞在同一窗口时会返回 429，历史实现直接
 // 丢弃整轮，表现为「定时刷新有时候不刷新」。这里对限流做有限次退避重试：

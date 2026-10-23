@@ -78,9 +78,11 @@ func pickNextAuthForModel(currentAuthID, model string) (nextAuthID string, nextS
 		if isTestFailed(id) {
 			continue
 		}
-		// 跳过已耗尽或额度低于安全红线的残血账号，防止同请求换号再次中断
-		remain, lowOrExhausted := cachedCreditsScore(id)
-		if lowOrExhausted || (remain >= 0 && remain < loadedMinRoutableCredits()) {
+		// 三档语义（2026-10-23）：只有低于硬禁用线或已耗尽的号才跳过；
+		// 禁用线与保活线之间的号仍可作为换号目标——请求已经失败过一次，
+		// 此时「有余额的号」远好过「直接失败」，保活档排在后面由调度排序体现。
+		_, lowOrExhausted := cachedCreditsScore(id)
+		if lowOrExhausted {
 			continue
 		}
 		// Skip candidates with no usable auth index — we can't load

@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -14,9 +15,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// hostAuthListFn / hostAuthGetFn 是签到链路的包级测试接缝（沿用
+// hostAuthListFn / hostAuthGetFn 是账号枚举与凭据读取的包级测试接缝（沿用
 // workbuddy-ai 同名模式）：生产指向真实 host RPC，单测替换为内存桩，避免为
 // 可测性把 hostAuthList / hostAuthGet 本身改成变量而影响全部调用方。
+// 签到链路与手动刷新链路共用：两者都建立在「先取凭据、再打上游」之上。
 var hostAuthListFn = hostAuthList
 var hostAuthGetFn = hostAuthGet
 
@@ -204,6 +206,14 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 							fresh.fetched = time.Now()
 							accountCache.Store(f.ID, &fresh)
 						}
+					}
+					// 签到会改变余额，因此必须立即重跑三档分级：新积分可能
+					// 让一个被本机制禁用的号达到解禁条件，也可能让档位从
+					// 保活升回正常。等待下一轮小时扫描会让这段窗口白等一小时。
+					recordCreditSnapshot(f.ID, cr2, sa.Account.Nickname, accountRegion(sa))
+					gradeCreditsForAuth(f.AuthIndex, f.ID, sa, cr2)
+					if persistErr := persistCreditSnapshot(); persistErr != nil {
+						log.Printf("[workbuddy] credits snapshot persist failed: %v", persistErr)
 					}
 				}
 			}

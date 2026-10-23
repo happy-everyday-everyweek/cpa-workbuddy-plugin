@@ -105,10 +105,9 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 	}
 }
 
-// TestSchedulerPick_PrefersLowCreditOverHighCredit guards the safety-floor
-// exclusion: an account below minRoutableCredits is hard-excluded, so the
-// remaining healthy account is routed. (The test name predates the
-// low-credit-first reversal; current routing is HIGH-CREDIT-FIRST.)
+// TestSchedulerPick_PrefersLowCreditOverHighCredit 锁定三档排序：保活档
+// （禁用线之上、保活线之下）仍然可路由，但必须让位给正常档账号。
+// 用例名沿用历史；2026-10-23 起该档从硬排除改为降级排序。
 func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 	resetActiveAuth(t)
 	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: lowCredits(), TotalUsed: healthyCredits(), TotalSize: healthyCredits()}})
@@ -129,9 +128,9 @@ func TestSchedulerPick_PrefersLowCreditOverHighCredit(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	resp := parsePickResponse(t, raw)
-	// wb-a 低于 minRoutableCredits 被低额安全红线硬排除，自动切换到健康的 wb-b
+	// wb-a 属保活档：存在正常档 wb-b 时必须让位；只有 wb-b 消失才会轮到它。
 	if !resp.Handled || resp.AuthID != "wb-b" {
-		t.Fatalf("want low-credit account wb-a (below redline) excluded and wb-b routed, got %+v", resp)
+		t.Fatalf("want 保活档 wb-a 让位给正常档 wb-b, got %+v", resp)
 	}
 }
 

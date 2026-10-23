@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.18.1
+
+### Feature - 积分三档分级：落盘快照 + 每小时串行扫描 + 低于 100 硬禁用
+
+- 变更要点:
+  1. **积分快照落盘**：新增 sidecar `data/workbuddy-credits.json`，跨重启保存每个账号的积分与档位。不写进 auth 文件——每小时全量刷新若逐个改 auth 文件，会让宿主 fsnotify 每小时触发几十次整池 reload。
+  2. **每小时串行全量扫描**（`credits_sweep.go`）：全部账号（不分启用/禁用）逐个拉取，整轮只在末尾原子写盘一次；上一轮未结束时本轮直接丢弃，不排队。
+  3. **三档分级**：低于 `low_credit_disable_below`（默认 100，新增配置项）写盘 `disabled: true`；介于该线与 `min_routable_credits`（默认 400，语义由硬排除改为保活线）之间打「保活」标，可路由但在正常档存在时整体让位；以上为正常档。解禁要求积分回到线上**且**探活成功。
+  4. **标记认领边界**：`manual_disable` > `failover_disable` > `low_credit_disable`，各管各的恢复；白名单重建时同步搬运低额标记，避免账号永久卡在禁用态。
+  5. **watchdog 职责收窄**：不再驱动全量积分刷新（改由小时扫描负责），只保留「测试」标签镜像同步与 10 分钟定时探活，消除两条路径重复打上游。
+  6. **面板与签到接入**：面板进入直接读落盘快照（不再进页面就打上游），仍支持手动刷新；手动刷新与签到成功后都会立即重跑分级检查并落盘。
+- 影响范围: `scheduler.pick`、请求内换号链、面板选中、会话粘性的积分判据统一收窄为「低于禁用线或已耗尽」；`min_routable_credits` 从硬排除改为保活降级。
+- 涉及文件: `credits_snapshot.go` `credits_sweep.go` `credit_disable.go` `credits_sweep_test.go` `policy.go` `scheduler.go` `active_auth.go` `failover_retry.go` `lifecycle.go` `refresh_runner.go` `watchdog.go` `checkin.go` `credits_handler.go` `main.go` `usage_config.go` `panel.go` `panel.html` `README.md` `README_CN.md` `VERSION`
+
 ## 0.18.0
 
 ### Breaking - 下线 Global 耗尽自动删号；低额红线改为可配置项

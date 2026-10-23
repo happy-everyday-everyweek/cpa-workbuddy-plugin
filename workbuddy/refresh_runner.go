@@ -290,20 +290,34 @@ func (r *refreshRunner) Snapshot() refreshSnapshot {
 	return snap
 }
 
-// doFetchOne refreshes a single account's plan/checkin/credits through the
-// existing singleflight helper (force=true so it always hits upstream and
-// updates accountCache). It reports an error only when the account's credits
-// could not be read — the panel's core datum; a checkin-only failure leaves
-// the credits fresh and the account marked done.
+// doFetchOne 手动刷新单个账号：拉积分 → 写快照 → 跑三档分级 → 探活。
+//
+// 这是「用户主动要求刷新」的通道，因此 force 拉取上游。定时刷新不走这里：
+// 自动积分更新由 credits_sweep.go 的每小时串行扫描负责，避免两条路径同时
+// 打 billing 接口（2026-10-23 用户裁定：自动刷新每小时一次且串行）。
+//
+// 它只把「积分本身拉不到」当作错误上报——那是面板的核心字段；探活失败只记日志，
+// 因为探活是另一套语义（test_failed 标签由 active_ping 自己维护）。
+// [参数] authIndex：宿主 auth_index；authID：账号标识。
+// [返回] 积分拉取失败时返回错误。
+// 最近修改时间：2026-10-23；改动原因：改为手动刷新专用，并接入快照落盘与分级。
 func doFetchOne(authIndex, authID string) error {
-	sa, err := hostAuthGet(authIndex)
+	sa, err := hostAuthGetFn(authIndex)
 	if err != nil {
 		return err
 	}
-	_, _, _, errs := cachedAccountDetails(authID, sa, true)
+	_, _, cr, errs := cachedAccountDetails(authID, sa, true)
 	for _, e := range errs {
 		if strings.Contains(e, "credits:") {
 			return errors.New(e)
+		}
+	}
+	// 写快照 + 分级：手动刷新同样必须立刻反映到路由档位上。
+	if cr != nil {
+		recordCreditSnapshot(authID, cr, sa.Account.Nickname, accountRegion(sa))
+		gradeCreditsForAuth(authIndex, authID, sa, cr)
+		if persistErr := persistCreditSnapshot(); persistErr != nil {
+			log.Printf("[workbuddy] credits snapshot persist failed: %v", persistErr)
 		}
 	}
 	if pingErr := triggerActivePing(authIndex, authID, sa); pingErr != nil {

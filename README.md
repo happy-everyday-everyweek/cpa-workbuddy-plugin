@@ -28,7 +28,7 @@
 - **执行器** — OpenAI 兼容 chat completions，流式（真 SSE 走 `host.stream.emit`）与非流式；内置 `tool_choice` 归一与 Claude Code 模板清洗。
 - **账号故障处置** — 一次上游失败同时写内存阶梯冷却（60s 起、每档 +60s、上限 10 分钟）与盘上 `disabled: true`；后台每 10 分钟串行探活，**只回放当初失败的那一个模型**，探通才写回 `disabled: false`，没有记录失败模型则跳过该账号。写盘后轮询 `host.auth.list` 确认宿主内存已吸收，避免「写了就算禁了」。
 - **统一调度内核** — 三类硬排除（`test_failed` 标签、故障禁用、低额）后，存活候选按**高积分优先**排序并平摊负载；全灭时 `Handled: false` defer 交还宿主跨 Provider 容灾；`session_auth` 支持会话粘性绑定。
-- **积分生命周期** — 账号耗尽自动禁用、额度回血自动恢复（CN 与 Global 一致，只写盘禁用并保留凭据，不自动删除）；执行器硬积分错误即时触发 reconcile。安全缓冲红线 `min_routable_credits` 默认 400 点，**可在配置文件配置修改**（显式 `0` 关闭低额保护）。
+- **积分生命周期** — 账号耗尽自动禁用、额度回血自动恢复（CN 与 Global 一致，只写盘禁用并保留凭据，不自动删除）；执行器硬积分错误即时触发 reconcile。三档分级：低于硬禁用线 `low_credit_disable_below`（默认 100 点）写盘停用；介于禁用线与保活线 `min_routable_credits`（默认 400 点）之间的打「保活」标，仍可路由但排在正常号之后；两个阈值均**可在配置文件配置修改**（显式 `0` 关闭对应机制）。
 - **每日签到** — 每 4 小时（00/04/08/12/16/20）定时自动签到，面板可手动批量签；per-account 互斥锁防止并发冲突。Token 保活使用独立时刻表。
 - **计数持久化** — 内存为主 + 跟随定时任务落盘 auth 文件顶层 `success_count` / `failed_count`，容器重启不归零。
 - **控制面板** — `/v0/resource/plugins/workbuddy-provider/panel`：积分进度条、CN/Global 筛选、账号删除（二次确认 + 归属校验）、故障禁用与冷却倒计时、选模型测试弹窗。
@@ -123,7 +123,7 @@
 
 ### 1. 统一调度与账号健康隔离
 
-1. **硬排除不可用账号**：带 `test_failed` 标签、处于故障禁用（盘上 `disabled: true`）、或剩余积分低于 `min_routable_credits` 红线的账号，调度器无条件硬排除，绝不分配流量。
+1. **硬排除不可用账号**：带 `test_failed` 标签、处于故障禁用（盘上 `disabled: true`）、或剩余积分低于 `low_credit_disable_below` 硬禁用线的账号，调度器无条件硬排除，绝不分配流量；低于保活线 `min_routable_credits` 的账号打「保活」标，正常档存在时整体让位。
 2. **存活账号按积分排序**：workbuddy / workbuddy-ai / traework / qoderwork 按剩余积分降序取号（未测 -1 排最后），并在同一健康阶梯内平摊负载；zcode 采用轮询取号。
 3. **全灭 Defer 跨 Provider 容灾**：当该 Provider 下所有账号均被排除时，执行全灭 defer（`Handled: false`），将请求交还 CPA 宿主调度其他 Provider，严禁死锁在故障 Provider 上。
 4. **会话粘性绑定**：开启 `session` 模式时，同一会话的后续请求绑定到同一账号；换号重试前主动解绑失效会话。

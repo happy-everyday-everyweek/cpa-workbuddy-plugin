@@ -25,7 +25,9 @@ type wbAccount struct {
 	CreatedAt    string          `json:"created_at,omitempty"` // account creation time (RFC3339), from JWT auth_time
 	Disabled     bool            `json:"disabled"`
 	Exhausted    bool            `json:"exhausted"`
-	LowCredits   bool            `json:"low_credits"` // 剩余额度低于安全红线(min_routable_credits)
+	LowCredits   bool            `json:"low_credits"` // 保活档：100~400，可路由但排最后
+	CreditTier   string          `json:"credit_tier,omitempty"` // normal / preserve / disabled
+	CreditsAt    string          `json:"credits_at,omitempty"`  // 积分快照时刻(RFC3339)，供面板显示新鲜度
 	Selected     bool            `json:"selected"`    // panel active routing card
 	TestFailed   bool            `json:"test_failed"` // scheduled active-ping failed while credits remained
 	Credits      *creditsSummary `json:"credits,omitempty"`
@@ -151,7 +153,11 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				acct.Checkin = ci
 				acct.Credits = cr
 				acct.Exhausted = isCreditsExhausted(cr)
-				acct.LowCredits = cr != nil && !acct.Exhausted && cr.TotalRemain < loadedMinRoutableCredits()
+				acct.CreditTier = creditTierFor(crRemainOf(cr), loadedLowCreditDisableBelow(), loadedMinRoutableCredits()).String()
+				acct.LowCredits = acct.CreditTier == creditTierPreserve.String()
+				if cr != nil && cr.FetchedAt != "" {
+					acct.CreditsAt = cr.FetchedAt
+				}
 				if isGlobalDomain(sa.Auth.Domain) {
 					acct.TrialClaimed = hasTrialPack(cr)
 				}
@@ -159,14 +165,30 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				_ = syncAuthNote(f.AuthIndex, f.ID, sa, cr, acct.Disabled)
 				acct.Error = strings.Join(errs, "; ")
 			} else {
-				// Light load: use cached values if available, but don't fetch upstream.
-				if v, ok := accountCache.Load(f.ID); ok {
+				// 轻载：只读落盘快照，不打上游。
+				//
+				// 2026-10-23 用户裁定：进面板不刷新积分，直接读一小时一轮的
+				// sidecar。快照缺失（新装 / 首轮还没跑）时才退回内存缓存，
+				// 仍然不发上游请求——面板打开绝不应该触发一轮全量 billing 调用。
+				if entry, ok := creditSnapshotGet(f.ID); ok && entry.Credits != nil {
+					acct.Credits = entry.Credits
+					acct.Exhausted = isCreditsExhausted(entry.Credits)
+					acct.LowCredits = entry.Tier == creditTierPreserve
+					acct.CreditTier = entry.Tier.String()
+					if !entry.FetchedAt.IsZero() {
+						acct.CreditsAt = entry.FetchedAt.Local().Format(time.RFC3339)
+					}
+					if isGlobalDomain(sa.Auth.Domain) {
+						acct.TrialClaimed = hasTrialPack(entry.Credits)
+					}
+				} else if v, ok := accountCache.Load(f.ID); ok {
 					if e, ok2 := v.(*accountCacheEntry); ok2 {
 						acct.Plan = e.plan
 						acct.Checkin = e.checkin
 						acct.Credits = e.credits
 						acct.Exhausted = isCreditsExhausted(e.credits)
 						acct.LowCredits = e.credits != nil && !acct.Exhausted && e.credits.TotalRemain < loadedMinRoutableCredits()
+						acct.CreditTier = authCreditTier(f.ID).String()
 						if isGlobalDomain(sa.Auth.Domain) {
 							acct.TrialClaimed = hasTrialPack(e.credits)
 						}
@@ -267,8 +289,10 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		"schedule":       []string{"00:00", "04:00", "08:00", "12:00", "16:00", "20:00"},
 		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
 		// 低额保护阈值由后端下发，避免面板另存一份硬编码副本与调度口径漂移。
-		"min_routable_credits": loadedMinRoutableCredits(),
-		"summary":              sum,
+		"min_routable_credits":     loadedMinRoutableCredits(),
+		"low_credit_disable_below": loadedLowCreditDisableBelow(),
+		"credits_sweep":            lastCreditsSweep(),
+		"summary":                  sum,
 	}
 	if len(life) > 0 {
 		resp["lifecycle"] = life

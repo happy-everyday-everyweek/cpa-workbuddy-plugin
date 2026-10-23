@@ -122,9 +122,14 @@ plugins:
       # auth file kept), re-enable it once credits recover (default false).
       lifecycle_auto: false
 
-      # Safety buffer: accounts with fewer credits than this are pulled from
-      # the routing pool (default 400, set 0 to disable the gate).
+      # Keep-alive line: accounts below this are tagged "preserve" and still
+      # routable, but yield to normal-tier accounts (default 400, 0 disables).
       min_routable_credits: 400
+
+      # Hard disable line: an hourly sweep writes disabled:true once credits
+      # fall below this; re-enabled only after credits recover AND a probe
+      # succeeds (default 100, 0 disables the mechanism).
+      low_credit_disable_below: 100
 
       # Scheduler behavior (default "session"):
       #   session → per-conversation round-robin: same conversation stays on
@@ -137,12 +142,13 @@ plugins:
       scheduler_mode: "session"
 
       # Account watchdog — every interval (fixed 10m, first tick immediate)
-      # fresh credits are pulled for every account and one lightweight "hi"
-      # reasoning ping is sent per account. A scheduled ping that fails
-      # while the account still has credits tags it with the 「测试」marker
-      # (top-level `test_failed: true` on the auth file): excluded from
-      # routing, listed under the panel's Test filter for manual cleanup.
-      # A later successful ping clears the tag. No config knobs.
+      # one lightweight "hi" reasoning ping is sent per account. A scheduled
+      # ping that fails while the account still has credits tags it with the
+      # 「测试」marker (top-level `test_failed: true` on the auth file):
+      # excluded from routing, listed under the panel's Test filter for
+      # manual cleanup. A later successful ping clears the tag.
+      # Credit refresh is NOT done here — see the hourly serial sweep below.
+      # No config knobs.
 
       # CPAMP usage forwarding. Both must be set for any record to be sent.
       # Falls back to USAGE_REPORT_URL / USAGE_REPORT_KEY /

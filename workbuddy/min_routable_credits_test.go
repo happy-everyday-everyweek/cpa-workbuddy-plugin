@@ -24,49 +24,68 @@ func healthyCredits() int64 {
 	return loadedMinRoutableCredits() * 2
 }
 
-// TestMinRoutableCredits_DefaultRedlineBoundary 锁定 400 默认红线与边界语义：
-// remain == 红线必须可路由，remain == 红线-1 必须被排除（判据是严格小于）。
-// 这两个点合起来才能钉住阈值本身与比较方向，任一漂移都会失败。
+// TestMinRoutableCredits_DefaultRedlineBoundary 锁定三档分级的边界语义：
+// remain == 保活线 属正常档；remain == 保活线-1 属保活档但仍可路由；
+// 只有低于硬禁用线才不可路由（2026-10-23 由硬排除改为降级）。
 func TestMinRoutableCredits_DefaultRedlineBoundary(t *testing.T) {
 	resetActiveAuth(t)
 	restoreMin := setMinRoutableCredits(defaultMinRoutableCredits)
 	defer restoreMin()
+	restoreDisable := setLowCreditDisableBelow(defaultLowCreditDisableBelow)
+	defer restoreDisable()
 
 	const redline = 400
+	const disableBelow = 100
 	if got := loadedMinRoutableCredits(); got != redline {
 		t.Fatalf("default minRoutableCredits = %d, want %d", got, redline)
+	}
+	if got := loadedLowCreditDisableBelow(); got != disableBelow {
+		t.Fatalf("default lowCreditDisableBelow = %d, want %d", got, disableBelow)
 	}
 
 	storeCredits(t, "wb-at-redline", redline, 0, redline)
 	storeCredits(t, "wb-below-redline", redline-1, 1, redline)
+	storeCredits(t, "wb-at-disable", disableBelow, 0, redline)
+	storeCredits(t, "wb-below-disable", disableBelow-1, 1, redline)
 
-	if accountRoutable("wb-at-redline") != true {
-		t.Fatalf("remain == %d must stay routable (predicate is strict <)", redline)
+	if !accountRoutable("wb-at-redline") {
+		t.Fatalf("remain == %d 属正常档，必须可路由", redline)
 	}
-	if accountRoutable("wb-below-redline") != false {
-		t.Fatalf("remain == %d must be excluded by the %d redline", redline-1, redline)
+	// 保活档的关键语义：低于保活线仍可路由，不再被摘出。
+	if !accountRoutable("wb-below-redline") {
+		t.Fatalf("remain == %d 属保活档，必须仍可路由", redline-1)
+	}
+	if !accountRoutable("wb-at-disable") {
+		t.Fatalf("remain == %d 恰好等于禁用线，不算低于，必须可路由", disableBelow)
+	}
+	if accountRoutable("wb-below-disable") {
+		t.Fatalf("remain == %d 低于禁用线 %d，必须不可路由", disableBelow-1, disableBelow)
 	}
 
+	// 排序：正常档必须排在保活档之前，即使保活档余量更大也不得抢先。
+	storeCredits(t, "wb-preserve-rich", redline-1, 0, redline)
+	storeCredits(t, "wb-normal-poor", redline, 0, redline)
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: providerName,
 		Candidates: []pluginapi.SchedulerAuthCandidate{
-			{ID: "wb-below-redline", Provider: providerName},
-			{ID: "wb-at-redline", Provider: providerName},
+			{ID: "wb-preserve-rich", Provider: providerName},
 		},
 	}))
 	if err != nil {
 		t.Fatalf("pick err: %v", err)
 	}
-	if resp := parsePickResponse(t, raw); !resp.Handled || resp.AuthID != "wb-at-redline" {
-		t.Fatalf("want wb-at-redline routed and wb-below-redline excluded, got %+v", resp)
+	if resp := parsePickResponse(t, raw); !resp.Handled || resp.AuthID != "wb-preserve-rich" {
+		t.Fatalf("保活档是唯一候选时必须被选中，got %+v", resp)
 	}
 }
 
-// TestMinRoutableCredits_Configurable400Boundary 验证 400 红线可被配置覆盖，
-// 且覆盖后判据立即跟随新值（不是把 400 写死在调用点）。
+// TestMinRoutableCredits_Configurable400Boundary 验证保活线与禁用线均可被配置覆盖，
+// 且覆盖后判据立即跟随新值（不是把 400/100 写死在调用点）。
 func TestMinRoutableCredits_Configurable400Boundary(t *testing.T) {
 	restoreMin := setMinRoutableCredits(defaultMinRoutableCredits)
 	defer restoreMin()
+	restoreDisable := setLowCreditDisableBelow(defaultLowCreditDisableBelow)
+	defer restoreDisable()
 	restoreMode := setSchedulerMode(schedulerModeSession)
 	defer restoreMode()
 
@@ -78,12 +97,16 @@ func TestMinRoutableCredits_Configurable400Boundary(t *testing.T) {
 		t.Fatalf("configured minRoutableCredits = %d, want 800", got)
 	}
 
+	// 700 低于 800 保活线但高于 100 禁用线：现在属保活档，仍可路由。
 	storeCredits(t, "wb-700", 700, 0, 700)
-	if accountRoutable("wb-700") {
-		t.Fatal("remain=700 must be excluded once the redline is raised to 800")
+	if !accountRoutable("wb-700") {
+		t.Fatal("remain=700 在禁用线之上，必须仍可路由（保活档）")
+	}
+	if got := creditTierFor(700, loadedLowCreditDisableBelow(), loadedMinRoutableCredits()); got != creditTierPreserve {
+		t.Fatalf("tier(700) = %v, want preserve", got)
 	}
 
-	// 显式 0 关闭红线保护：任何正积分账号都应恢复可路由。
+	// 显式 0 关闭保活降级：高于禁用线的账号全部回到正常档。
 	cfgOff, _ := json.Marshal(map[string]any{
 		"config_yaml": []byte("min_routable_credits: 0\nscheduler_mode: credits\n"),
 	})
@@ -91,8 +114,8 @@ func TestMinRoutableCredits_Configurable400Boundary(t *testing.T) {
 	if got := loadedMinRoutableCredits(); got != 0 {
 		t.Fatalf("minRoutableCredits = %d after explicit 0, want 0", got)
 	}
-	if !accountRoutable("wb-700") {
-		t.Fatal("explicit min_routable_credits: 0 must disable the low-credit gate")
+	if got := creditTierFor(700, loadedLowCreditDisableBelow(), loadedMinRoutableCredits()); got != creditTierNormal {
+		t.Fatalf("min_routable_credits: 0 关闭保活降级后 tier(700) = %v, want normal", got)
 	}
 }
 
@@ -160,8 +183,8 @@ func TestMinRoutableCredits_ConfigAndExclusion(t *testing.T) {
 	}
 	setMinRoutableCredits(defaultMinRoutableCredits)
 
-	// 3. 调度器硬排除 remain < 红线账号，并在健康账号间平摊轮询。
-	// 用例数据全部相对默认红线构造，阈值再次调整时语义不被静默改写。
+	// 3. 调度器把保活档排在正常档之后，并在正常档内平摊轮询。
+	// 用例数据全部相对默认阈值构造，阈值再次调整时语义不被静默改写。
 	lowRemain, okRemain, okHighRemain := lowCredits(), healthyCredits(), healthyCredits()*2
 	accountCache.Store("acc-low", &accountCacheEntry{
 		credits: &creditsSummary{TotalRemain: lowRemain, TotalUsed: 100, TotalSize: lowRemain + 100},
@@ -178,7 +201,7 @@ func TestMinRoutableCredits_ConfigAndExclusion(t *testing.T) {
 		accountCache.Delete("acc-ok2")
 	}()
 
-	// 即使面板曾经选中了 acc-low（低于红线），调度器也必须拒绝它并切换到健康账号
+	// 即使面板曾经选中了 acc-low（保活档），健康号存在时也必须优先健康号。
 	setActiveAuthID("acc-low")
 	raw1, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: providerName,
@@ -193,7 +216,7 @@ func TestMinRoutableCredits_ConfigAndExclusion(t *testing.T) {
 	}
 	resp1 := parsePickResponse(t, raw1)
 	if !resp1.Handled || resp1.AuthID != "acc-ok2" {
-		t.Fatalf("expected acc-low (<%d) excluded and highest healthy acc-ok2 picked first, got %+v", defaultMinRoutableCredits, resp1)
+		t.Fatalf("expected 保活档 acc-low 让位、最高分健康号 acc-ok2 优先，got %+v", resp1)
 	}
 
 	// 再次切换（清空当前选中模拟轮询）：应轮询到下一个健康候选 acc-ok1
@@ -216,7 +239,7 @@ func TestMinRoutableCredits_ConfigAndExclusion(t *testing.T) {
 		t.Fatalf("expected round-robin to pick acc-ok1 on second turn, got %+v", resp2)
 	}
 
-	// 4. 所有候选均低于红线时，必须全灭 defer (Handled: false)
+	// 4. 只剩保活档候选时必须仍然路由（不再全灭 defer）。
 	rawAllLow, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: providerName,
 		Candidates: []pluginapi.SchedulerAuthCandidate{
@@ -227,13 +250,13 @@ func TestMinRoutableCredits_ConfigAndExclusion(t *testing.T) {
 		t.Fatalf("pickAllLow err: %v", err)
 	}
 	respAllLow := parsePickResponse(t, rawAllLow)
-	if respAllLow.Handled {
-		t.Fatalf("expected all low-credit candidates to defer (Handled: false), got %+v", respAllLow)
+	if !respAllLow.Handled || respAllLow.AuthID != "acc-low" {
+		t.Fatalf("保活档是唯一候选时必须仍然路由，got %+v", respAllLow)
 	}
 
-	// 5. accountRoutable 对 remain < 红线判定为 false
-	if accountRoutable("acc-low") {
-		t.Fatalf("expected accountRoutable(acc-low) == false for remain=%d < %d", lowRemain, defaultMinRoutableCredits)
+	// 5. accountRoutable 对保活档返回 true，只有低于禁用线才是 false。
+	if !accountRoutable("acc-low") {
+		t.Fatalf("expected accountRoutable(acc-low) == true for remain=%d（保活档仍可路由）", lowRemain)
 	}
 	if !accountRoutable("acc-ok1") {
 		t.Fatalf("expected accountRoutable(acc-ok1) == true for remain=%d >= %d", okRemain, defaultMinRoutableCredits)
