@@ -30,17 +30,27 @@ func TestManagementRegistrationModelsRoute(t *testing.T) {
 	}
 }
 
-// TestGrowthRouteRemoved 锁定成长中心整体下线：面板按钮、管理路由、写路径判定
-// 三处都不得再出现 /growth。用户裁定只保留签到，不再做任务领取。
-func TestGrowthRouteRemoved(t *testing.T) {
-	base := loadedManagementBasePath() + "/plugins/" + providerName
-	for _, r := range managementRegistration().Routes {
+// TestGrowthRouteRegistered 锁定成长中心入口在位且受写路径保护。
+// 2026-10-24 起成长中心重新接入（原 TestGrowthRouteRemoved 负向守卫已作废）：
+// 路由必须存在、方法必须是 POST、且必须列入 mutatingManagementPath，
+// 防止后续重构把写入口悄悄降级成免鉴权的只读路径。
+func TestGrowthRouteRegistered(t *testing.T) {
+	reg := managementRegistration()
+	found := false
+	for _, r := range reg.Routes {
 		if strings.HasSuffix(r.Path, "/growth") {
-			t.Fatalf("成长中心已下线，但路由仍注册：%s %s", r.Method, r.Path)
+			found = true
+			if r.Method != http.MethodPost {
+				t.Fatalf("/growth route method = %s, want POST", r.Method)
+			}
 		}
 	}
-	if mutatingManagementPath(base + "/growth") {
-		t.Fatal("/growth 不再是管理路径，不得保留在 mutatingManagementPath 中")
+	if !found {
+		t.Fatal("/growth route missing from managementRegistration().Routes")
+	}
+	base := loadedManagementBasePath() + "/plugins/" + providerName
+	if !mutatingManagementPath(base + "/growth") {
+		t.Fatal("/growth must be a mutating path so management auth applies")
 	}
 }
 

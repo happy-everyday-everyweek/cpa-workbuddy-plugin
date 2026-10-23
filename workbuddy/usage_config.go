@@ -58,10 +58,11 @@ const fallbackUsageReportURL = "http://cpa-manager-plus:18317/v0/management/usag
 // configure decodes plugin config from the lifecycle request.
 // [参数] raw：宿主流式下发的 config_yaml 原文。
 // [返回] 无。
-// 最近修改时间：2026-10-22；改动原因：成长中心下线，移除 growth_auto 解析。
+// 最近修改时间：2026-10-24；改动原因：成长中心重新接入，恢复 growth_auto 解析（默认开启）。
 func configure(raw []byte) {
 	// Parse config without holding any lock (fixes nested-lock hazard).
 	nextCheckinAuto := true
+	nextGrowthAuto := true
 	nextLifecycleAuto := false
 	// scheduler default: session (per-conversation round-robin). Explicit
 	// scheduler_mode in config_yaml overrides it; unknown values fall back to
@@ -97,6 +98,11 @@ func configure(raw []byte) {
 				if strings.HasPrefix(line, "checkin_auto:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_auto:"))
 					nextCheckinAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
+				if strings.HasPrefix(line, "growth_auto:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "growth_auto:"))
+					v = strings.Trim(v, "\"'")
+					nextGrowthAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
 				if strings.HasPrefix(line, "lifecycle_auto:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
@@ -182,6 +188,10 @@ func configure(raw []byte) {
 	checkinAutoMu.Lock()
 	checkinAuto = nextCheckinAuto
 	checkinAutoMu.Unlock()
+
+	growthAutoMu.Lock()
+	growthAuto = nextGrowthAuto
+	growthAutoMu.Unlock()
 
 	lifecycleAutoMu.Lock()
 	lifecycleAuto = nextLifecycleAuto

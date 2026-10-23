@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.19.0
+
+### Feature - 重新接入成长中心（修复旧版「任务永远完不成」的两个根因）
+
+- 背景: 0.16.0 引入的成长中心在 0.17.0 整体移除，原因是用户反馈「成长计划没有生效，任务都没有完成」，生产日志连续 6 轮恒报 `14 accepted, 0 claimed`。本轮实测定位到两个根因后重新接入。
+- 根因一（本轮新发现，是真正的第一性原因）: **旧版从未调用 `buddy/first` 领养 Buddy**。未领养时上游对每个任务的 accept 都返回 `prerequisite not met: first_buddy (no buddy instance found)`，因此任务永远锁死。领养后同一批任务立刻转 `accepted` 并带出 `progress{current,target}`。
+- 根因二: 旧版完全没有行为上报（`POST /v2/report`）。成长任务进度由服务端行为事件点亮，不发上报则 `current` 永远不动。
+- 变更要点:
+  1. **Buddy 领养前置链**：`report → buddy/agreement → buddy/first`，排在所有任务操作之前（`growth_run.go` / `growth_run_segments.go`）。
+  2. **通用行为上报**（`growth_report.go`）：完整 `chat_request_send` 事件形状，`userId` 必填（缺失时上游返回 200 但静默丢弃，故在发送前拦截）。
+  3. **进度口径领奖**：判据改为 `!claimed && target>0 && current>=target`，不再用 `accept_status == "completed"`（该状态会短暂回填后回滚，据此领奖会误领）。
+  4. **逐条接单判定**：读 `data.results[i].status`，失败按原因聚合并回显，不再只认 HTTP 状态码。
+  5. 七段编排：签到 → Buddy 领养 → 旅行 → 任务 → 补登 → 兑换 → 抽奖 → 盲盒 → 汇总；单账号 180s 预算，分段容错。
+  6. 新增 `growth_auto` 配置（默认 true），与签到共用 4 小时 tick；关闭后仅保留面板手动执行。
+  7. 面板账号卡片新增「成长中心」按钮与结果摘要行（仅 CN 账号），摘要行同时渲染失败原因。
+- 端点契约: 2026-10-24 真实账号实测冻结，见 `doc/2-需求/2026-10-24_120000_workbuddy成长中心重新接入需求.md` §3。四个 base（codebuddy.cn/v2、workbuddy.cn、copilot.tencent.com 带/不带 /v2）全部可用，旧版路径本身无问题；本轮沿用 `{billingBase}/v2/activity/growth`。
+- 验证: 单测 15 项全绿（含三处变异自测）；真实 CN 账号经 c-shared 真实 `.so` + ctypes 驱动跑通完整七段，返回 `success:true`、`buddy_unlocked:true`、`errors:null`。详见 `doc/5-tests/2026-10-24_120000_workbuddy成长中心重新接入验证.md`。
+- 测试资产: 新增 `scripts/probe_growth_endpoints.py`（端点契约探针，只读优先）与 `scripts/drive_growth_e2e.py`（ctypes 驱动真实插件端到端）。
+- 涉及文件: `growth.go` `growth_tasks.go` `growth_status.go` `growth_actions.go` `growth_report.go` `growth_run.go` `growth_run_segments.go` `growth_run_streak.go` `growth_schedule.go` `growth_handler.go` 及 4 个测试文件；`checkin.go` `management.go` `management_test.go` `usage_config.go` `main.go` `panel.html` `README.md` `README_CN.md` `VERSION`
+
 ## 0.18.2
 
 ### Fix - 面板单卡「刷新」不写积分快照，新加账号永远显示「加载中…」

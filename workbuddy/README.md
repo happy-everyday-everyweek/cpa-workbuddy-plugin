@@ -118,6 +118,12 @@ plugins:
       # Runs every 4 hours at 00/04/08/12/16/20 local time.
       checkin_auto: true
 
+      # Growth-center automation for CN accounts (default true).
+      # Runs on the same 4-hour tick: buddy adoption (required by every growth
+      # task), travel, task accept/claim, makeup card, streak redeem, lottery
+      # and buddy box. Set false to keep panel-only manual execution.
+      growth_auto: true
+
       # Credit lifecycle: disable an account on exhaust (CN and Global alike,
       # auth file kept), re-enable it once credits recover (default false).
       lifecycle_auto: false

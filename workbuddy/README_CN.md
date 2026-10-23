@@ -102,6 +102,11 @@ plugins:
       # CN 账号每日自动签到（默认 true），每 4 小时一次（00/04/08/12/16/20 本地时间）。
       checkin_auto: true
 
+      # CN 账号成长中心自动执行（默认 true），与签到共用 4 小时 tick：
+      # Buddy 领养（全部成长任务的前置门槛）、旅行、任务接单与领奖、补登卡、
+      # 连登阶梯兑换、抽奖、盲盒。设为 false 则只在面板手动执行。
+      growth_auto: true
+
       # 积分生命周期：CN 耗尽禁用 / Global 耗尽删除 / CN 回血恢复（默认 false）。
       lifecycle_auto: false
 

@@ -342,7 +342,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.18.2"
+var version = "0.19.0"
 
 func wbRegistration() registration {
 	return registration{
@@ -355,6 +355,7 @@ func wbRegistration() registration {
 			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用自动签到（每4小时一次，本地时间 00:00/04:00/08:00/12:00/16:00/20:00，CN 账号，默认开启）。"},
+				{Name: "growth_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用成长中心自动执行（随 4 小时 tick 运行：Buddy 领养、旅行、任务接单与领奖、补登、兑换、抽奖、盲盒；CN 账号，默认开启）。关闭后仅保留面板手动执行。"},
 				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "额度耗尽时自动禁用账号（CN 与 Global 一致，只写盘禁用并保留凭据）；额度恢复后自动重新启用（默认关闭）。"},
 				{Name: "token_keepalive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每4小时 access-token 自动刷新，防止 Keycloak 离线会话过期（默认开启）。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "可选模型列表。每个条目可包含 id、name、alias、context、max_tokens、enabled、reasoning 字段；配置后优先于自动获取的模型列表。"},

@@ -126,13 +126,14 @@ func schedulerLoop(stop chan struct{}) {
 //
 // [参数] 无。
 // [返回] 无。
-// 最近修改时间：2026-10-22；改动原因：成长中心已整体下线，提前返回条件恢复为签到 + lifecycle。
+// 最近修改时间：2026-10-24；改动原因：成长中心重新接入，tick 条件纳入 growth。
 func runAutoCheckin() {
 	checkinAutoMu.RLock()
 	doCheckin := checkinAuto
 	checkinAutoMu.RUnlock()
+	doGrowth := growthEnabled()
 	// Lifecycle may still run when check-in is off (credit gate).
-	if !doCheckin && !lifecycleEnabled() {
+	if !doCheckin && !lifecycleEnabled() && !doGrowth {
 		return
 	}
 	files, err := hostAuthListFn()
@@ -148,22 +149,24 @@ func runAutoCheckin() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			processAutoCheckinAccount(f, doCheckin)
+			processAutoCheckinAccount(f, doCheckin, doGrowth)
 		}()
 	}
 	wg.Wait()
+	// 成长中心的账号级锁表需要随账号删除收缩，避免 sync.Map 无界增长
+	pruneGrowthLocks()
 }
 
 // processAutoCheckinAccount handles one account's scheduled tick. Extracted so
 // runAutoCheckin can fan out per-account work without duplicating logic.
 //
-// [参数] f：账号条目；doCheckin：本轮是否执行签到。
+// [参数] f：账号条目；doCheckin：本轮是否执行签到；doGrowth：本轮是否执行成长中心。
 // [返回] 无。
-// 最近修改时间：2026-10-22；改动原因：成长中心下线，去掉取号条件里的 growth 分支与执行段。
-func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
-	// A-24: only fetch sa when needed (checkin). For lifecycle-only paths,
-	// let reconcileOneAccount do the single hostAuthGetBundle internally.
-	if doCheckin {
+// 最近修改时间：2026-10-24；改动原因：成长中心重新接入，增加独立 growth 分支。
+func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin, doGrowth bool) {
+	// A-24: only fetch sa when needed (checkin or growth). For lifecycle-only
+	// paths, let reconcileOneAccount do the single hostAuthGetBundle internally.
+	if doCheckin || doGrowth {
 		sa, err := hostAuthGetFn(f.AuthIndex)
 		if err != nil {
 			return
@@ -179,6 +182,16 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 					accountCache.Store(f.ID, &fresh)
 				}
 			}
+			if lifecycleEnabled() {
+				_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
+			}
+			return
+		}
+		// CN: 成长中心先执行——它可能发放积分，随后的签到缓存刷新能带上新余额。
+		if doGrowth {
+			runScheduledGrowth(sa, f)
+		}
+		if !doCheckin {
 			if lifecycleEnabled() {
 				_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 			}

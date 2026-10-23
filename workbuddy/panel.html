@@ -117,6 +117,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .pb-bar{height:100%;background:var(--ok);border-radius:99px;transition:width .6s ease}
 .pb-meta{font-size:11px;color:var(--mut);margin-top:6px}
 .actions{margin-top:12px;display:flex;gap:8px}
+.growth-line{color:var(--mut);font-size:11px;line-height:1.5;word-break:break-word;margin-top:-4px;margin-bottom:8px;min-height:16px}
 .field-input{flex:1;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--fg)}
 /* 右上角滑入通知栈 */
 .toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:10px;z-index:9999;max-width:360px}
@@ -466,6 +467,7 @@ function bindCardActions(root){
       else if(act==="refresh") refreshCredits(idx, ev.currentTarget);
       else if(act==="test") openTestModal(idx);
       else if(act==="unfreeze") unfreezeOne(idx, ev.currentTarget);
+      else if(act==="growth") growthOne(idx, ev.currentTarget);
       else if(act==="delete") openDeleteModal(idx);
     });
   });
@@ -524,6 +526,8 @@ function card(a){
     actionHTML=`<button class="${btnClass}" data-action="checkin" data-auth-index="${esc(a.auth_index)}"${btnDisabled}>${btnText}</button>`;
   }
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
+  // 成长中心入口只在 CN 卡片渲染：Global 账号没有该活动（后端亦返回 skipped_global）
+  const growthBtn=isGlobal?"":`<button class="sec" data-action="growth" data-auth-index="${esc(a.auth_index)}" title="执行成长中心：Buddy 领养 / 旅行 / 任务接单领奖 / 补登 / 兑换 / 抽奖 / 盲盒">成长中心</button>`;
   const testFailedBadge=a.test_failed?`<span class="badge test-failed" title="定时活跃测试失败且仍有积分；建议人工复核后清理">测试</span>`:"";
   const lowCredits=isAccountLowCredits(a);
   const lowCreditsBadge=lowCredits?`<span class="badge low-credits" title="剩余额度低于保活线(${minRoutableCredits})，仍可路由但排在健康号之后">保活</span>`:"";
@@ -534,7 +538,8 @@ function card(a){
   ${a.created_at?`<div class="uid">创建 ${esc(fmtCST(a.created_at))}</div>`:''}
   ${progressHTML(cr,a)}
   ${a.error?`<div class="row"><span class="k">错误</span><span class="v err">${esc(a.error)}</span></div>`:""}
-  <div class="actions">${refreshBtn}${actionHTML}<button class="sec" data-action="test" data-auth-index="${esc(a.auth_index)}" title="测试账号活跃并发送一次推理请求">测试</button></div>
+  <div class="actions">${refreshBtn}${actionHTML}${growthBtn}<button class="sec" data-action="test" data-auth-index="${esc(a.auth_index)}" title="测试账号活跃并发送一次推理请求">测试</button></div>
+  ${isGlobal?"":`<div class="growth-line" data-growth-summary="${esc(a.auth_index)}"></div>`}
   </div>`;
 }
 // 冷却倒计时：每秒刷新积分首行中的冷却剩余秒数。
@@ -1090,8 +1095,43 @@ async function checkin(idx, btn){
     busy(btn,false);
   }
 }
-async function selectAuth(idx, btn){
+// 成长中心：执行一轮并把真实收益与失败原因写进卡片摘要行。
+// 失败原因必须一并渲染——旧版把失败掩盖成「今日已领完」，用户无法自查。
+async function growthOne(idx, btn){
   busy(btn,true);
+  const line=document.querySelector(`[data-growth-summary="${CSS.escape(idx)}"]`);
+  if(line) line.textContent="执行中…";
+  try{
+    const d=await api("/growth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({auth_index:idx})});
+    const res=(d.results||[])[0]||{};
+    if(line) line.textContent=growthSummaryText(res);
+    if(res.error) toast("成长中心执行失败","err",res.error);
+    else if((res.errors||[]).length) toast("成长中心部分失败，详见卡片","warn",res.errors[0]);
+    else toast("成长中心执行完成","ok",growthSummaryText(res));
+    await load();
+  }catch(e){
+    if(line) line.textContent="执行失败："+e.message;
+    toast("成长中心请求失败","err",e.message);
+  }finally{
+    busy(btn,false);
+  }
+}
+// 把单账号结果压成一行可读摘要。
+function growthSummaryText(res){
+  if(res.error) return "失败："+res.error;
+  if(res.reason==="global") return "国际版账号无成长中心";
+  if(res.reason==="busy") return "该账号正在执行，请稍后重试";
+  const parts=[];
+  parts.push(`+${Number(res.credits_gained)||0} 积分`);
+  if(Number(res.energy_gained)) parts.push(`+${res.energy_gained} 能量`);
+  if(Number(res.tasks_claimed)) parts.push(`领奖 ${res.tasks_claimed} 项`);
+  if(Number(res.tasks_accepted)) parts.push(`接单 ${res.tasks_accepted} 项`);
+  if(res.buddy_unlocked) parts.push("Buddy 已解锁");
+  const errs=res.errors||[];
+  if(errs.length) parts.push(`⚠ ${errs.length} 项失败：${errs[0]}`);
+  return parts.join(" · ");
+}
+async function selectAuth(idx, btn){  busy(btn,true);
   try{
     const d=await api("/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({auth_index:idx})});
     if(d.error){

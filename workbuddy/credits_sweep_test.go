@@ -594,7 +594,7 @@ func TestProcessAutoCheckinGradesAfterCheckin(t *testing.T) {
 		}
 	})
 
-	processAutoCheckinAccount(pluginapi.HostAuthFileEntry{ID: "wb-ci", AuthIndex: "idx-ci"}, true)
+	processAutoCheckinAccount(pluginapi.HostAuthFileEntry{ID: "wb-ci", AuthIndex: "idx-ci"}, true, false)
 
 	if !checkinDone {
 		t.Fatal("前置条件不成立：签到请求未被发出")

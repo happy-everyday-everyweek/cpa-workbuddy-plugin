@@ -151,6 +151,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/refresh", Description: "Force refresh quota/cache for all accounts."},
 			{Method: http.MethodGet, Path: base + "/refresh/status", Description: "Async refresh progress snapshot."},
 			{Method: http.MethodPost, Path: base + "/checkin", Description: "Manually check in one account (auth_index) or all."},
+			{Method: http.MethodPost, Path: base + "/growth", Description: "Run growth-center tasks (buddy adopt, travel, tasks, lottery) for one account (auth_index) or all."},
 			{Method: http.MethodPost, Path: base + "/checkin/config", Description: "Toggle auto check-in (enabled: true/false)."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
@@ -206,6 +207,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, globalRefresh.Snapshot()))
 	case req.Method == http.MethodPost && path == base+"/checkin":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleManualCheckin(req)))
+	case req.Method == http.MethodPost && path == base+"/growth":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleGrowth(req)))
 	case req.Method == http.MethodPost && path == base+"/checkin/config":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCheckinConfig(req)))
 	case req.Method == http.MethodGet && path == base+"/credits":
@@ -294,6 +297,7 @@ func mutatingManagementPath(path string) bool {
 	switch path {
 	case base + "/refresh",
 		base + "/checkin",
+		base + "/growth",
 		base + "/checkin/config",
 		base + "/import",
 		base + "/export",
