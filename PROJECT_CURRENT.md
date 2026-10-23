@@ -26,7 +26,7 @@
   - `qoderwork-provider`: **0.9.44**（0.9.44 流式中途断流零泄漏换号重试 + 断流信封补 `http_status=502` + 冷却落盘失败可观测与内存兜底；0.9.40 重建上游 messages 时保留工具调用结构修复 agent 多轮往返工具结果失配对；0.9.38 签到节奏恢复每 4 小时六槽 + 移除冗余门控；0.9.37 tools 对齐修复；0.9.35 max_tokens 统一 32768 最低输出底线；0.9.34 上游 110 日调用上限 24 小时持久化冷却 + 路由/换号排除 + 面板解冷）
   - `qoder-ai-provider`: **0.1.24**（0.1.24 流式中途断流零泄漏换号重试 + 断流信封补 `http_status=502`；0.1.20 重建上游 messages 时保留工具调用结构修复 agent 多轮往返工具结果失配对；0.1.18 签到节奏恢复每 4 小时六槽 + 移除冗余门控；0.1.17 tools 对齐修复；0.1.15 max_tokens 统一 32768 最低输出底线；0.1.14 上游 110 日调用上限 24 小时持久化冷却 + 补齐 /clear-cooldown 路由注册）
   - `traework-provider`: **0.2.13**（面板签到时刻文案漂移修正为 00/04/08/12/16/20；0.2.12 定时探活降频至 4 小时 + 失败也刷新节流时间戳；0.2.11 max_tokens 32768 底线 + payload 层同步，探活改全量模型按序测试）
-  - `workbuddy-provider`: **0.16.5**（0.16.5 流式中途断流零泄漏换号重试 + 断流信封补 `http_status=502`；0.16.4 账号故障冷却改为 30s 递增阶梯、上限 10 分钟；0.16.3 成长中心接单失败不再虚报成功 + 错误原因可见化；0.16.0 成长中心全自动领奖 7 类玩法，`growth_auto` 默认关闭）
+  - `workbuddy-provider`: **0.19.0**（0.19.0 重新接入成长中心 7 段，修复旧版「任务永远完不成」的两个根因：从未调用 `buddy/first` 领养 + 完全没有 `POST /v2/report` 行为上报；0.18.2 面板单卡刷新补写积分快照；0.18.1 积分三档分级 + 每小时串行扫描 + 低于 100 硬禁用；0.18.0 下线 Global 耗尽自动删号 + 低额红线可配置；0.16.5 流式中途断流零泄漏换号重试 + 断流信封补 `http_status=502`）
   - `workbuddy-ai-provider`: **0.1.16**（0.1.16 授权后自动补注册地等新能力；0.1.15 定时探活降频至 4 小时 + 失败也刷新节流时间戳；0.1.14 max_tokens 32768 底线，探活改全量模型按序测试）
   - `copilot-provider`: **0.1.2**（0.1.2 调度器对齐宿主候选集语义修复越界缺陷，已发布 `0054c28`→`ba471b0`→`bca1264`→`78b4069` 并生产验收：热重载前 5 分钟 50/50 请求告警、热重载后 0/57；0.1.1 宿主 OAuth 弹窗改开插件桥接页展示设备码；0.1.0 首发：Device Flow 登录 + 内部令牌 80% 提前保活 + VS Code Copilot Chat 指纹模拟 + 动态模型发现 + 多账号池换号重试 + 流式/非流式转发 + 额度与面板）
   - `workbuddy-token-usage`: **0.2.8**（0.2.8 让退役实例的 feed 导入协程在连续 3 轮关闭句柄后自行退出；0.2.7 修复宿主配置重载换句柄窗口导致的用量记录丢失；0.2.6 移除四个图表与导出图片、下线 `/stats/trends` 及序列聚合以省算力与响应体积；0.2.5 起请求明细与维度汇总展示原始 provider id）
@@ -34,6 +34,18 @@
 - 当前时间：2026-10-17 (GMT+8)
 
 ## 活动会话进展摘要
+
+- 当前会话（2026-10-24）：**workbuddy-provider 0.19.0 重新接入成长中心，已发生产并完成行为验收**：
+  - 用户先给参考项目 `linguo2625469/workbuddy2api-panel`，要求分析「我们之前删掉的成长中心为什么有问题」再重新加上。多轮决策：恢复完整 7 段 / 照参考项目做进度上报 / 默认开启定时自动跑 / 通用上报层（25 个专属动作只读）/ 先探针再实现。
+  - **两个根因（旧版 0.16.0 失败真相，此前无人定位）**：① **从未调用 `buddy/first` 领养 Buddy**——未领养时上游对每个 `tasks/accept` 返回 HTTP 200 + code 0，但在 `data.results[i]` 逐条带 `prerequisite not met: first_buddy (no buddy instance found)`；只判 HTTP 码的实现记成「14 accepted」，下一轮待处理集合完全不变，正是历史日志连续 6 轮 `14 accepted, 0 claimed` 的成因。② **完全没有 `POST /v2/report` 行为上报**——`git grep "v2/report" 947a83c^ -- workbuddy/` 无匹配，任务进度由服务端行为事件点亮，不发则 `current` 永不动。
+  - **推翻了计划假设**：原怀疑旧版 `codebuddy.cn/v2` 域名有误；实测四个 base 的 `/tasks` 全部 200，域名从来不是问题。
+  - **落地**：新增 10 个源文件 + 4 个测试文件（growth.go / _status / _actions / _tasks / _report / _run / _run_segments / _run_streak / _schedule / _handler），全部 ≤200 行；改 checkin.go / management.go / management_test.go / usage_config.go / main.go / panel.html / credits_sweep_test.go。领奖判据改为进度口径 `!claimed && target>0 && current>=target`（`accept_status=="completed"` 会回填后回滚，不可用）。
+  - **验证**：cgo-shim build+vet+test 全绿（15 个新用例，3 处变异全部被捕获）；面板两段 `<script>` node --check PASS；真实 CN 账号经 WSL 编译的 c-shared `.so` + ctypes 驱动跑通完整七段（`success:true, buddy_unlocked:true, tasks_progressed:2, errors:null`）。
+  - **发布链**：`51f8ee8`(feat, 30 文件) → CI `39991991017` success（4.8 分钟，同时取消 push 触发的冗余 run）→ 6/6 assets sha256 OK → `29ab9a7`(registry) → 远端 6/6 sha+size ALL PASS 且无旧版本残留。
+  - **生产验收（热重载零重启）**：`hot reloaded active_version=0.19.0 retired_version=0.18.2`；落盘 `.so` sha256 `dc219e91…1218f46dc`，内置版本串 `0.19.0`、含 `growthRunBuddyAdopt` 符号；单账号实跑 `success:true, buddy_unlocked:true, tasks_accepted:4, tasks_progressed:2, credits_gained:8, energy_balance:8, errors:null`；accounts / panel / growth 三端点均 200；容器 Up 24h 未重启。
+  - **配置**：生产未显式设置 `growth_auto`，走代码默认 `true`，与签到共用 4 小时 tick；关闭后仅保留面板手动执行。
+  - **受限项**：浏览器点击验证未做（本地无 CPA 实例）；4 个消耗性端点（makeup / redeem / lottery / buddy-open）为遵守探针纪律未单独探测，仅在真实一次运行中按编排触发；真实 Global 账号路径仅单测覆盖（生产 Global 账号数为 0）。
+  - 文档：`doc/2-需求/2026-10-24_120000_workbuddy成长中心重新接入需求.md`、`doc/5-tests/…验证.md`、`doc/6-review/…_6-review.md`（STYLE: PASS）。
 
 - 当前会话（2026-10-23）：**workbuddy-ai 0.1.22 与 zcode 0.1.35 版本就绪并生产落盘（未启用）**：
   - 用户先问「f961f2eb 会话的合并改动是否一起提交发布了」，查清：该会话产出 `121931d`（README 六插件说明，纯文档 +51/−7、父提交我的 `bde747d`），**已提交且已在远端 main**；但它同时合并进来的两处**代码修复从未发布过二进制**。
@@ -160,7 +172,7 @@
 {
   "version": 5,
   "registry_schema": "task_plan_projection_registry",
-  "registry_updated_at": "2026-10-18T09:12:12Z",
+  "registry_updated_at": "2026-10-22T17:50:15.790173Z",
   "projections": [
     {
       "projection_id": "SESSION/30608b3616fa2311bfb720a2776c09ac96b2738601ec3752b03a252c810cdb70",
@@ -234,97 +246,6 @@
       ]
     },
     {
-      "projection_id": "SESSION/5818ea886692422d8a462f2eb89e9b453f44422b609457bddc7ce1391942abe6",
-      "session_id": "01a1219b-6aff-7fb2-822f-d9160626c22c",
-      "projection_origin": "synthesized",
-      "synthesis_mode": "exact",
-      "state": "inactive",
-      "plan_key": "IMPL-QODERWORK-CHECKIN-FALSE-SUCCESS-20261010",
-      "source_document": "doc/3-实施/2026-10-10_QoderWork签到假成功修复实施总览.md",
-      "plan_fingerprint": "7aab74187dac06f2d24f3b680a2913cfb6f68784eaf7f6a7f403d3a5d2607581",
-      "updated_at": "2026-10-11T00:30:00.000000Z",
-      "steps": [
-        {
-          "id": "TASK-001",
-          "step": "[TASK-001] 取证与根因冻结：宿主桥状态码解码错误",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-002",
-          "step": "[TASK-002] 修复 host_bridge.go：抽出 parseHostHTTPDoResult",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-003",
-          "step": "[TASK-003] 收紧 billing.go：performCheckinCall 缺 success 字段返回失败",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-004",
-          "step": "[TASK-004] 新增 host_bridge_test.go 回归并完成反证与本地全绿",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-005",
-          "step": "[TASK-005] 版本与文档收口：bump 0.9.26、CHANGELOG、5-tests、6-review",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-006",
-          "step": "[TASK-006] 发布链：commit、push、CI、assets、registry、远端验证",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-007",
-          "step": "[TASK-007] 生产部署与账号 u09a5b6ab 行为验收",
-          "status": "completed"
-        }
-      ]
-    },
-    {
-      "projection_id": "SESSION/7226fa6af0bcd53d1de3ea0168019a75d3e69d438a2e508583aa50b16c3a005e",
-      "session_id": "4a50f1f2-f554-4fcd-bb84-216778147dd2",
-      "projection_origin": "synthesized",
-      "synthesis_mode": "exact",
-      "state": "inactive",
-      "plan_key": "RELEASE-ZCODE-CLAIM-GUIDE-0.1.22",
-      "source_document": "zcode/CHANGELOG.md",
-      "plan_fingerprint": "7d0ab4c92600e8679dcb8ddfa5a628622ec80d2cc8a5e54f2ba1b61c543edec3",
-      "updated_at": "2026-10-13T18:09:27.704552Z",
-      "steps": [
-        {
-          "id": "TASK-001",
-          "step": "[TASK-001] 提交 zcode 0.1.22 领取指引改动（仅 5 个 zcode 文件）",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-002",
-          "step": "[TASK-002] 推送 main 并派发 zcode-provider 0.1.22 CI 构建",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-003",
-          "step": "[TASK-003] 轮询 CI 运行并下载 8 个发布资产",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-004",
-          "step": "[TASK-004] 提交发布资产并运行 registry 发布脚本",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-005",
-          "step": "[TASK-005] 提交 registry.json 并验证远端 raw URL 可达",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-006",
-          "step": "[TASK-006] 生产环境 plugin-store 热重载安装并验收",
-          "status": "completed"
-        }
-      ]
-    },
-    {
       "projection_id": "SESSION/4c4dab02fd732c0d17940754bc3095a8a25815699011645d49b517efc9cac1bb",
       "session_id": "75082e35-bf34-49e3-8ec9-d8c884098190",
       "projection_origin": "persisted",
@@ -363,67 +284,39 @@
       ]
     },
     {
-      "projection_id": "SESSION/dd4640b0e3990effb3a66aee0da5c3fe25288b12610cbe5e75c08c80d2a34b14",
-      "session_id": "bbc80e05-e600-4495-bdc2-9fd5e1bfc7cf",
+      "projection_id": "SESSION/94dd522698a5cf6e0897452ab54a3907615603273c390609e7694e7501d16106",
+      "session_id": "88d9095a-1953-4563-8fa7-28bc30f9b129",
       "projection_origin": "persisted",
       "synthesis_mode": "none",
-      "state": "active",
-      "plan_key": "IMPL-QWENWORK-MULTI-ACCOUNT-20261018",
-      "source_document": "doc/3-实施/2026-10-17_234000_QwenWorkProvider插件立项_实施总览.md",
-      "plan_fingerprint": "21081b87f6808d09b806eb30cc74aedcc99e3c61226a4fa090740970209e032f",
-      "updated_at": "2026-10-17T18:06:46Z",
+      "state": "inactive",
+      "plan_key": "DIAG/WORKBUDDY-ROUTING-BALANCE",
+      "source_document": "PROJECT_CURRENT.md",
+      "plan_fingerprint": "a2faaec8f1ff284eb6cfdd6066e0be9632cf1863dea7cff7b96f078b01c72367",
+      "updated_at": "2026-10-23T02:00:00Z",
       "steps": [
         {
-          "id": "TASK-001",
-          "step": "[TASK-001] 侦察 qwenwork 多账号/调度/冷却现状与 CYCLE-02 差距",
+          "id": "DIAG-01",
+          "step": "[DIAG-01] 统计最近 1 小时生产日志中各 workbuddy 账号的请求量分布，确认不均衡程度",
           "status": "completed"
         },
         {
-          "id": "TASK-002",
-          "step": "[TASK-002] 账号池与账号落盘对齐（含令牌刷新折叠式直写）",
+          "id": "DIAG-02",
+          "step": "[DIAG-02] 判定请求实际走的是插件 scheduler.pick 还是宿主内置 session-affinity 选择器",
           "status": "completed"
         },
         {
-          "id": "TASK-003",
-          "step": "[TASK-003] 调度三模式 + 会话粘性对齐（含 off 解析修复）",
+          "id": "DIAG-03",
+          "step": "[DIAG-03] 统计各账号唯一会话数与粘性时长，验证「少量会话高粘性导致集中」假设",
           "status": "completed"
         },
         {
-          "id": "TASK-004",
-          "step": "[TASK-004] 冷却阶梯 + 换号重试对齐（账号身份 key 统一为宿主 auth.ID）",
+          "id": "DIAG-04",
+          "step": "[DIAG-04] 核对生产实际在任的 scheduler 插件，确认 workbuddy 路由逻辑是否被宿主绕过",
           "status": "completed"
         },
         {
-          "id": "TASK-005",
-          "step": "[TASK-005] 双账号故障切换验证 + 文档与风格收口",
-          "status": "completed"
-        }
-      ]
-    },
-    {
-      "projection_id": "SESSION/b104d3bd7fe586700ffcf91a64d1b13f225f91728325744aad9b76fccf1540cb",
-      "session_id": "b98da698-d42c-4920-afdf-34f3bc242d7c",
-      "projection_origin": "persisted",
-      "synthesis_mode": "none",
-      "state": "active",
-      "plan_key": "DIAG-PROJECT-DISK-USAGE-20261018",
-      "source_document": "doc/4-bugs/2026-10-18_172500_项目磁盘占用过大根因诊断.md",
-      "plan_fingerprint": "41eebc847b50e161b00543a1659f14721dff70011ae0728f14474bf54e37d36c",
-      "updated_at": "2026-10-18T09:12:12Z",
-      "steps": [
-        {
-          "id": "TASK-001",
-          "step": "[TASK-001] 统计工作树各目录与 .git 的真实磁盘占用",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-002",
-          "step": "[TASK-002] 定位大体积来源：release-assets、Git 对象、缓存、构建产物",
-          "status": "completed"
-        },
-        {
-          "id": "TASK-003",
-          "step": "[TASK-003] 归纳根因与安全清理建议，落盘诊断文档",
+          "id": "DIAG-05",
+          "step": "[DIAG-05] 输出根因结论与可选修复方向，交用户裁定",
           "status": "completed"
         }
       ]
@@ -474,6 +367,84 @@
           {
             "id": "TASK-006",
             "step": "[TASK-006] 6-review + 发布 + 生产热重载验收",
+            "status": "completed"
+          }
+        ]
+      }
+    },
+    {
+      "reason_code": "invalid_projection",
+      "affected_session_id": "bbc80e05-e600-4495-bdc2-9fd5e1bfc7cf",
+      "source_version": 5,
+      "source_index": 5,
+      "raw_entry": {
+        "projection_id": "SESSION/dd4640b0e3990effb3a66aee0da5c3fe25288b12610cbe5e75c08c80d2a34b14",
+        "session_id": "bbc80e05-e600-4495-bdc2-9fd5e1bfc7cf",
+        "projection_origin": "persisted",
+        "synthesis_mode": "none",
+        "state": "active",
+        "plan_key": "IMPL-QWENWORK-MULTI-ACCOUNT-20261018",
+        "source_document": "doc/3-实施/2026-10-17_234000_QwenWorkProvider插件立项_实施总览.md",
+        "plan_fingerprint": "21081b87f6808d09b806eb30cc74aedcc99e3c61226a4fa090740970209e032f",
+        "updated_at": "2026-10-17T18:06:46Z",
+        "steps": [
+          {
+            "id": "TASK-001",
+            "step": "[TASK-001] 侦察 qwenwork 多账号/调度/冷却现状与 CYCLE-02 差距",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-002",
+            "step": "[TASK-002] 账号池与账号落盘对齐（含令牌刷新折叠式直写）",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-003",
+            "step": "[TASK-003] 调度三模式 + 会话粘性对齐（含 off 解析修复）",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-004",
+            "step": "[TASK-004] 冷却阶梯 + 换号重试对齐（账号身份 key 统一为宿主 auth.ID）",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-005",
+            "step": "[TASK-005] 双账号故障切换验证 + 文档与风格收口",
+            "status": "completed"
+          }
+        ]
+      }
+    },
+    {
+      "reason_code": "invalid_projection",
+      "affected_session_id": "b98da698-d42c-4920-afdf-34f3bc242d7c",
+      "source_version": 5,
+      "source_index": 6,
+      "raw_entry": {
+        "projection_id": "SESSION/b104d3bd7fe586700ffcf91a64d1b13f225f91728325744aad9b76fccf1540cb",
+        "session_id": "b98da698-d42c-4920-afdf-34f3bc242d7c",
+        "projection_origin": "persisted",
+        "synthesis_mode": "none",
+        "state": "active",
+        "plan_key": "DIAG-PROJECT-DISK-USAGE-20261018",
+        "source_document": "doc/4-bugs/2026-10-18_172500_项目磁盘占用过大根因诊断.md",
+        "plan_fingerprint": "41eebc847b50e161b00543a1659f14721dff70011ae0728f14474bf54e37d36c",
+        "updated_at": "2026-10-18T09:12:12Z",
+        "steps": [
+          {
+            "id": "TASK-001",
+            "step": "[TASK-001] 统计工作树各目录与 .git 的真实磁盘占用",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-002",
+            "step": "[TASK-002] 定位大体积来源：release-assets、Git 对象、缓存、构建产物",
+            "status": "completed"
+          },
+          {
+            "id": "TASK-003",
+            "step": "[TASK-003] 归纳根因与安全清理建议，落盘诊断文档",
             "status": "completed"
           }
         ]
