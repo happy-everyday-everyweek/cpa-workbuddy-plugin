@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.2
+
+### Fix - 面板单卡「刷新」不写积分快照，新加账号永远显示「加载中…」
+
+- 现象: 新加账号后点卡片上的「刷新」，积分确实拉到了（toast 显示剩余额度），但重新进入面板该卡片仍显示「加载中…」，整张卡没有任何积分、额度与徽标。
+- 根因: 单卡刷新走 `GET /credits?auth_index=<idx>`，该分支只更新内存缓存 `accountCache`，**从不写 sidecar 快照**；而面板进入是轻载，只读 `data/workbuddy-credits.json`。新账号不在快照里 → 轻载查不到 → 回落为「未知」。其它三条入口（批量刷新 `doFetchOne` / 签到 / 每小时扫描）都写快照，唯独单卡刷新被漏掉。
+- 修复: 单卡刷新成功后补与另三条入口同口径的三步——`recordCreditSnapshot` + `gradeCreditsForAuth` + `persistCreditSnapshot`；并把 `hostAuthList`/`hostAuthGet` 改为走既有测试接缝 `hostAuthListFn`/`hostAuthGetFn`（签到与刷新链路早已如此）。
+- 验证: 新增 `TestHandleCreditsQuerySingleAccountWritesSnapshot`（端到端驱动 handler，断言快照收录 + 落盘）与 `TestHandleCreditsQuerySingleAccountPersistsOnFailure`（上游失败不得用「未知」覆盖）；变异删除写快照两行 → 前者精确 FAIL，还原后全绿。
+- 影响范围: 仅 `/credits` 单账号分支；批量查询（无 `auth_index`，面板无调用方）行为不变。
+- 涉及文件: `credits_handler.go` `credits_sweep_test.go` `CHANGELOG.md` `VERSION` `main.go`
+
 ## 0.18.1
 
 ### Feature - 积分三档分级：落盘快照 + 每小时串行扫描 + 低于 100 硬禁用

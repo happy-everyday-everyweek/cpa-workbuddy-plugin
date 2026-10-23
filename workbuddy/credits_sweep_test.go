@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -607,5 +608,113 @@ func TestProcessAutoCheckinGradesAfterCheckin(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(creditSnapshotPath()); err != nil || len(raw) == 0 {
 		t.Fatalf("签到后必须落盘 sidecar, err=%v", err)
+	}
+}
+
+// TestHandleCreditsQuerySingleAccountWritesSnapshot 锁定面板单卡「刷新」。
+//
+// 该按钮走 GET /credits?auth_index=<idx>，与批量刷新 / 签到 / 小时扫描是
+// 四条独立入口。用户实测：新加账号点「刷新」后，卡片仍显示「加载中…」。
+// 原因就是这条路径只更新 accountCache，从不写 sidecar；面板重新加载走轻载
+// 分支读快照，查不到该账号便回落为「未知」。因此本用例断言刷新必须落盘。
+func TestHandleCreditsQuerySingleAccountWritesSnapshot(t *testing.T) {
+	withTempSnapshotDir(t)
+	resetFailover(t)
+	resetCreditProbeForTest()
+	h := newFailoverFakeHost(t)
+	h.addAccount("wb-single", "idx-single", nil)
+	restoreDisable := setLowCreditDisableBelow(100)
+	defer restoreDisable()
+	restoreMin := setMinRoutableCredits(400)
+	defer restoreMin()
+
+	// 宿主枚举与凭据读取走既有接缝，单卡路径必须同样可注入。
+	origList := hostAuthListFn
+	origGet := hostAuthGetFn
+	t.Cleanup(func() {
+		hostAuthListFn = origList
+		hostAuthGetFn = origGet
+	})
+	hostAuthListFn = func() ([]pluginapi.HostAuthFileEntry, error) {
+		return []pluginapi.HostAuthFileEntry{{
+			ID: "wb-single", AuthIndex: "idx-single", Name: "wb-single", Label: "新号",
+		}}, nil
+	}
+	sa := &storedAuth{}
+	sa.Account.UID = "wb-single"
+	sa.Account.Nickname = "新号"
+	sa.Auth.Domain = "www.codebuddy.cn"
+	hostAuthGetFn = func(string) (*storedAuth, error) { return sa, nil }
+
+	newBillingStub(t, func(path string) (int, string) {
+		switch path {
+		case "/v2/billing/meter/get-user-resource":
+			return 200, creditsEnvelope(2100, 2100)
+		default:
+			return 200, `{"code":0,"msg":"OK","data":{}}`
+		}
+	})
+
+	res := handleCreditsQuery(pluginapi.ManagementRequest{
+		Method: "GET",
+		Query:  url.Values{"auth_index": []string{"idx-single"}},
+	})
+	accounts, _ := res["accounts"].([]map[string]any)
+	if len(accounts) != 1 {
+		t.Fatalf("单卡查询应返回 1 条账号, got %#v", res)
+	}
+	if accounts[0]["credits"] == nil {
+		t.Fatalf("单卡刷新必须返回积分, got %#v", accounts[0])
+	}
+
+	// 核心断言：快照必须收录该账号，否则面板重载会退回「加载中…」。
+	entry, ok := creditSnapshotGet("wb-single")
+	if !ok || entry.Remain != 2100 {
+		t.Fatalf("单卡刷新必须写入快照, got %+v ok=%v", entry, ok)
+	}
+	if raw, err := os.ReadFile(creditSnapshotPath()); err != nil || len(raw) == 0 {
+		t.Fatalf("单卡刷新必须落盘 sidecar, err=%v", err)
+	}
+}
+
+// TestHandleCreditsQuerySingleAccountPersistsOnFailure 反向对照：上游拉取失败
+// 时不得写快照——否则会用「未知」覆盖已有的真实积分。
+func TestHandleCreditsQuerySingleAccountPersistsOnFailure(t *testing.T) {
+	withTempSnapshotDir(t)
+	resetFailover(t)
+	resetCreditProbeForTest()
+	h := newFailoverFakeHost(t)
+	h.addAccount("wb-single2", "idx-single2", nil)
+
+	origList := hostAuthListFn
+	origGet := hostAuthGetFn
+	t.Cleanup(func() {
+		hostAuthListFn = origList
+		hostAuthGetFn = origGet
+	})
+	hostAuthListFn = func() ([]pluginapi.HostAuthFileEntry, error) {
+		return []pluginapi.HostAuthFileEntry{{
+			ID: "wb-single2", AuthIndex: "idx-single2", Name: "wb-single2",
+		}}, nil
+	}
+	sa := &storedAuth{}
+	sa.Account.UID = "wb-single2"
+	sa.Auth.Domain = "www.codebuddy.cn"
+	hostAuthGetFn = func(string) (*storedAuth, error) { return sa, nil }
+
+	newBillingStub(t, func(path string) (int, string) {
+		return 500, `{"code":500,"msg":"boom"}`
+	})
+
+	res := handleCreditsQuery(pluginapi.ManagementRequest{
+		Method: "GET",
+		Query:  url.Values{"auth_index": []string{"idx-single2"}},
+	})
+	accounts, _ := res["accounts"].([]map[string]any)
+	if len(accounts) != 1 {
+		t.Fatalf("单卡查询应返回 1 条账号, got %#v", res)
+	}
+	if _, ok := creditSnapshotGet("wb-single2"); ok {
+		t.Fatal("上游拉取失败时不得写入快照")
 	}
 }

@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -349,7 +350,7 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 	if vals := req.Query["auth_index"]; len(vals) > 0 {
 		authIndex = strings.TrimSpace(vals[0])
 	}
-	files, err := hostAuthList()
+	files, err := hostAuthListFn()
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -359,7 +360,7 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 			if f.AuthIndex != authIndex {
 				continue
 			}
-			sa, err := hostAuthGet(f.AuthIndex)
+			sa, err := hostAuthGetFn(f.AuthIndex)
 			if err != nil {
 				return map[string]any{"accounts": []map[string]any{{
 					"auth_index": authIndex, "error": "load auth: " + err.Error(),
@@ -376,17 +377,17 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 				}
 			}
 			cr, err := fetchUserResource(sa)
-		acct := map[string]any{
-			"auth_index":  authIndex,
-			"nickname":    sa.Account.Nickname,
-			"uid":         sa.Account.UID,
-			"region":      accountRegion(sa),
-			"name":        f.Name,
-			"label":       f.Label,
-			"disabled":    f.Disabled,
-			"selected":    getActiveAuthID() == f.ID,
-			"test_failed": isTestFailed(f.ID),
-		}
+			acct := map[string]any{
+				"auth_index":  authIndex,
+				"nickname":    sa.Account.Nickname,
+				"uid":         sa.Account.UID,
+				"region":      accountRegion(sa),
+				"name":        f.Name,
+				"label":       f.Label,
+				"disabled":    f.Disabled,
+				"selected":    getActiveAuthID() == f.ID,
+				"test_failed": isTestFailed(f.ID),
+			}
 			if err != nil {
 				acct["error"] = err.Error()
 			} else {
@@ -419,6 +420,16 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 				accountCache.Store(f.ID, &accountCacheEntry{
 					checkin: ci, credits: cr, plan: plan, fetched: now,
 				})
+				// 写快照 + 分级：单卡刷新与批量刷新/签到/小时扫描走同一口径。
+				// 只更新 accountCache 时，面板重新加载会退回轻载分支读 sidecar，
+				// 新账号因不在快照里而永远显示「加载中」——用户实测踩到过。
+				if cr != nil {
+					recordCreditSnapshot(f.ID, cr, sa.Account.Nickname, accountRegion(sa))
+					gradeCreditsForAuth(f.AuthIndex, f.ID, sa, cr)
+					if persistErr := persistCreditSnapshot(); persistErr != nil {
+						log.Printf("[workbuddy] credits snapshot persist failed: %v", persistErr)
+					}
+				}
 			}
 			return map[string]any{"accounts": []map[string]any{acct}}
 		}
