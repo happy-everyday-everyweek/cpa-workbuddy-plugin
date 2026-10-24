@@ -1,0 +1,42 @@
+name: Build qoder-ai (linux/arm64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'qoder-ai/**'
+      - '.github/workflows/build-qoder-ai.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+          cache-dependency-path: qoder-ai/go.sum
+
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Build c-shared plugin
+        working-directory: qoder-ai
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+            go build -buildmode=c-shared -ldflags "-s -w" -o qoder-ai-provider.so .
+
+      - name: Verify artifact
+        run: |
+          file qoder-ai/qoder-ai-provider.so
+          ls -l qoder-ai/qoder-ai-provider.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qoder-ai-provider-arm64
+          path: qoder-ai/qoder-ai-provider.so
+          if-no-files-found: error
