@@ -9,6 +9,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -17,6 +18,24 @@ import (
 
 //go:embed baseprompt.json
 var basepromptJSON []byte
+
+// keepTemplatePrompt 控制是否保留模板内嵌的 Qoder system 提示词。
+//
+// 模板 baseprompt.json 里带一段约 10657 token 的 Qoder CLI system prompt，
+// 原实现无条件把它放在 messages 最前面，再把客户端消息追加在后面。
+// 后果是客户端自己的 system prompt 根本发不到上游：模型先看到 Qoder 的角色
+// 设定，而且实际上存在两份 system，通常以前面那份为准。
+//
+// 默认改为穿透（丢弃模板 system，只用客户端 messages）。如果上游因为缺少
+// 那段提示词而行为异常（例如基础对话能力下降），把环境变量
+// QODER_AI_KEEP_TEMPLATE_PROMPT 设为 1 / true / yes / on 即可恢复原行为。
+func keepTemplatePrompt() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_AI_KEEP_TEMPLATE_PROMPT"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
 
 // cpaToUpstreamKey maps CPA-facing model names to upstream keys.
 // Unknown names pass through unchanged (server silently routes to auto).
@@ -90,7 +109,6 @@ type openAIContentPart struct {
 // 仅提取 text / input_text 部件的文本（图片等非文本部件无对应位置，按空处理）。
 // [参数] raw: 单条消息的原始 JSON。
 // [返回] 解析成功返回 nil；content 为非法形态时返回错误。
-// 最近修改时间 2026-10-15；改动原因：同步解析 tool_calls / tool_call_id / name，避免重建 messages 时丢失工具配对结构
 func (m *openAIMessage) UnmarshalJSON(raw []byte) error {
 	var wire struct {
 		Role       string          `json:"role"`
@@ -115,18 +133,14 @@ func (m *openAIMessage) UnmarshalJSON(raw []byte) error {
 }
 
 // decodeOpenAIContent 把 OpenAI content 字段归一为文本。
-// [参数] raw: content 原始 JSON（字符串、部件数组，或 null / 缺省）。
-// [返回] 归一后的文本；既非字符串也非部件数组时返回错误。
 func decodeOpenAIContent(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return "", nil
 	}
-	// 1. 纯字符串形态（旧客户端与探活构造）优先
 	var text string
 	if err := json.Unmarshal(raw, &text); err == nil {
 		return text, nil
 	}
-	// 2. 多模态部件数组形态：只保留文本部件
 	var parts []openAIContentPart
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return "", fmt.Errorf("content must be a string or content parts array")
@@ -143,17 +157,6 @@ func decodeOpenAIContent(raw json.RawMessage) (string, error) {
 }
 
 // alignToolsWithClient 按客户端真实声明对齐上游 body 的 tools 字段。
-// 模板 baseprompt.json 硬编码了 Qoder CLI 的 14 个 agent 工具（Bash/Glob/Read…）
-// 与 agent 会话上下文，而客户端普通问答并不具备这些工具的执行回路；若不剥离，
-// 上游会把每次问答都当 agent 任务作答：先输出一句编排语，再发出工具调用并以
-// finish_reason=tool_calls 结束本轮，下游表现为「推理一小段就停、等用户继续」。
-// 因此：客户端未声明工具时剥离模板工具集，声明了则用客户端工具覆盖。
-// tool_choice 由 normalizeToolChoice 归一后写入：上游只认字符串形态，客户端
-// 常见的对象形（{"type":"function",...}）与 "none" 会被静默忽略——实测
-// tool_choice:"none" 时上游照常发出工具调用，与「禁用工具」意图相反。
-// [参数] base: 模板解析后的 body 根对象（就地修改）；req: 客户端请求。
-// [返回] 无。
-// 最近修改时间 2026-10-14；改动原因：补齐 tool_choice 形态规整，修复 "none" 被上游忽略致工具抑制失效
 func alignToolsWithClient(base map[string]any, req *openAIRequest) {
 	if req == nil || len(req.Tools) == 0 {
 		delete(base, "tools")
@@ -163,7 +166,6 @@ func alignToolsWithClient(base map[string]any, req *openAIRequest) {
 	base["tools"] = req.Tools
 	choice, suppress := normalizeToolChoice(req.ToolChoice)
 	if suppress {
-		// tool_choice=none：上游不认该值，唯一可靠抑制是整组删除 tools。
 		delete(base, "tools")
 		delete(base, "tool_choice")
 		return
@@ -176,13 +178,6 @@ func alignToolsWithClient(base map[string]any, req *openAIRequest) {
 }
 
 // normalizeToolChoice 把 OpenAI 各形态的 tool_choice 归一为上游可识别的字符串。
-// 覆盖四种形态：字符串（auto/none/required）、对象形
-// {"type":"auto|none|required|function", ...}、函数指定形（提取 name）、
-// 以及未知/非法值（视为缺省）。语义与 workbuddy 的 normalizeToolsInPlace 一致。
-// [参数] tc: 客户端 tool_choice 原值（any，可能为 nil/字符串/对象）。
-// [返回] choice: 归一后的字符串（"auto"/"required"/函数名；空表示无显式选择）；
-// suppress: 是否要求禁用工具（tool_choice=none）。
-// 最近修改时间 2026-10-14；改动原因：新增 tool_choice 形态规整（对齐 workbuddy）
 func normalizeToolChoice(tc any) (choice string, suppress bool) {
 	switch v := tc.(type) {
 	case nil:
@@ -197,7 +192,6 @@ func normalizeToolChoice(tc any) (choice string, suppress bool) {
 		case "":
 			return "", false
 		default:
-			// 非标准字符串（含具体函数名）原样透传，上游按函数名处理。
 			return strings.TrimSpace(v), false
 		}
 	case map[string]any:
@@ -236,11 +230,8 @@ type openAIRequest struct {
 	Stream          bool            `json:"stream"`
 	MaxTokens       int64           `json:"max_tokens"`
 	ReasoningEffort string          `json:"reasoning_effort"`
-	// Tools / ToolChoice 承载客户端的工具声明。模板 baseprompt.json 硬编码了
-	// Qoder CLI 的 14 个 agent 工具，必须按客户端真实声明对齐，否则普通问答
-	// 会被上游当作 agent 任务作答并以 finish_reason=tool_calls 提前结束。
-	Tools      []any `json:"tools"`
-	ToolChoice any   `json:"tool_choice"`
+	Tools           []any           `json:"tools"`
+	ToolChoice      any             `json:"tool_choice"`
 }
 
 // extractLatestUserPrompt returns the content of the last user message,
@@ -260,10 +251,11 @@ func extractLatestUserPrompt(messages []openAIMessage) string {
 }
 
 // buildQoderBody renders the upstream agent_chat_generation body for one request.
-// modelKey is the upstream key (already mapped via cpaToUpstreamKey).
-// [参数] req: 客户端 OpenAI 请求；modelKey: 上游模型键；userType: 阿里云用户类型。
-// [返回] []byte: 渲染后的上游请求体；error: 模板解析或渲染异常。
-// 最近修改时间 2026-10-15；改动原因：重建 messages 时保留 tool_calls / tool_call_id / name 配对结构
+//
+// messages 组装策略：
+//   默认（穿透）：完全丢弃模板里的 system 条目，先放客户端自己的 system 消息，
+//     再按原顺序放其余对话。客户端 system prompt 直接抵达上游。
+//   QODER_AI_KEEP_TEMPLATE_PROMPT=1（旧行为）：模板 system 打头，客户端消息追加在后。
 func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, error) {
 	var base map[string]any
 	if err := json.Unmarshal(basepromptJSON, &base); err != nil {
@@ -318,18 +310,21 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 		}
 	}
 
-	// messages: keep system prompt from baseprompt (template has it), replace user/assistant
-	var systemMsgs []any
-	if msgs, ok := base["messages"].([]any); ok {
-		for _, m := range msgs {
-			if mm, ok := m.(map[string]any); ok {
-				if role, _ := mm["role"].(string); role == "system" {
-					systemMsgs = append(systemMsgs, m)
+	// messages 组装
+	var out []any
+	if keepTemplatePrompt() {
+		// 旧行为：保留模板 system，再追加客户端消息。
+		if msgs, ok := base["messages"].([]any); ok {
+			for _, m := range msgs {
+				if mm, ok := m.(map[string]any); ok {
+					if role, _ := mm["role"].(string); role == "system" {
+						out = append(out, m)
+					}
 				}
 			}
 		}
 	}
-	// Append the actual conversation
+	// Append the actual conversation（穿透模式下这是唯一的消息来源）
 	for _, m := range req.Messages {
 		msg := map[string]any{"role": m.Role, "content": m.Content}
 		if len(m.ToolCalls) > 0 {
@@ -341,9 +336,9 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 		if m.Name != "" {
 			msg["name"] = m.Name
 		}
-		systemMsgs = append(systemMsgs, msg)
+		out = append(out, msg)
 	}
-	base["messages"] = systemMsgs
+	base["messages"] = out
 
 	// business
 	if biz, ok := base["business"].(map[string]any); ok {
